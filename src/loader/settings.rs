@@ -98,6 +98,9 @@ pub trait Settings {
     /// Test if a directive is a label.
     fn is_label(directive: &Self::Directive) -> Option<&str>;
 
+    /// If the directive is a static jump, returns the label it jumps to.
+    fn get_static_target(directive: &Self::Directive) -> Option<&str>;
+
     /// Emits an unconditional jump to a label.
     ///
     /// This must be exactly one instruction, otherwise jump tables will
@@ -109,13 +112,17 @@ pub enum LabelType {
     Function,
     Local,
     Loop,
+    Marker,
 }
+
+pub const LOCAL_LABEL_PREFIX: &str = "__local_";
 
 pub fn format_label(label_id: u32, label_type: LabelType) -> String {
     match label_type {
         LabelType::Function => format!("__func_{label_id}"),
-        LabelType::Local => format!("__local_{label_id}"),
+        LabelType::Local => format!("{LOCAL_LABEL_PREFIX}{label_id}"),
         LabelType::Loop => format!("__loop_{label_id}"),
+        LabelType::Marker => format!("__marker_{label_id}"),
     }
 }
 

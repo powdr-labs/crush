@@ -614,7 +614,7 @@ fn translate_single_node<'a, S: Settings<'a>>(
                     // This label is not actually referenced statically, but it marks
                     // one possible target of the relative jump. It is useful on backends
                     // that rely on labels to find all the possible jump targets.
-                    let marker_label = ctx.new_label(LabelType::Local);
+                    let marker_label = ctx.new_label(LabelType::Marker);
                     directives.push(s.emit_label(ctx, marker_label, None).into());
                     match is_single_plain_jump::<S>(jump_directives.into()) {
                         Ok(target) => {
