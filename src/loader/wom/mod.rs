@@ -4,7 +4,8 @@ use std::sync::atomic::AtomicU32;
 
 use crate::loader::{
     CommonStages, FunctionAsm, FunctionProcessingStage, Module, Statistics,
-    passes::dumb_jump_removal, wom::settings::Settings,
+    passes::{dumb_jump_removal, orphan_labels_removal::remove_orphan_labels},
+    wom::settings::Settings,
 };
 
 pub mod flattening;
@@ -17,8 +18,10 @@ pub enum WomStages<'a, S: Settings<'a>> {
     CommonStages(CommonStages<'a>),
     /// The flattened assembly-like representation of the function.
     PlainFlatAsm(FunctionAsm<S::Directive>),
-    /// The flattened assembly-like representation with useless jumps removed.
+    /// The assembly-like representation with useless jumps removed.
     DumbJumpOptFlatAsm(FunctionAsm<S::Directive>),
+    /// The assembly-like representation with useless labels removed.
+    OrphanLabelOptFlatAsm(FunctionAsm<S::Directive>),
 }
 
 impl<'a, S: Settings<'a>> FunctionProcessingStage<'a, S> for WomStages<'a, S> {
@@ -61,15 +64,23 @@ impl<'a, S: Settings<'a>> FunctionProcessingStage<'a, S> for WomStages<'a, S> {
                 }
                 Self::DumbJumpOptFlatAsm(flat_asm)
             }
-            Self::DumbJumpOptFlatAsm(flat_asm) => {
+            Self::DumbJumpOptFlatAsm(mut flat_asm) => {
+                // Optimization pass: remove orphaned local labels.
+                let labels_removed = remove_orphan_labels::<S>(&mut flat_asm);
+                if let Some(stats) = stats {
+                    stats.orphan_labels_removed += labels_removed;
+                }
+                Self::OrphanLabelOptFlatAsm(flat_asm)
+            }
+            Self::OrphanLabelOptFlatAsm(flat_asm) => {
                 // Processing is complete. Just return itself.
-                Self::DumbJumpOptFlatAsm(flat_asm)
+                Self::OrphanLabelOptFlatAsm(flat_asm)
             }
         })
     }
 
     fn consume_last_stage(self) -> Result<FunctionAsm<S::Directive>, Self> {
-        if let Self::DumbJumpOptFlatAsm(flat_asm) = self {
+        if let Self::OrphanLabelOptFlatAsm(flat_asm) = self {
             Ok(flat_asm)
         } else {
             Err(self)
