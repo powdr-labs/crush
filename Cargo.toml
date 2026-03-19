@@ -4,8 +4,10 @@ description = "Compiles WebAssembly into a ZK friendly IR with infinite register
 edition = "2024"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 derive-where = "1.4.0"
 env_logger = "0.10.0"
+hashbrown = "0.16"
 iset = "0.3"
 itertools = "0.14"
 log = "0.4.17"
@@ -17,7 +19,6 @@ wasmparser = { version = "0.235", default-features = false, features = [
     'features',
     'simd',
 ] }
-clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }

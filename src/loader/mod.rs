@@ -868,6 +868,8 @@ pub struct Statistics {
     pub block_outputs_removed: usize,
     /// Number of useless jumps removed from flattened assembly.
     pub useless_jumps_removed: usize,
+    /// Number of useless labels removed from flattened assembly.
+    pub orphan_labels_removed: usize,
 }
 
 impl AddAssign for Statistics {
@@ -879,6 +881,7 @@ impl AddAssign for Statistics {
         self.loop_inputs_removed += other.loop_inputs_removed;
         self.block_outputs_removed += other.block_outputs_removed;
         self.useless_jumps_removed += other.useless_jumps_removed;
+        self.orphan_labels_removed += other.orphan_labels_removed;
     }
 }
 
@@ -886,14 +889,15 @@ impl Display for Statistics {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(
             f,
-            "Optimization statistics:\n - {} register copies saved\n - {} constants collapsed\n - {} constants deduplicated\n - {} dangling nodes removed\n - {} loop inputs removed\n - {} block outputs removed\n - {} useless jumps removed",
+            "Optimization statistics:\n - {} register copies saved\n - {} constants collapsed\n - {} constants deduplicated\n - {} dangling nodes removed\n - {} loop inputs removed\n - {} block outputs removed\n - {} useless jumps removed\n - {} orphan labels removed",
             self.register_copies_saved,
             self.constants_collapsed,
             self.constants_deduplicated,
             self.dangling_nodes_removed,
             self.loop_inputs_removed,
             self.block_outputs_removed,
-            self.useless_jumps_removed
+            self.useless_jumps_removed,
+            self.orphan_labels_removed,
         )
     }
 }

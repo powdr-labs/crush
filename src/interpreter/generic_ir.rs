@@ -44,6 +44,18 @@ impl<'a> Settings for GenericIrSetting<'a> {
         }
     }
 
+    fn get_static_target(directive: &Self::Directive) -> Option<&str> {
+        match directive {
+            Directive::Jump { target } => Some(target),
+            Directive::JumpIf { target, .. } => Some(target),
+            Directive::JumpIfZero { target, .. } => Some(target),
+            Directive::JumpAndActivateFrame { target, .. } => Some(target),
+            Directive::RwCall { target, .. } => Some(target),
+            Directive::WomCall { target, .. } => Some(target),
+            _ => None,
+        }
+    }
+
     fn to_plain_local_jump(directive: Directive) -> Result<String, Directive> {
         if let Directive::Jump { target } = directive {
             Ok(target)

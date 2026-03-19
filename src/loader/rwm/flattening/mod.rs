@@ -329,7 +329,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                     // This label is not actually refereced statically, but it marks
                     // one possible target of the relative jump. It is useful on backends
                     // that rely on labels to find all the possible jump targets.
-                    let marker_label = ctx.new_label(LabelType::Local);
+                    let marker_label = ctx.new_label(LabelType::Marker);
                     directives.push(s.emit_label(&mut ctx, marker_label).into());
                     match jump_directives {
                         JumpResult::PlainJump(target) => {
