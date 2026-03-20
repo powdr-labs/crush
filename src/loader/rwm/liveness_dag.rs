@@ -20,17 +20,17 @@ use crate::{
 
 #[derive(Debug)]
 pub struct Liveness {
-    /// For each node interval, holds a map of the last usage of a value produced
-    /// by some node (that might be outside the current interval). If not present,
-    /// the value was already dead before the interval.
+    /// For each value origin, holds the ranges where the value is live.
     ///
-    /// The intervals are delimited by labels and breaks, so the liveness
-    /// might change suddenly from one interval to the next.
+    /// The liveness may be intermitent, because in some execution paths the
+    /// value can be dropped earlier than in others. If a value is not live in some
+    /// range after its origin, it is guaranteed it won't be needed again in every
+    /// possible execution path from that range.
     ///
-    /// This vec is sorted in decreasing order of the intervals, and the tuple is:
-    /// (index of the first node in the interval, map of origin to last usage).
-    /// E.g., if there are 15 nodes, the order of the elements might be [(10, _),(5, _),(0, _)].
-    last_usage_map: Vec<(usize, BTreeMap<ValueOrigin, usize>)>,
+    /// The ranges are non-overlapping and sorted. Each node index in a range is a
+    /// node where the value is available for reading, so the range starts one node
+    /// after the origin, and ends at the last node that uses the value.
+    live_ranges: HashMap<ValueOrigin, Vec<(usize, usize)>>,
 
     /// The set of outputs indexed from the Input node that are redirected
     /// as-is to the next iteration of the loop.
@@ -76,9 +76,21 @@ impl<'a> LivenessDag<'a> {
         use crate::loader::passes::blockless_dag::Operation::*;
 
         let nodes = dag.nodes;
-        let mut last_usage_map = Vec::new();
+
         let mut last_usage = BTreeMap::new();
         let mut liveness_nodes: RevVecFiller<Node<'a>> = RevVecFiller::new(nodes.len());
+
+        // For each node interval, holds a map of the last usage of a value produced
+        // by some node (that might be outside the current interval). If not present,
+        // the value was already dead before the interval.
+        //
+        // The intervals are delimited by labels and breaks, so the liveness
+        // might change suddenly from one interval to the next.
+        //
+        // This vec is sorted in decreasing order of the intervals, and the tuple is:
+        // (index of the first node in the interval, map of origin to last usage).
+        // E.g., if there are 15 nodes, the order of the elements might be [(10, _),(5, _),(0, _)].
+        let mut last_usage_map = Vec::new();
 
         let mut usage_idx_for_label = HashMap::new();
 
@@ -194,6 +206,30 @@ impl<'a> LivenessDag<'a> {
 
         last_usage_map.push((0, last_usage));
 
+        // Use last usage map to build the live ranges for each value origin.
+        let mut live_ranges = HashMap::new();
+        while let Some((interval_start, usage_map)) = last_usage_map.pop() {
+            for (origin, last_usage) in usage_map {
+                let start = interval_start.max(origin.node + 1);
+                let end = if let Some((next_interval_start, _)) = last_usage_map.last() {
+                    last_usage.min(*next_interval_start - 1)
+                } else {
+                    last_usage
+                };
+                let ranges: &mut Vec<(usize, usize)> = live_ranges.entry(origin).or_default();
+
+                if let Some((_, prev_range_end)) = ranges.last_mut()
+                    && *prev_range_end == start
+                {
+                    // Merge with the previous range if they are contiguous.
+                    *prev_range_end = end;
+                } else {
+                    // Add a new range otherwise.
+                    ranges.push((start, end));
+                }
+            }
+        }
+
         let redirections = dag.block_data;
         let redirected_inputs = redirections
             .into_iter()
@@ -206,7 +242,7 @@ impl<'a> LivenessDag<'a> {
         LivenessDag {
             nodes: liveness_nodes.try_into_vec().unwrap(),
             block_data: Liveness {
-                last_usage_map,
+                live_ranges,
                 redirected_inputs,
             },
         }
@@ -246,12 +282,14 @@ fn cond_break(
 fn merge_usages(
     target: &mut BTreeMap<ValueOrigin, usize>,
     source: &BTreeMap<ValueOrigin, usize>,
-    last_range_idx: usize,
+    end_range_idx: usize,
 ) {
-    for (origin, usage) in source {
-        if origin.node > last_range_idx {
-            continue;
-        }
+    // Discard values originating after the end of the range.
+    let upper_bound = ValueOrigin {
+        node: end_range_idx + 1,
+        output_idx: 0,
+    };
+    for (origin, usage) in source.range(..upper_bound) {
         target
             .entry(*origin)
             .and_modify(|u| *u = (*u).max(*usage))
