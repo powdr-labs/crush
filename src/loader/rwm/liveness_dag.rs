@@ -1,10 +1,10 @@
 //! Pass that takes a blockless dag and calculates liveness information for each node.
-//!
-//! TODO: I think there is a way to merge this pass with register allocation, by using
-//! the same bottom-up algorithm used in wom::flattening::allocate_registers, keeping
-//! track of the state independently for each execution path.
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Range,
+    rc::Rc,
+};
 
 use crate::{
     loader::{
@@ -28,9 +28,11 @@ pub struct Liveness {
     /// possible execution path from that range.
     ///
     /// The ranges are non-overlapping and sorted. Each node index in a range is a
-    /// node where the value is available for reading, so the range starts one node
-    /// after the origin, and ends at the last node that uses the value.
-    live_ranges: HashMap<ValueOrigin, Vec<(usize, usize)>>,
+    /// node where the value must be carried over. The first range starts at the
+    /// origin node, and others at a label where the value carried from some break.
+    /// Each range ends either at the node right before its last usage, ot at a break
+    /// that might need to carry the value over to the jump target.
+    live_ranges: HashMap<ValueOrigin, Rc<[Range<usize>]>>,
 
     /// The set of outputs indexed from the Input node that are redirected
     /// as-is to the next iteration of the loop.
@@ -48,18 +50,19 @@ pub struct Liveness {
 impl Liveness {
     /// Query the liveness information for a given node output.
     ///
-    /// Returns the index of the last node that uses the output, if known,
-    /// otherwise it is already dead, and returns the index of the node that
-    /// produced the output.
+    /// Returns the ordered list of disjoint ranges where the value is live
+    /// (i.e. available for reading). Returns an empty list if the value is never used.
     ///
-    /// TODO: see if it is better to return an enum {Alive, Dead, LastUsageIsNow}.
-    pub fn query_liveness(&self, curr_node_idx: usize, origin: &ValueOrigin) -> usize {
-        // The first range whose current node index greater or equal to its start.
-        let interval_idx = self
-            .last_usage_map
-            .partition_point(|(interval_start, _)| curr_node_idx < *interval_start);
-        let last_usage = &self.last_usage_map[interval_idx].1;
-        last_usage.get(origin).cloned().unwrap_or(origin.node)
+    /// The first range always starts at the origin.
+    pub fn query_liveness(&self, origin: &ValueOrigin) -> Rc<[Range<usize>]> {
+        thread_local! {
+            static EMPTY_RANGES: Rc<[Range<usize>]> = Rc::new([]);
+        }
+
+        self.live_ranges
+            .get(origin)
+            .cloned()
+            .unwrap_or_else(|| EMPTY_RANGES.with(|r| r.clone()))
     }
 
     pub fn query_if_input_is_redirected(&self, input_idx: u32) -> bool {
@@ -126,7 +129,7 @@ impl<'a> LivenessDag<'a> {
                         Label { id }
                     }
                     Br(break_target) => {
-                        // On a break, we discard the previous range and start a new one
+                        // On a local break, we discard the previous range and start a new one
                         // using the target as basis (if local).
                         last_usage = BTreeMap::new();
                         if break_target.depth == 0
@@ -210,25 +213,29 @@ impl<'a> LivenessDag<'a> {
         let mut live_ranges = HashMap::new();
         while let Some((interval_start, usage_map)) = last_usage_map.pop() {
             for (origin, last_usage) in usage_map {
-                let start = interval_start.max(origin.node + 1);
+                let start = interval_start.max(origin.node);
                 let end = if let Some((next_interval_start, _)) = last_usage_map.last() {
-                    last_usage.min(*next_interval_start - 1)
+                    last_usage.min(*next_interval_start)
                 } else {
                     last_usage
                 };
-                let ranges: &mut Vec<(usize, usize)> = live_ranges.entry(origin).or_default();
+                let ranges: &mut Vec<Range<usize>> = live_ranges.entry(origin).or_default();
 
-                if let Some((_, prev_range_end)) = ranges.last_mut()
-                    && *prev_range_end == start
+                if let Some(prev_range) = ranges.last_mut()
+                    && prev_range.end == start
                 {
                     // Merge with the previous range if they are contiguous.
-                    *prev_range_end = end;
+                    prev_range.end = end;
                 } else {
                     // Add a new range otherwise.
-                    ranges.push((start, end));
+                    ranges.push(Range { start, end });
                 }
             }
         }
+        let live_ranges = live_ranges
+            .into_iter()
+            .map(|(origin, ranges)| (origin, ranges.into()))
+            .collect();
 
         let redirections = dag.block_data;
         let redirected_inputs = redirections

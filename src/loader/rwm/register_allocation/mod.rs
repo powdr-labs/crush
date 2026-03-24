@@ -356,18 +356,13 @@ fn recursive_block_allocation<'a, S: Settings>(
                     let origin = unwrap_ref(input, "loop inputs must be references");
 
                     // Check if we can fix this allocation for the loop input.
-                    let last_usage = oa[0].occupation_tracker.liveness().query_liveness(
-                        index,
-                        origin.node,
-                        origin.output_idx,
-                    );
-                    let alloc_fixed = if last_usage <= index && {
-                        assert_eq!(
-                            last_usage, index,
-                            "liveness bug: last usage is before a node that uses the value"
-                        );
-                        true
-                    } {
+                    let value_liveness = oa[0].occupation_tracker.liveness().query_liveness(origin);
+                    let usage_range_idx =
+                        value_liveness.partition_point(|range| index >= range.end);
+                    let err_msg = "liveness bug: value used outside of its live ranges";
+                    let this_range_usage = value_liveness.get(usage_range_idx).expect(err_msg);
+                    assert!(this_range_usage.start < index, "{}", err_msg);
+                    let alloc_fixed = if this_range_usage.end == index {
                         // This is the last usage of the value before the loop,
                         // so we should try to reuse the same allocation for the loop input.
                         // Doesn't always work, because the same input value could be used

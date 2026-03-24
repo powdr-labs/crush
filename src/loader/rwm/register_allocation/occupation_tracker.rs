@@ -5,6 +5,7 @@ use iset::IntervalMap;
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::io::Write;
+use std::rc::Rc;
 use std::{
     collections::BTreeMap, fs::File, io::BufWriter, num::NonZeroU32, ops::Range, path::Path,
 };
@@ -27,11 +28,13 @@ enum AllocationType {
 struct AllocationEntry {
     kind: AllocationType,
     reg_range: Range<u32>,
-    /// Starts at the node that creates the value, ends at the last node that uses it.
-    /// Since the standard Range is exclusive at the end, this works nicely to prevent
-    /// overlapping when the node who consumes the value immediately produces another
-    /// at the same register.
-    live_range: Range<usize>,
+    /// Sequence of ranges where the value is live. The first range starts at the node
+    /// after the one that creates the value. Other ranges starts after labels on the
+    /// execution path where the value is kept alive. All ranges ends either at breaks
+    /// that renders the value dead or at the last node that uses it in that execution path.
+    ///
+    /// The ranges inclusive at both ends, sorted and disjoint.
+    live_ranges: Rc<[(usize, usize)]>,
 }
 
 /// Maps occupied registers over nodes.
@@ -90,7 +93,7 @@ impl OccupationTracker {
     ///
     /// Warning: this function doesn't check for overlaps with other existing allocations!
     pub fn set_allocation(&mut self, origin: ValueOrigin, reg_range: Range<u32>) {
-        let live_range = self.natural_liveness(origin);
+        let live_ranges = self.liveness.query_liveness(&origin);
 
         if let Some(alloc_idx) = self.origin_map.get(&origin) {
             let existing_alloc = &self.occupation.allocations[*alloc_idx];
@@ -103,14 +106,20 @@ impl OccupationTracker {
                 do_not_relocate: true,
             },
             reg_range,
-            live_range,
+            live_ranges,
         );
     }
 
     /// Reserve a given register range, blocking it from being used.
     pub fn reserve_range(&mut self, reg_range: Range<u32>) {
-        let whole_range = 0..usize::MAX;
-        self.insert(AllocationType::ExplicitlyBlocked, reg_range, whole_range);
+        thread_local! {
+            static WHOLE_RANGE: Rc<[(usize, usize)]> = Rc::new([(0, usize::MAX)]);
+        }
+        self.insert(
+            AllocationType::ExplicitlyBlocked,
+            reg_range,
+            WHOLE_RANGE.with(|r| r.clone()),
+        );
     }
 
     /// Tries to allocate the value at the given register range, if not already allocated.
@@ -148,12 +157,11 @@ impl OccupationTracker {
     }
 
     fn try_allocate_at(&mut self, origin: ValueOrigin, hint: Range<u32>) -> TryAllocResult {
-        let live_range = self.natural_liveness(origin);
-
         if self.origin_map.contains_key(&origin) {
             return TryAllocResult::AlreadyAllocated;
         }
 
+        let live_range = self.liveness.query_liveness(&origin);
         let existing_entries = self.occupation.reg_occupation(live_range.clone());
         if overlaps_any(existing_entries.iter(), &hint) {
             TryAllocResult::NotAllocated {
@@ -539,21 +547,28 @@ impl OccupationTracker {
         Ok(())
     }
 
-    fn insert(&mut self, kind: AllocationType, reg_range: Range<u32>, live_range: Range<usize>) {
+    fn insert(
+        &mut self,
+        kind: AllocationType,
+        reg_range: Range<u32>,
+        live_ranges: Rc<[(usize, usize)]>,
+    ) {
         let entry_idx = self.occupation.allocations.len();
         if let AllocationType::Value { origin, .. } = kind {
             self.origin_map.insert(origin, entry_idx);
         }
 
         // Force insert because live ranges are not unique.
-        self.occupation
-            .alive_interval_map
-            .force_insert(live_range.clone(), entry_idx);
+        for range in live_ranges.iter() {
+            self.occupation
+                .alive_interval_map
+                .force_insert(range.0..(range.1 + 1), entry_idx);
+        }
 
         self.occupation.allocations.push(AllocationEntry {
             kind,
             reg_range,
-            live_range,
+            live_ranges,
         });
     }
 
@@ -590,22 +605,6 @@ impl OccupationTracker {
         self.occupation
             .alive_interval_map
             .force_insert(moved_entry.live_range.clone(), entry_idx);
-    }
-
-    fn natural_liveness(&self, origin: ValueOrigin) -> Range<usize> {
-        let range = origin.node
-            ..self
-                .liveness
-                .query_liveness(origin.node, origin.node, origin.output_idx);
-
-        // Zero-length live ranges are valid (values that are never used), but not supported
-        // by iset::IntervalMap, so we extend them by one (pretend they are used at the next
-        // node). This should have no practical effect.
-        if range.start == range.end {
-            range.start..(range.end + 1)
-        } else {
-            range
-        }
     }
 }
 
