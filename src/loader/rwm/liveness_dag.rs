@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     ops::Range,
-    rc::Rc,
+    sync::Arc,
 };
 
 use crate::{
@@ -32,7 +32,7 @@ pub struct Liveness {
     /// origin node, and others at a label where the value carried from some break.
     /// Each range ends either at the node right before its last usage, ot at a break
     /// that might need to carry the value over to the jump target.
-    live_ranges: HashMap<ValueOrigin, Rc<[Range<usize>]>>,
+    live_ranges: HashMap<ValueOrigin, Arc<[Range<usize>]>>,
 
     /// The set of outputs indexed from the Input node that are redirected
     /// as-is to the next iteration of the loop.
@@ -57,11 +57,11 @@ impl Liveness {
     ///
     /// If the value is ephemeral (not used by any node after its origin),
     /// returns a single range encompassing only the origin node.
-    pub fn query_liveness(&self, origin: &ValueOrigin) -> Rc<[Range<usize>]> {
+    pub fn query_liveness(&self, origin: &ValueOrigin) -> Arc<[Range<usize>]> {
         self.live_ranges
             .get(origin)
             .cloned()
-            .unwrap_or_else(|| Rc::new([origin.node..(origin.node + 1)]))
+            .unwrap_or_else(|| Arc::new([origin.node..(origin.node + 1)]))
     }
 
     pub fn query_if_input_is_redirected(&self, input_idx: u32) -> bool {

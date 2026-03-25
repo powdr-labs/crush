@@ -5,7 +5,7 @@ use iset::IntervalMap;
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::io::Write;
-use std::rc::Rc;
+use std::sync::{Arc, LazyLock};
 use std::{
     collections::BTreeMap, fs::File, io::BufWriter, num::NonZeroU32, ops::Range, path::Path,
 };
@@ -24,9 +24,7 @@ enum AllocationType {
     },
 }
 
-thread_local! {
-    static WHOLE_RANGE: Rc<[Range<usize>]> = Rc::new([0..usize::MAX]);
-}
+static WHOLE_RANGE: LazyLock<Arc<[Range<usize>]>> = LazyLock::new(|| Arc::new([0..usize::MAX]));
 
 #[derive(Debug)]
 struct AllocationEntry {
@@ -38,7 +36,7 @@ struct AllocationEntry {
     /// that renders the value dead or at the last node that uses it in that execution path.
     ///
     /// The ranges inclusive at both ends, sorted and disjoint.
-    live_ranges: Rc<[Range<usize>]>,
+    live_ranges: Arc<[Range<usize>]>,
 }
 
 /// Maps occupied registers over nodes.
@@ -124,7 +122,7 @@ impl OccupationTracker {
         self.insert(
             AllocationType::ExplicitlyBlocked,
             reg_range,
-            WHOLE_RANGE.with(|r| r.clone()),
+            WHOLE_RANGE.clone(),
         );
     }
 
@@ -309,7 +307,7 @@ impl OccupationTracker {
         self.insert(
             AllocationType::FunctionFrame,
             function_range,
-            Rc::new([call_index..(call_index + 1)]),
+            Arc::new([call_index..(call_index + 1)]),
         );
 
         frame_start
@@ -429,7 +427,7 @@ impl OccupationTracker {
         let sub_range = [sub_block_index..(sub_block_index + 1)];
         let sub_occupation = self.occupation.consolidated_reg_occupation(&sub_range);
 
-        let whole_range = WHOLE_RANGE.with(|whole_range| whole_range.clone());
+        let whole_range = WHOLE_RANGE.clone();
         for reg_range in sub_occupation {
             sub_tracker.insert(
                 AllocationType::BlockedRegistersAtParent,
@@ -461,7 +459,7 @@ impl OccupationTracker {
             self.insert(
                 AllocationType::SubBlockInternal,
                 alloc,
-                Rc::new([sub_block_index..(sub_block_index + 1)]),
+                Arc::new([sub_block_index..(sub_block_index + 1)]),
             );
         }
     }
@@ -511,7 +509,7 @@ impl OccupationTracker {
         &mut self,
         origin: ValueOrigin,
         size: NonZeroU32,
-        live_ranges: Rc<[Range<usize>]>,
+        live_ranges: Arc<[Range<usize>]>,
         existing_entries: Vec<Range<u32>>,
     ) -> Result<(), ()> {
         // Track the end of the current occupied space
@@ -543,7 +541,7 @@ impl OccupationTracker {
         &mut self,
         kind: AllocationType,
         reg_range: Range<u32>,
-        live_ranges: Rc<[Range<usize>]>,
+        live_ranges: Arc<[Range<usize>]>,
     ) {
         let entry_idx = self.occupation.allocations.len();
         if let AllocationType::Value { origin, .. } = kind {
@@ -608,7 +606,7 @@ enum TryAllocResult {
     AlreadyAllocated,
     AllocatedAtHint,
     NotAllocated {
-        live_ranges: Rc<[Range<usize>]>,
+        live_ranges: Arc<[Range<usize>]>,
         existing_entries: Vec<Range<u32>>,
     },
 }
