@@ -51,18 +51,17 @@ impl Liveness {
     /// Query the liveness information for a given node output.
     ///
     /// Returns the ordered list of disjoint ranges where the value is live
-    /// (i.e. available for reading). Returns an empty list if the value is never used.
+    /// (i.e. available for reading).
     ///
     /// The first range always starts at the origin.
+    ///
+    /// If the value is ephemeral (not used by any node after its origin),
+    /// returns a single range encompassing only the origin node.
     pub fn query_liveness(&self, origin: &ValueOrigin) -> Rc<[Range<usize>]> {
-        thread_local! {
-            static EMPTY_RANGES: Rc<[Range<usize>]> = Rc::new([]);
-        }
-
         self.live_ranges
             .get(origin)
             .cloned()
-            .unwrap_or_else(|| EMPTY_RANGES.with(|r| r.clone()))
+            .unwrap_or_else(|| Rc::new([origin.node..(origin.node + 1)]))
     }
 
     pub fn query_if_input_is_redirected(&self, input_idx: u32) -> bool {
