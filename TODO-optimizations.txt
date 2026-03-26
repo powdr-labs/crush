@@ -39,10 +39,6 @@ Likely to be useful optimizations
   are stored after the arguments, makes this optimization impossible in
   most cases. We should revise the calling convention eventually.
 
-- [liveness]: calculate the liveness for all possible control flow paths,
-  releasing values earlier when possible, which may reduce register
-  pressure.
-
 - [(rw)constant-lift]: in RW mode, since loops are executed inside the same
   frame as the function, Const instructions that are executed repeatedly
   should be lifted to outside of the loops. It is theoretically possible
