@@ -105,22 +105,10 @@ impl<'a> LivenessDag<'a> {
             },
         ) in nodes.into_iter().enumerate().rev()
         {
-            // Process subnodes recursively
+            // Process subnodes recursively.
+            // We need to break the ranges at labels, breaks and loops (which are kind of breaks).
             let operation = {
                 match operation {
-                    Loop {
-                        sub_dag,
-                        break_targets,
-                    } => {
-                        let sub_dag = LivenessDag::from_blockless_dag(sub_dag);
-
-                        Loop {
-                            sub_dag,
-                            break_targets,
-                        }
-                    }
-
-                    // We need to break the ranges at labels and breaks.
                     Label { id } => {
                         // On a label we finish the previous range.
                         usage_idx_for_label.insert(id, last_usage_map.len());
@@ -181,6 +169,35 @@ impl<'a> LivenessDag<'a> {
                         }
 
                         BrTable { targets }
+                    }
+                    Loop {
+                        sub_dag,
+                        break_targets,
+                    } => {
+                        // Calculate the liveness for the loop body.
+                        let sub_dag = LivenessDag::from_blockless_dag(sub_dag);
+
+                        // Loops are similar to BrTable in that they never continue directly to the next node,
+                        // and we need to merge the liveness of all the local break targets together.
+                        last_usage = BTreeMap::new();
+                        if let Some((depth, targets)) = break_targets.first()
+                            && *depth == 0
+                        {
+                            for break_target in targets {
+                                if let TargetType::Label(label_id) = break_target {
+                                    merge_usages(
+                                        &mut last_usage,
+                                        &last_usage_map[usage_idx_for_label[label_id]].1,
+                                        index,
+                                    );
+                                }
+                            }
+                        }
+
+                        Loop {
+                            sub_dag,
+                            break_targets,
+                        }
                     }
 
                     // Other operations remain unchanged, but we have to spell them out

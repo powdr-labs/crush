@@ -325,11 +325,12 @@ fn recursive_block_allocation<'a, S: Settings>(
 
                     // Check if we can fix this allocation for the loop input.
                     let value_liveness = oa[0].occupation_tracker.liveness().query_liveness(origin);
-                    let usage_range_idx =
-                        value_liveness.partition_point(|range| index >= range.end);
+                    // Find the range that contains the current index, or that ends immediatelly
+                    // before the current index (in which case this is the last usage of the value).
+                    let usage_range_idx = value_liveness.partition_point(|range| index > range.end);
                     let err_msg = "liveness bug: value used outside of its live ranges";
                     let this_range_usage = value_liveness.get(usage_range_idx).expect(err_msg);
-                    assert!(this_range_usage.start < index, "{}", err_msg);
+                    assert!(this_range_usage.start <= index, "{}", err_msg);
                     let alloc_fixed = if this_range_usage.end == index {
                         // This is the last usage of the value before the loop,
                         // so we should try to reuse the same allocation for the loop input.
