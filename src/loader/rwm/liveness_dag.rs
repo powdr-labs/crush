@@ -111,7 +111,8 @@ impl<'a> LivenessDag<'a> {
                 match operation {
                     Label { id } => {
                         // On a label we finish the previous range.
-                        usage_idx_for_label.insert(id, last_usage_map.len());
+                        let old_idx = usage_idx_for_label.insert(id, last_usage_map.len());
+                        assert!(old_idx.is_none());
                         last_usage_map.push((index, std::mem::take(&mut last_usage)));
                         Label { id }
                     }
@@ -298,7 +299,8 @@ fn cond_break(
     );
     merge_usages(&mut merged, last_usage, node_idx);
 
-    usage_idx_for_label.insert(label_id, last_usage_map.len());
+    // Don't update usage_idx_for_label: the fall-through point (node_idx + 1)
+    // is not a label and can't be targeted by any other break.
     last_usage_map.push((node_idx + 1, std::mem::replace(last_usage, merged)));
 }
 
