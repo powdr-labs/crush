@@ -324,18 +324,17 @@ fn recursive_block_allocation<'a, S: Settings>(
                     let origin = unwrap_ref(input, "loop inputs must be references");
 
                     // Check if we can fix this allocation for the loop input.
-                    // The last range always ends before the last value usage,
-                    // but other ranges could also ends before the last usage at that
-                    // execution path. TODO: mark the reason why the range ended, so
-                    // that we can apply this heuristic to every case where the last
-                    // usage is a loop.
+                    // Find the range that either contains the loop node or ends at it.
                     let value_liveness = oa[0].occupation_tracker.liveness().query_liveness(origin);
                     let err_msg = "liveness bug: value used outside of its live ranges";
-                    let last_live_range = value_liveness.last().expect(err_msg);
-                    assert!(last_live_range.end >= index, "{}", err_msg);
-                    let alloc_fixed = if last_live_range.end == index {
-                        // This loop is the last usage of this value, so we should try to reuse
-                        // the same allocation for the loop input.
+                    let pos = value_liveness.partition_point(|r| r.start <= index);
+                    assert!(pos > 0, "{}", err_msg);
+                    let relevant_range = &value_liveness[pos - 1];
+                    assert!(relevant_range.end >= index, "{}", err_msg);
+                    let alloc_fixed = if relevant_range.end == index {
+                        // The range covering the loop node ends exactly here, so
+                        // on this execution path the loop consumes the value.
+                        // Try to reuse the same register for the loop input.
                         // Doesn't always work, because the same input value could be used
                         // by multiple loop inputs. Only one will be able to reuse the allocation.
                         let allocation = oa[0].occupation_tracker.get_allocation(*origin).unwrap();
