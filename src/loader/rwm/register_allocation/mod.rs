@@ -15,7 +15,7 @@ use crate::{
         dag::ValueOrigin,
         passes::blockless_dag::GenericNode,
         rwm::{
-            liveness_dag::{self, single_range, LivenessDag},
+            liveness_dag::{self, LivenessDag, single_range},
             register_allocation::occupation_tracker::{Occupation, OccupationTracker},
         },
         settings::Settings,
