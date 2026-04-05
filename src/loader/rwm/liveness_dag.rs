@@ -63,7 +63,7 @@ impl Liveness {
         self.live_ranges
             .get(origin)
             .cloned()
-            .unwrap_or_else(|| Arc::new([origin.node..(origin.node + 1)]))
+            .unwrap_or_else(|| single_range(origin.node..(origin.node + 1)))
     }
 
     pub fn query_if_input_is_redirected(&self, input_idx: u32) -> bool {
@@ -328,4 +328,10 @@ fn merge_usages(
             .and_modify(|u| *u = (*u).max(*usage))
             .or_insert(*usage);
     }
+}
+
+/// Creates an `Arc<[Range<usize>]>` containing a single range.
+#[allow(clippy::single_range_in_vec_init)]
+pub(crate) fn single_range(range: Range<usize>) -> Arc<[Range<usize>]> {
+    Arc::new([range])
 }

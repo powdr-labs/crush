@@ -1,3 +1,4 @@
+use crate::loader::rwm::liveness_dag::single_range;
 use crate::loader::rwm::register_allocation::Allocation;
 use crate::loader::{dag::ValueOrigin, rwm::liveness_dag::Liveness};
 use crate::utils::range_consolidation::RangeConsolidationIterator;
@@ -24,7 +25,7 @@ enum AllocationType {
     },
 }
 
-static WHOLE_RANGE: LazyLock<Arc<[Range<usize>]>> = LazyLock::new(|| Arc::new([0..usize::MAX]));
+static WHOLE_RANGE: LazyLock<Arc<[Range<usize>]>> = LazyLock::new(|| single_range(0..usize::MAX));
 
 #[derive(Debug)]
 struct AllocationEntry {
@@ -35,7 +36,7 @@ struct AllocationEntry {
     /// execution path where the value is kept alive. All ranges ends either at breaks
     /// that renders the value dead or at the last node that uses it in that execution path.
     ///
-    /// The ranges inclusive at both ends, sorted and disjoint.
+    /// The ranges are half-open, sorted and disjoint.
     live_ranges: Arc<[Range<usize>]>,
 }
 
@@ -280,7 +281,7 @@ impl OccupationTracker {
                 let live_range = self.liveness.query_liveness(&origin);
                 assert_eq!(
                     live_range.as_ref(),
-                    &[origin.node..(origin.node + 1)],
+                    single_range(origin.node..(origin.node + 1)).as_ref(),
                     "unused function output should have one node liveness"
                 );
 
@@ -307,7 +308,7 @@ impl OccupationTracker {
         self.insert(
             AllocationType::FunctionFrame,
             function_range,
-            Arc::new([call_index..(call_index + 1)]),
+            single_range(call_index..(call_index + 1)),
         );
 
         frame_start
@@ -363,7 +364,7 @@ impl OccupationTracker {
                         // We try allocating later, so this doesn't block the natural
                         // placement of the other outputs.
                     }
-                    TryAllocResult::AllocatedAtHint { .. } => {
+                    TryAllocResult::AllocatedAtHint => {
                         // Allocated at natural position, great!
                         new_allocs[entry_idx] = Some(entry.output_idx);
                         copies_saved += entry.original_range.len();
@@ -424,7 +425,7 @@ impl OccupationTracker {
     pub fn make_sub_tracker(&self, sub_block_index: usize, sub_liveness: Liveness) -> Self {
         let mut sub_tracker = OccupationTracker::new(sub_liveness);
 
-        let sub_range = [sub_block_index..(sub_block_index + 1)];
+        let sub_range = single_range(sub_block_index..(sub_block_index + 1));
         let sub_occupation = self.occupation.consolidated_reg_occupation(&sub_range);
 
         let whole_range = WHOLE_RANGE.clone();
@@ -459,7 +460,7 @@ impl OccupationTracker {
             self.insert(
                 AllocationType::SubBlockInternal,
                 alloc,
-                Arc::new([sub_block_index..(sub_block_index + 1)]),
+                single_range(sub_block_index..(sub_block_index + 1)),
             );
         }
     }

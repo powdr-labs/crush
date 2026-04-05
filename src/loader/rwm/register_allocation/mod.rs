@@ -15,7 +15,7 @@ use crate::{
         dag::ValueOrigin,
         passes::blockless_dag::GenericNode,
         rwm::{
-            liveness_dag::{self, LivenessDag},
+            liveness_dag::{self, single_range, LivenessDag},
             register_allocation::occupation_tracker::{Occupation, OccupationTracker},
         },
         settings::Settings,
@@ -79,7 +79,7 @@ impl Allocation {
 
     pub fn occupation_for_node(&self, node_index: usize) -> Vec<Range<u32>> {
         self.occupation
-            .reg_occupation(&[node_index..(node_index + 1)])
+            .reg_occupation(&single_range(node_index..(node_index + 1)))
     }
 }
 
