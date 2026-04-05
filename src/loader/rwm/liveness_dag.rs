@@ -6,6 +6,8 @@ use std::{
     sync::Arc,
 };
 
+use wasmparser::Operator as Op;
+
 use crate::{
     loader::{
         blockless_dag::{GenericBlocklessDag, GenericNode, GenericNode as BDNode},
@@ -204,6 +206,12 @@ impl<'a> LivenessDag<'a> {
                     // Other operations remain unchanged, but we have to spell them out
                     // because the types are different.
                     Inputs => Inputs,
+                    WASMOp(Op::Unreachable) => {
+                        // Unreachable terminates the execution path, like an
+                        // unconditional break out of the block.
+                        last_usage = BTreeMap::new();
+                        WASMOp(Op::Unreachable)
+                    }
                     WASMOp(operator) => WASMOp(operator),
                 }
             };
