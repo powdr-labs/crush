@@ -45,6 +45,14 @@ trait RegisterBank {
     /// Set a future value at the given absolute address.
     /// Only valid for write-once execution model.
     fn set_future(&mut self, addr: u32);
+
+    /// Mark a single register as dropped. Reading it afterwards will panic.
+    /// Only valid for read-write execution model.
+    fn drop_reg(&mut self, _addr: u32) {}
+
+    /// Mark all registers from `first` onward as dropped.
+    /// Only valid for read-write execution model.
+    fn drop_from(&mut self, _first: u32) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,37 +216,55 @@ impl RegisterBank for WriteOnceRegisterBank {
 }
 
 struct ReadWriteRegisterBank {
-    regs: Vec<u32>,
+    /// Each register is `Some(value)` if alive, or `None` if dropped.
+    regs: Vec<Option<u32>>,
 }
 
 impl ReadWriteRegisterBank {
     fn new() -> Self {
         Self { regs: Vec::new() }
     }
+
+    /// Mark a single register as dropped.
+    fn drop_reg(&mut self, addr: u32) {
+        let addr = addr as usize;
+        if addr < self.regs.len() {
+            self.regs[addr] = None;
+        }
+    }
+
+    /// Mark all registers from `first` onward as dropped.
+    fn drop_from(&mut self, first: u32) {
+        let first = first as usize;
+        for reg in self.regs[first..].iter_mut() {
+            *reg = None;
+        }
+    }
 }
 
 impl RegisterBank for ReadWriteRegisterBank {
     fn get(&mut self, addr: u32) -> RegisterValue {
-        let value = self.regs.get(addr as usize).copied().unwrap_or(0);
-        RegisterValue::Concrete(value)
+        match self.regs.get(addr as usize) {
+            Some(Some(value)) => RegisterValue::Concrete(*value),
+            Some(None) => panic!("Read from dropped register (absolute address {addr})"),
+            None => RegisterValue::Concrete(0),
+        }
     }
 
     fn set(&mut self, addr: u32, value: u32) {
         let addr = addr as usize;
         if addr >= self.regs.len() {
-            self.regs.resize(addr + 1, 0);
+            self.regs.resize(addr + 1, None);
         }
-        self.regs[addr] = value;
+        self.regs[addr] = Some(value);
     }
 
     fn copy_range(&mut self, src: Range<u32>, dest: Range<u32>) {
         assert_eq!(src.len(), dest.len());
         if src.len() == 1 {
-            // Optimize the common case of copying a single word to avoid the overhead of collect_vec()
             let value = self.get(src.start).as_concrete();
             self.set(dest.start, value);
         } else {
-            // Read all the values first to allow for overlapping src and dest
             let value = src.map(|addr| self.get(addr).as_concrete()).collect_vec();
             for (dest, value) in dest.zip_eq(value) {
                 self.set(dest, value);
@@ -252,6 +278,14 @@ impl RegisterBank for ReadWriteRegisterBank {
 
     fn set_future(&mut self, _addr: u32) {
         unreachable!("Futures are not supported in read-write execution model");
+    }
+
+    fn drop_reg(&mut self, addr: u32) {
+        ReadWriteRegisterBank::drop_reg(self, addr);
+    }
+
+    fn drop_from(&mut self, first: u32) {
+        ReadWriteRegisterBank::drop_from(self, first);
     }
 }
 
@@ -456,8 +490,11 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     should_inc_pc = false;
                     // do nothing
                 }
-                Directive::Drop { .. } | Directive::DropFrom { .. } => {
-                    // Drop hints, ignored by the interpreter.
+                Directive::Drop { register } => {
+                    t.i.regs.drop_reg(t.i.fp + register);
+                }
+                Directive::DropFrom { first } => {
+                    t.i.regs.drop_from(t.i.fp + first);
                 }
                 Directive::Return { ret_pc, ret_fp } => {
                     let pc = t.get_reg_relative_u32(ret_pc..ret_pc + 1);
