@@ -446,6 +446,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                         )
                         .into(),
                         call.suffix_directives.into(),
+                        s.emit_drop_from(&mut ctx, call.drop_from).into(),
                     ]
                     .into()
                 }
@@ -512,6 +513,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                     )
                     .into(),
                     call.suffix_directives.into(),
+                    s.emit_drop_from(&mut ctx, call.drop_from).into(),
                 ]
                 .into()
             }
@@ -869,6 +871,9 @@ impl<'a, 'b> Context<'a, 'b> {
 
 struct FunctionCall<D> {
     frame_start: u32,
+    /// First register past the return values in the callee's frame.
+    /// Everything from here onward is garbage after the call returns.
+    drop_from: u32,
     prefix_directives: Vec<Tree<D>>,
     suffix_directives: Vec<Tree<D>>,
     ret_pc: Range<u32>,
@@ -919,12 +924,48 @@ fn prepare_function_call<'a, S: Settings<'a>>(
     // Set the end of the function call prelude, so tmps can be allocated in the function frame if needed.
     ctx.function_call_prelude_size = Some(ret_fp.end);
 
+    // Find drop_from: scan outputs from the end to find trailing unused ones that
+    // can be subsumed by the DropFrom instruction. An output is unused if it sits at
+    // its natural position in the callee frame and is not alive at the next node.
+    let next_occupation = allocation.occupation_for_node(node_idx + 1);
+    let mut drop_from = outputs_offset; // Default: after all outputs.
+    let mut scan_offset = outputs_offset;
+    for output_idx in (0..func_type.results().len()).rev() {
+        let size = word_count_type::<S>(func_type.results()[output_idx]);
+        scan_offset -= size;
+        let natural_range = scan_offset..(scan_offset + size);
+
+        let output_origin = ValueOrigin {
+            node: node_idx,
+            output_idx: output_idx as u32,
+        };
+        let dest_range = allocation.get(&output_origin).unwrap();
+
+        // If the output was copied elsewhere, it's used (just relocated).
+        if dest_range != natural_range {
+            break;
+        }
+
+        // Output is at its natural position. Check if it's alive at the next node.
+        let is_alive = next_occupation
+            .iter()
+            .any(|r| r.start < natural_range.end && r.end > natural_range.start);
+
+        if is_alive {
+            break;
+        }
+
+        // This trailing output is unused. Include it in the DropFrom range.
+        drop_from = scan_offset;
+    }
+
     // Generate the actual directives for input and output copy.
     let prefix_directives = copy_inputs_if_needed(s, ctx, inputs, input_ranges);
     let suffix_directives = parallel_copy(s, ctx, output_copy_set);
 
     FunctionCall {
         frame_start,
+        drop_from,
         prefix_directives,
         suffix_directives,
         ret_pc,

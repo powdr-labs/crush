@@ -121,4 +121,13 @@ pub trait Settings<'a>: loader::Settings {
         c: &mut Context<'a, '_>,
         reg: u32,
     ) -> impl Into<Tree<Self::Directive>>;
+
+    /// Emits a drop-from instruction after a function call, signaling that all registers
+    /// from `reg` onward (in the current frame) are no longer needed. This covers the
+    /// callee's frame space past the return values (saved RA/FP, locals, temporaries).
+    fn emit_drop_from(
+        &self,
+        c: &mut Context<'a, '_>,
+        reg: u32,
+    ) -> impl Into<Tree<Self::Directive>>;
 }

@@ -228,6 +228,10 @@ impl<'a> RwmSettings<'a> for GenericIrSetting<'a> {
     fn emit_drop(&self, _c: &mut RwmCtx, reg: u32) -> Directive<'a> {
         Directive::Drop { register: reg }
     }
+
+    fn emit_drop_from(&self, _c: &mut RwmCtx, reg: u32) -> Directive<'a> {
+        Directive::DropFrom { first: reg }
+    }
 }
 
 #[allow(refining_impl_trait)]
@@ -625,6 +629,11 @@ pub enum Directive<'a> {
     Drop {
         register: Register, // size: 1 word
     },
+    /// Signals that all registers from `first` onward are no longer needed.
+    /// Emitted after function calls to mark the callee's frame space (past return values) as free.
+    DropFrom {
+        first: Register, // size: 1 word
+    },
     /// General trap, which includes an unreachable instruction.
     Trap { reason: TrapReason },
     /// A forwarded operation from WebAssembly, only with the inputs and output registers specified.
@@ -802,6 +811,9 @@ impl Display for Directive<'_> {
             }
             Directive::Drop { register } => {
                 write!(f, "    Drop ${register}")?;
+            }
+            Directive::DropFrom { first } => {
+                write!(f, "    DropFrom ${first}")?;
             }
             Directive::Trap { reason } => {
                 write!(f, "    Trap")?;
