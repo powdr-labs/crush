@@ -4,7 +4,7 @@ use crate::loader::{dag::ValueOrigin, rwm::liveness_dag::Liveness};
 use crate::utils::range_consolidation::RangeConsolidationIterator;
 use iset::IntervalMap;
 use itertools::Itertools;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::sync::{Arc, LazyLock};
 use std::{
@@ -68,6 +68,72 @@ impl Occupation {
     ) -> impl Iterator<Item = Range<u32>> {
         let occupied_ranges = self.reg_occupation(live_ranges);
         RangeConsolidationIterator::new(occupied_ranges)
+    }
+
+    /// Precomputes a map from node index to the set of registers that should be dropped
+    /// after processing that node.
+    ///
+    /// For each Value allocation's live range:
+    /// - Last range: the value is consumed at `range.end`, so drop after node `range.end`.
+    /// - Intermediate range: boundary death, drop after node `range.end - 1` (last node in range).
+    ///
+    /// A drop is suppressed for a register if it is immediately written at the drop point
+    /// (i.e., the node at the drop point produces an output in that register).
+    pub fn compute_drop_map(
+        &self,
+        nodes_outputs: &BTreeMap<ValueOrigin, Range<u32>>,
+    ) -> HashMap<usize, Vec<u32>> {
+        let mut drops: HashMap<usize, BTreeSet<u32>> = HashMap::new();
+
+        for entry in &self.allocations {
+            if !matches!(entry.kind, AllocationType::Value { .. }) {
+                continue;
+            }
+
+            let ranges = &entry.live_ranges;
+            let num_ranges = ranges.len();
+
+            for (i, range) in ranges.iter().enumerate() {
+                if range.start >= range.end {
+                    continue;
+                }
+
+                let is_last = i == num_ranges - 1;
+
+                let drop_at = if is_last {
+                    // Last range: value consumed at range.end.
+                    range.end
+                } else {
+                    // Intermediate range: boundary death after last node in range.
+                    range.end - 1
+                };
+
+                let drop_set = drops.entry(drop_at).or_default();
+                for reg in entry.reg_range.clone() {
+                    // Skip if the register is immediately written by an output at drop_at.
+                    let is_written = nodes_outputs
+                        .range(
+                            ValueOrigin {
+                                node: drop_at,
+                                output_idx: 0,
+                            }..ValueOrigin {
+                                node: drop_at + 1,
+                                output_idx: 0,
+                            },
+                        )
+                        .any(|(_, output_range)| output_range.contains(&reg));
+
+                    if !is_written {
+                        drop_set.insert(reg);
+                    }
+                }
+            }
+        }
+
+        drops
+            .into_iter()
+            .map(|(node, regs)| (node, regs.into_iter().collect()))
+            .collect()
     }
 }
 

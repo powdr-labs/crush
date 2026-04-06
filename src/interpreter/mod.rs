@@ -456,6 +456,9 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     should_inc_pc = false;
                     // do nothing
                 }
+                Directive::Drop { .. } => {
+                    // Drop is a hint, ignored by the interpreter.
+                }
                 Directive::Return { ret_pc, ret_fp } => {
                     let pc = t.get_reg_relative_u32(ret_pc..ret_pc + 1);
                     let fp = t.get_reg_relative_u32(ret_fp..ret_fp + 1);

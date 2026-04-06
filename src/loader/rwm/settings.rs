@@ -114,4 +114,11 @@ pub trait Settings<'a>: loader::Settings {
         inputs: &[WasmOpInput],
         output: Option<Range<u32>>,
     ) -> impl Into<Tree<Self::Directive>>;
+
+    /// Emits a drop instruction, signaling that the given register is no longer needed.
+    fn emit_drop(
+        &self,
+        c: &mut Context<'a, '_>,
+        reg: u32,
+    ) -> impl Into<Tree<Self::Directive>>;
 }

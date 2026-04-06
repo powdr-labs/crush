@@ -224,6 +224,10 @@ impl<'a> RwmSettings<'a> for GenericIrSetting<'a> {
             output,
         }
     }
+
+    fn emit_drop(&self, _c: &mut RwmCtx, reg: u32) -> Directive<'a> {
+        Directive::Drop { register: reg }
+    }
 }
 
 #[allow(refining_impl_trait)]
@@ -617,6 +621,10 @@ pub enum Directive<'a> {
         inputs: Vec<Range<u32>>,
         outputs: Vec<Range<u32>>,
     },
+    /// Signals that a register is no longer needed and can be reclaimed.
+    Drop {
+        register: Register, // size: 1 word
+    },
     /// General trap, which includes an unreachable instruction.
     Trap { reason: TrapReason },
     /// A forwarded operation from WebAssembly, only with the inputs and output registers specified.
@@ -791,6 +799,9 @@ impl Display for Directive<'_> {
                         }
                     }
                 }
+            }
+            Directive::Drop { register } => {
+                write!(f, "    Drop ${register}")?;
             }
             Directive::Trap { reason } => {
                 write!(f, "    Trap")?;
