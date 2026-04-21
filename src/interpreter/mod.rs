@@ -229,15 +229,6 @@ impl ReadWriteRegisterBank {
     fn new() -> Self {
         Self { regs: Vec::new() }
     }
-
-    /// Mark a single register as dropped.
-    fn drop_reg(&mut self, addr: u32) {
-        let addr = addr as usize;
-        if addr < self.regs.len() {
-            self.regs[addr] = None;
-        }
-    }
-
 }
 
 impl RegisterBank for ReadWriteRegisterBank {
@@ -279,16 +270,15 @@ impl RegisterBank for ReadWriteRegisterBank {
     }
 
     fn drop_reg(&mut self, addr: u32) {
-        ReadWriteRegisterBank::drop_reg(self, addr);
-    }
-
-    fn drop_from(&mut self, first: u32) {
-        let first = first as usize;
-        for reg in self.regs[first..].iter_mut() {
-            *reg = None;
+        let addr = addr as usize;
+        if addr < self.regs.len() {
+            self.regs[addr] = None;
         }
     }
 
+    fn drop_from(&mut self, first: u32) {
+        self.regs.truncate(first as usize);
+    }
 }
 
 pub struct Interpreter<'a, E: ExternalFunctions> {
@@ -501,15 +491,15 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                 Directive::Return { ret_pc, ret_fp } => {
                     let pc = t.get_reg_relative_u32(ret_pc..ret_pc + 1);
                     let fp = t.get_reg_relative_u32(ret_fp..ret_fp + 1);
-                    // Callee drops stay as-is. Return values and RA/FP were
-                    // written by phi-copies/ExplicitlyBlocked — they're alive.
                     if pc == 0 {
+                        // Special when the program is terminating.
                         break fp;
-                    } else {
-                        t.i.call_stack.pop();
-                        t.i.pc = pc;
-                        t.i.fp = fp;
                     }
+
+                    t.i.call_stack.pop();
+                    t.i.pc = pc;
+                    t.i.fp = fp;
+
                     should_inc_pc = false;
                 }
                 Directive::WASMOp {
@@ -1822,9 +1812,6 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     saved_ret_pc,
                     saved_caller_fp,
                 } => {
-                    // Save max-written watermark before the call, so DropFrom can
-                    // bound its range to the callee's actual frame extent.
-
                     let prev_pc = t.i.pc;
                     t.i.pc = t.i.labels[&target].pc;
                     should_inc_pc = false;
@@ -1844,7 +1831,6 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     saved_ret_pc,
                     saved_caller_fp,
                 } => {
-
                     let prev_pc = t.i.pc;
                     t.i.pc = t.get_reg_relative_u32(target_pc..target_pc + 1);
                     should_inc_pc = false;
@@ -2110,9 +2096,7 @@ mod trace {
             if let RegisterValue::Dropped = reg_value {
                 panic!(
                     "Read from dropped register ${offset} (absolute address {addr}) at pc={}, fp={}\nInstruction: {}",
-                    self.i.pc,
-                    self.i.fp,
-                    self.i.flat_program[self.i.pc as usize]
+                    self.i.pc, self.i.fp, self.i.flat_program[self.i.pc as usize]
                 );
             }
             let value = reg_value.as_concrete();
