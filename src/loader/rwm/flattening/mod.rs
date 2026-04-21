@@ -546,7 +546,6 @@ fn process_node<'a, 'b, S: Settings<'a>>(
     if is_terminal {
         node_directives
     } else if let Some(drops) = drop_map.get(&node_idx) {
-        // Emit drop instructions for registers whose live range ends at this node.
         let allocation = &ctrl_stack[0].allocation;
         let mut ctx = Context::new(common_ctx, allocation, node_idx, &inputs);
         let mut result = vec![node_directives];
@@ -924,11 +923,8 @@ fn prepare_function_call<'a, S: Settings<'a>>(
     // Set the end of the function call prelude, so tmps can be allocated in the function frame if needed.
     ctx.function_call_prelude_size = Some(ret_fp.end);
 
-    // Find drop_from: scan outputs from the end to find trailing unused ones that
-    // can be subsumed by the DropFrom instruction. An output is unused if it sits at
-    // its natural position in the callee frame and is not alive at the next node.
     let next_occupation = allocation.occupation_for_node(node_idx + 1);
-    let mut drop_from = outputs_offset; // Default: after all outputs.
+    let mut drop_from = outputs_offset;
     let mut scan_offset = outputs_offset;
     for output_idx in (0..func_type.results().len()).rev() {
         let size = word_count_type::<S>(func_type.results()[output_idx]);

@@ -81,7 +81,8 @@ impl Occupation {
     /// (i.e., the node at the drop point produces an output in that register).
     pub fn compute_drop_map(
         &self,
-        nodes_outputs: &BTreeMap<ValueOrigin, Range<u32>>,
+        _nodes_outputs: &BTreeMap<ValueOrigin, Range<u32>>,
+        labels: &HashMap<u32, usize>,
     ) -> HashMap<usize, Vec<u32>> {
         let mut drops: HashMap<usize, BTreeSet<u32>> = HashMap::new();
 
@@ -100,30 +101,85 @@ impl Occupation {
 
                 let is_last = i == num_ranges - 1;
 
-                let drop_at = if is_last {
-                    // Last range: value consumed at range.end.
-                    range.end
+                // Distinguish two cases for when a range ends:
+                // 1. The value is consumed at range.end (it's an input to that node).
+                //    Drop must come AFTER range.end.
+                // 2. The value was produced but never used (ephemeral). Its range is
+                //    a single node: origin..(origin+1). Drop comes AFTER origin
+                //    (= range.end - 1), i.e., right after the producing node.
+                //
+                // Case 2 applies when: single range of length 1 starting at the origin.
+                let is_ephemeral = is_last
+                    && num_ranges == 1
+                    && range.end == range.start + 1
+                    && matches!(entry.kind, AllocationType::Value { origin, .. } if origin.node == range.start);
+
+                let drop_at = if is_ephemeral {
+                    range.start // after the producing node
                 } else {
-                    // Intermediate range: boundary death after last node in range.
-                    range.end - 1
+                    range.end // after the consuming node
                 };
 
                 let drop_set = drops.entry(drop_at).or_default();
-                for reg in entry.reg_range.clone() {
-                    // Skip if the register is immediately written by an output at drop_at.
-                    let is_written = nodes_outputs
-                        .range(
-                            ValueOrigin {
-                                node: drop_at,
-                                output_idx: 0,
-                            }..ValueOrigin {
-                                node: drop_at + 1,
-                                output_idx: 0,
-                            },
+                // Check which registers are occupied by actual data at drop_at.
+                // Only Value (another live value) and ExplicitlyBlocked (RA/FP)
+                // suppress drops. Structural reservations (FunctionFrame,
+                // SubBlockInternal, BlockedRegistersAtParent) do not.
+                let occupied_at_drop: Vec<Range<u32>> = self
+                    .alive_interval_map
+                    .values(drop_at..(drop_at + 1))
+                    .filter_map(|idx| {
+                        let alloc = &self.allocations[*idx];
+                        matches!(
+                            alloc.kind,
+                            AllocationType::Value { .. } | AllocationType::ExplicitlyBlocked
                         )
-                        .any(|(_, output_range)| output_range.contains(&reg));
+                        .then(|| alloc.reg_range.clone())
+                    })
+                    .collect();
 
-                    if !is_written {
+                for reg in entry.reg_range.clone() {
+                    // Skip if any allocation occupies this register at the drop point.
+                    let is_occupied = occupied_at_drop
+                        .iter()
+                        .any(|r| r.start <= reg && reg < r.end);
+
+                    if !is_occupied {
+                        drop_set.insert(reg);
+                    }
+                }
+            }
+        }
+
+        // Second pass: at each label, drop registers that were alive just before
+        // the label but are dead at the label. This handles values consumed by
+        // terminal jumps (Br/BrTable) targeting the label, whose drops couldn't
+        // be emitted at the terminal node.
+        let value_or_blocked = |node: usize| -> Vec<Range<u32>> {
+            self.alive_interval_map
+                .values(node..(node + 1))
+                .filter_map(|idx| {
+                    let alloc = &self.allocations[*idx];
+                    matches!(
+                        alloc.kind,
+                        AllocationType::Value { .. } | AllocationType::ExplicitlyBlocked
+                    )
+                    .then(|| alloc.reg_range.clone())
+                })
+                .collect()
+        };
+
+        for &label_node in labels.values() {
+            if label_node == 0 {
+                continue;
+            }
+            let prev_occ = value_or_blocked(label_node - 1);
+            let label_occ = value_or_blocked(label_node);
+            let drop_set = drops.entry(label_node).or_default();
+            for prev_range in &prev_occ {
+                for reg in prev_range.clone() {
+                    let alive_at_label = label_occ.iter().any(|r| r.start <= reg && reg < r.end);
+                    if !alive_at_label {
                         drop_set.insert(reg);
                     }
                 }

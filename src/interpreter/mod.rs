@@ -47,17 +47,16 @@ trait RegisterBank {
     fn set_future(&mut self, addr: u32);
 
     /// Mark a single register as dropped. Reading it afterwards will panic.
-    /// Only valid for read-write execution model.
     fn drop_reg(&mut self, _addr: u32) {}
 
     /// Mark all registers from `first` onward as dropped.
-    /// Only valid for read-write execution model.
     fn drop_from(&mut self, _first: u32) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegisterValue {
     Unassigned,
+    Dropped,
     Future(u32),
     Concrete(u32),
 }
@@ -74,6 +73,9 @@ impl RegisterValue {
             RegisterValue::Unassigned => {
                 panic!("Can not convert unassigned to u32");
             }
+            RegisterValue::Dropped => {
+                panic!("Can not read from a dropped register");
+            }
         }
     }
 }
@@ -82,6 +84,7 @@ impl Display for RegisterValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RegisterValue::Unassigned => write!(f, "U"),
+            RegisterValue::Dropped => write!(f, "D"),
             RegisterValue::Future(fut) => write!(f, "F{}", fut),
             RegisterValue::Concrete(value) => write!(f, "{}", value),
         }
@@ -167,6 +170,7 @@ impl RegisterBank for WriteOnceRegisterBank {
                 self.regs[addr as usize] = value;
                 value
             }
+            RegisterValue::Dropped => unreachable!("Dropped state in write-once bank"),
         }
     }
 
@@ -176,6 +180,7 @@ impl RegisterBank for WriteOnceRegisterBank {
             RegisterValue::Unassigned => {
                 *slot = RegisterValue::Concrete(value);
             }
+            RegisterValue::Dropped => unreachable!("Dropped state in write-once bank"),
             RegisterValue::Future(future) => {
                 // Assigning Concrete values to Futures materializes it.
                 if let Some(old_value) = self.future_assignments.insert(future, value) {
@@ -233,20 +238,13 @@ impl ReadWriteRegisterBank {
         }
     }
 
-    /// Mark all registers from `first` onward as dropped.
-    fn drop_from(&mut self, first: u32) {
-        let first = first as usize;
-        for reg in self.regs[first..].iter_mut() {
-            *reg = None;
-        }
-    }
 }
 
 impl RegisterBank for ReadWriteRegisterBank {
     fn get(&mut self, addr: u32) -> RegisterValue {
         match self.regs.get(addr as usize) {
             Some(Some(value)) => RegisterValue::Concrete(*value),
-            Some(None) => panic!("Read from dropped register (absolute address {addr})"),
+            Some(None) => RegisterValue::Dropped,
             None => RegisterValue::Concrete(0),
         }
     }
@@ -285,8 +283,12 @@ impl RegisterBank for ReadWriteRegisterBank {
     }
 
     fn drop_from(&mut self, first: u32) {
-        ReadWriteRegisterBank::drop_from(self, first);
+        let first = first as usize;
+        for reg in self.regs[first..].iter_mut() {
+            *reg = None;
+        }
     }
+
 }
 
 pub struct Interpreter<'a, E: ExternalFunctions> {
@@ -499,10 +501,11 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                 Directive::Return { ret_pc, ret_fp } => {
                     let pc = t.get_reg_relative_u32(ret_pc..ret_pc + 1);
                     let fp = t.get_reg_relative_u32(ret_fp..ret_fp + 1);
+                    // Callee drops stay as-is. Return values and RA/FP were
+                    // written by phi-copies/ExplicitlyBlocked — they're alive.
                     if pc == 0 {
                         break fp;
                     } else {
-                        // Pop the current function from the stack
                         t.i.call_stack.pop();
                         t.i.pc = pc;
                         t.i.fp = fp;
@@ -1819,6 +1822,9 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     saved_ret_pc,
                     saved_caller_fp,
                 } => {
+                    // Save max-written watermark before the call, so DropFrom can
+                    // bound its range to the callee's actual frame extent.
+
                     let prev_pc = t.i.pc;
                     t.i.pc = t.i.labels[&target].pc;
                     should_inc_pc = false;
@@ -1838,6 +1844,7 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     saved_ret_pc,
                     saved_caller_fp,
                 } => {
+
                     let prev_pc = t.i.pc;
                     t.i.pc = t.get_reg_relative_u32(target_pc..target_pc + 1);
                     should_inc_pc = false;
@@ -2099,7 +2106,16 @@ mod trace {
 
         fn get_reg(&mut self, offset: u32) -> u32 {
             let addr = self.i.fp + offset;
-            let value = self.i.regs.get(addr).as_concrete();
+            let reg_value = self.i.regs.get(addr);
+            if let RegisterValue::Dropped = reg_value {
+                panic!(
+                    "Read from dropped register ${offset} (absolute address {addr}) at pc={}, fp={}\nInstruction: {}",
+                    self.i.pc,
+                    self.i.fp,
+                    self.i.flat_program[self.i.pc as usize]
+                );
+            }
+            let value = reg_value.as_concrete();
             self.reads.push(ReadOp {
                 addr: offset,
                 value: RegisterValue::Concrete(value),

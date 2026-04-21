@@ -84,7 +84,8 @@ impl Allocation {
 
     /// Precomputes a map from node index to registers that should be dropped after that node.
     pub fn compute_drop_map(&self) -> HashMap<usize, Vec<u32>> {
-        self.occupation.compute_drop_map(&self.nodes_outputs)
+        self.occupation
+            .compute_drop_map(&self.nodes_outputs, &self.labels)
     }
 }
 
