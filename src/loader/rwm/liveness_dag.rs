@@ -331,6 +331,8 @@ fn merge_usages(
 }
 
 /// Creates an `Arc<[Range<usize>]>` containing a single range.
+///
+/// This function is needed to isolate the false positive on clippy.
 #[allow(clippy::single_range_in_vec_init)]
 pub(crate) fn single_range(range: Range<usize>) -> Arc<[Range<usize>]> {
     Arc::new([range])

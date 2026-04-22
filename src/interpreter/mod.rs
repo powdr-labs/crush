@@ -235,8 +235,7 @@ impl RegisterBank for ReadWriteRegisterBank {
     fn get(&mut self, addr: u32) -> RegisterValue {
         match self.regs.get(addr as usize) {
             Some(Some(value)) => RegisterValue::Concrete(*value),
-            Some(None) => RegisterValue::Dropped,
-            None => RegisterValue::Concrete(0),
+            Some(None) | None => RegisterValue::Dropped,
         }
     }
 

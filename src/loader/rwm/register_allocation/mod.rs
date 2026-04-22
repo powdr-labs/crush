@@ -77,6 +77,11 @@ impl Allocation {
         self.nodes_outputs.iter()
     }
 
+    /// Returns all the occupied register ranges crossing a single node index.
+    ///
+    /// Does not include the inputs of the node, but includes its outputs, because the
+    /// live range of an output is [A, B) where A is the node prducing it and B is the
+    /// last node consuming it.
     pub fn occupation_for_node(&self, node_index: usize) -> Vec<Range<u32>> {
         self.occupation
             .reg_occupation(&single_range(node_index..(node_index + 1)))
