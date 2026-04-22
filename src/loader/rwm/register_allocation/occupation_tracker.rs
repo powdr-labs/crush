@@ -106,6 +106,22 @@ impl Occupation {
         RangeConsolidationIterator::new(occupied_ranges)
     }
 
+    /// Returns `true` if the Value allocation with the given origin has any
+    /// non-empty live range — i.e. it is read by at least one node.
+    ///
+    /// In the dimensionless-ranges convention an unused value has a single
+    /// empty range `[X, X)`, whereas a used-but-consumed-immediately value has
+    /// range `[X, X + 1)`. These are stored identically in the IntervalMap
+    /// (both as `[X, X + 1)`), so the distinction lives only in the
+    /// `live_ranges` field of the `AllocationEntry`. Callers that need to know
+    /// whether a value will ever be read should use this method.
+    pub fn is_value_used(&self, origin: ValueOrigin) -> bool {
+        self.allocations.iter().any(|entry| {
+            matches!(entry.kind, AllocationType::Value { origin: o, .. } if o == origin)
+                && entry.live_ranges.iter().any(|r| r.start < r.end)
+        })
+    }
+
     /// Precomputes a map from node index to the set of registers that should be dropped
     /// after processing that node.
     ///

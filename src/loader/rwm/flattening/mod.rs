@@ -923,7 +923,6 @@ fn prepare_function_call<'a, S: Settings<'a>>(
     // Set the end of the function call prelude, so tmps can be allocated in the function frame if needed.
     ctx.function_call_prelude_size = Some(ret_fp.end);
 
-    let next_occupation = allocation.occupation_for_node(node_idx + 1);
     let mut drop_from = outputs_offset;
     let mut scan_offset = outputs_offset;
     for output_idx in (0..func_type.results().len()).rev() {
@@ -942,12 +941,12 @@ fn prepare_function_call<'a, S: Settings<'a>>(
             break;
         }
 
-        // Output is at its natural position. Check if it's alive at the next node.
-        let is_alive = next_occupation
-            .iter()
-            .any(|r| r.start < natural_range.end && r.end > natural_range.start);
-
-        if is_alive {
+        // Output is at its natural position. Drop it only if truly unused —
+        // i.e. its live range is dimensionless. A value consumed at the very
+        // next node has live range `[node_idx, node_idx + 1)` which would not
+        // show up in `occupation_for_node(node_idx + 1)`, but `is_value_used`
+        // correctly tells it apart from a dimensionless `[node_idx, node_idx)`.
+        if allocation.is_value_used(&output_origin) {
             break;
         }
 

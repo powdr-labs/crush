@@ -92,6 +92,18 @@ impl Allocation {
         self.occupation
             .compute_drop_map(&self.nodes_outputs, &self.labels)
     }
+
+    /// Returns `true` if the value at `origin` is read by at least one node.
+    ///
+    /// In the dimensionless-ranges convention, an unused value has an empty
+    /// live range `[X, X)` while a used value has at least one non-empty range,
+    /// so this is decidable from the stored live ranges alone — even when the
+    /// unique consumer is the immediately following node, which the
+    /// `occupation_for_node` queries cannot see (its live range ends before
+    /// that query point).
+    pub fn is_value_used(&self, origin: &ValueOrigin) -> bool {
+        self.occupation.is_value_used(*origin)
+    }
 }
 
 pub type AllocatedDag<'a> = GenericBlocklessDag<'a, Allocation>;
