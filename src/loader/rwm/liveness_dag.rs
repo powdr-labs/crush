@@ -57,13 +57,15 @@ impl Liveness {
     ///
     /// The first range always starts at the origin.
     ///
-    /// If the value is ephemeral (not used by any node after its origin),
-    /// returns a single range encompassing only the origin node.
+    /// If the value is ephemeral (produced but never used), returns a single
+    /// empty range `[origin.node, origin.node)`. Storing it as dimensionless
+    /// distinguishes "unused" unambiguously from "last used exactly at
+    /// `origin.node + 1`", whose range is `[origin.node, origin.node + 1)`.
     pub fn query_liveness(&self, origin: &ValueOrigin) -> Arc<[Range<usize>]> {
         self.live_ranges
             .get(origin)
             .cloned()
-            .unwrap_or_else(|| single_range(origin.node..(origin.node + 1)))
+            .unwrap_or_else(|| single_range(origin.node..origin.node))
     }
 
     pub fn query_if_input_is_redirected(&self, input_idx: u32) -> bool {
