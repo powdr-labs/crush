@@ -184,7 +184,10 @@ impl Occupation {
                         let alloc = &self.allocations[*idx];
                         matches!(
                             alloc.kind,
-                            AllocationType::Value { .. } | AllocationType::ExplicitlyBlocked
+                            AllocationType::Value { .. }
+                                | AllocationType::ExplicitlyBlocked
+                                | AllocationType::BlockedRegistersAtParent
+                                | AllocationType::SubBlockInternal
                         )
                         .then(|| alloc.reg_range.clone())
                     })
