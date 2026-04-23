@@ -143,34 +143,17 @@ impl Occupation {
                 continue;
             }
 
-            let ranges = &entry.live_ranges;
-            let num_ranges = ranges.len();
-
-            for (i, range) in ranges.iter().enumerate() {
+            for range in entry.live_ranges.iter() {
                 if range.start >= range.end {
+                    // Dimensionless (truly unused) ranges: nothing to drop —
+                    // the register never had a meaningful value placed in it.
                     continue;
                 }
 
-                let is_last = i == num_ranges - 1;
-
-                // Distinguish two cases for when a range ends:
-                // 1. The value is consumed at range.end (it's an input to that node).
-                //    Drop must come AFTER range.end.
-                // 2. The value was produced but never used (ephemeral). Its range is
-                //    a single node: origin..(origin+1). Drop comes AFTER origin
-                //    (= range.end - 1), i.e., right after the producing node.
-                //
-                // Case 2 applies when: single range of length 1 starting at the origin.
-                let is_ephemeral = is_last
-                    && num_ranges == 1
-                    && range.end == range.start + 1
-                    && matches!(entry.kind, AllocationType::Value { origin, .. } if origin.node == range.start);
-
-                let drop_at = if is_ephemeral {
-                    range.start // after the producing node
-                } else {
-                    range.end // after the consuming node
-                };
+                // The value is consumed at `range.end` (either read by a node
+                // there or dying at a control-flow boundary), so the drop goes
+                // right after it.
+                let drop_at = range.end;
 
                 let drop_set = drops.entry(drop_at).or_default();
                 // Check which registers are occupied by actual data at drop_at.
