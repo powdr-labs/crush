@@ -491,7 +491,7 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     let pc = t.get_reg_relative_u32(ret_pc..ret_pc + 1);
                     let fp = t.get_reg_relative_u32(ret_fp..ret_fp + 1);
                     if pc == 0 {
-                        // Special when the program is terminating.
+                        // Special PC for when the program is terminating.
                         break fp;
                     }
 
