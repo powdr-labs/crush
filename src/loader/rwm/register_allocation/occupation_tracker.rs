@@ -4,7 +4,8 @@ use crate::loader::{dag::ValueOrigin, rwm::liveness_dag::Liveness};
 use crate::utils::range_consolidation::RangeConsolidationIterator;
 use iset::IntervalMap;
 use itertools::Itertools;
-use std::collections::{BTreeSet, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::io::Write;
 use std::sync::{Arc, LazyLock};
 use std::{
@@ -116,10 +117,29 @@ impl Occupation {
     /// `live_ranges` field of the `AllocationEntry`. Callers that need to know
     /// whether a value will ever be read should use this method.
     pub fn is_value_used(&self, origin: ValueOrigin) -> bool {
+        // TODO: this is stupid. We can query from the map and then check the AllocationEntry directly.
         self.allocations.iter().any(|entry| {
             matches!(entry.kind, AllocationType::Value { origin: o, .. } if o == origin)
                 && entry.live_ranges.iter().any(|r| r.start < r.end)
         })
+    }
+
+    pub fn per_node_tracker(&self) -> PerNodeOccupation {
+        // Sort all the allocated chunks by their live range start.
+        let mut rev_sorted_allocs = self
+            .allocations
+            .iter()
+            .filter(|alloc| matches!(alloc.kind, AllocationType::Value { .. }))
+            .flat_map(|alloc| {
+                alloc.live_ranges.iter().map(|live| RangeReg {
+                    live: live.clone(),
+                    regs: alloc.reg_range.clone(),
+                })
+            })
+            .collect_vec();
+        rev_sorted_allocs.sort_unstable_by_key(|r| Reverse(r.live.start));
+
+        todo!();
     }
 
     /// Precomputes a map from node index to the set of registers that should be dropped
@@ -131,7 +151,7 @@ impl Occupation {
     ///
     /// A drop is suppressed for a register if it is immediately written at the drop point
     /// (i.e., the node at the drop point produces an output in that register).
-    pub fn compute_drop_map(
+    pub fn compute__drop_map(
         &self,
         _nodes_outputs: &BTreeMap<ValueOrigin, Range<u32>>,
         labels: &HashMap<u32, usize>,
@@ -228,6 +248,84 @@ impl Occupation {
             .into_iter()
             .map(|(node, regs)| (node, regs.into_iter().collect()))
             .collect()
+    }
+}
+
+/// Struct to track every live chunk independently.
+///
+/// It compares by reverse live range end so it can be inserted in a BinaryHeap
+/// to efficiently track the currently alive chunks by their end point.
+#[derive(Eq)]
+struct RangeReg {
+    live: Range<usize>,
+    regs: Range<u32>,
+}
+impl PartialEq for RangeReg {
+    fn eq(&self, other: &Self) -> bool {
+        self.live.end == other.live.end
+    }
+}
+impl PartialOrd for RangeReg {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for RangeReg {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse order: think of higer as "first to die".
+        other.live.end.cmp(&self.live.end)
+    }
+}
+
+/// This is a tracker that reply the allocation state per node, and
+/// can be used to detect when a value is no longer alive and its
+/// register can be dropped.
+pub struct PerNodeOccupation {
+    next_node: usize,
+    /// The allocations that have not yet become alive, sorted by their live
+    /// range start in reverse order (so we can pop to get the next allocation).
+    rev_sorted_next_allocs: Vec<RangeReg>,
+    active_allocs: BinaryHeap<RangeReg>,
+}
+
+impl PerNodeOccupation {
+    /// Advances the tracker to the next node, returning the set of registers that
+    /// are just dying at this node. To get what actually must be dropped, make
+    /// the difference with the registers that are alive at this node (which doesn't
+    /// include the dying, but includes the ones just becoming live).
+    pub fn advance(&mut self) -> (usize, HashSet<u32>) {
+        let curr_node = self.next_node;
+        self.next_node += 1;
+
+        // The following order is important: add the new allocations first, then remove
+        // the dying ones, because some allocations are degenerate (live range is a single node).
+
+        // Add the new allocations.
+        while let Some(next_to_live) = self.rev_sorted_next_allocs.last()
+            && next_to_live.live.start <= self.next_node
+        {
+            self.active_allocs
+                .push(self.rev_sorted_next_allocs.pop().unwrap());
+        }
+
+        // Remove the dying allocations and collect their registers.
+        let mut dying = HashSet::new();
+        while let Some(next_to_die) = self.active_allocs.peek()
+            && next_to_die.live.end <= curr_node
+        {
+            for reg in next_to_die.regs.clone() {
+                dying.insert(reg);
+            }
+            self.active_allocs.pop();
+        }
+
+        (curr_node, dying)
+    }
+
+    pub fn alive(&self) -> impl Iterator<Item = u32> {
+        self.active_allocs
+            .iter()
+            .flat_map(|alloc| alloc.regs.clone())
     }
 }
 

@@ -95,15 +95,6 @@ fn process_node<'a, 'b, S: Settings<'a>>(
     func_idx: u32,
     drop_map: &HashMap<usize, Vec<u32>>,
 ) -> Tree<S::Directive> {
-    // Terminal nodes have no fall-through, so no drops are needed after them.
-    let is_terminal = matches!(
-        &node.operation,
-        Operation::Br(_)
-            | Operation::BrTable { .. }
-            | Operation::Loop { .. }
-            | Operation::WASMOp(Op::Unreachable)
-    );
-
     // Destructure the node so we can use parts in separate scopes.
     let register_allocation::Node {
         operation,
@@ -111,402 +102,326 @@ fn process_node<'a, 'b, S: Settings<'a>>(
         output_types,
     } = node;
 
-    // Resolve all the inputs to register ranges (briefly borrows ctrl_stack).
-    let inputs = {
-        let allocation = &ctrl_stack[0].allocation;
-        raw_inputs
-            .into_iter()
-            .map(|input| match input {
-                NodeInput::Constant(c) => WasmOpInput::Constant(c),
-                NodeInput::Reference(origin) => {
-                    WasmOpInput::Register(allocation.get(&origin).unwrap())
-                }
-            })
-            .collect_vec()
-    };
+    // Terminal nodes have no fall-through, so no drops are needed after them.
+    let is_terminal = matches!(
+        &operation,
+        Operation::Br(_)
+            | Operation::BrTable { .. }
+            | Operation::Loop { .. }
+            | Operation::WASMOp(Op::Unreachable)
+    );
 
-    // Process the node in a scoped block so that the borrow on ctrl_stack (via allocation/ctx)
-    // is released before we compute drops. This is needed because the Loop arm mutably borrows
-    // ctrl_stack.
-    let node_directives = {
-        let allocation = &ctrl_stack[0].allocation;
-        let mut ctx = Context::new(common_ctx, allocation, node_idx, &inputs);
-        match operation {
-            Operation::Inputs => {
-                // Inputs node marks the start of the block. If this the toplevel function, we must issue the function label here.
-                // Add the function label with the frame size.
-                if ctrl_stack.len() == 1 {
-                    let mut directives = Vec::with_capacity(2);
-                    directives.push(
-                        s.emit_label(&mut ctx, format_label(func_idx, LabelType::Function))
-                            .into(),
-                    );
+    let allocation = &ctrl_stack[0].allocation;
 
-                    if let Some(name) = ctx.common.prog.get_exported_func(func_idx) {
-                        // Add an alternative label, using the exported function name.
-                        directives.push(s.emit_label(&mut ctx, name.to_string()).into());
-                    }
-                    directives.into()
-                } else {
-                    Tree::Empty
-                }
-            }
-            Operation::Label { id } => s
-                .emit_label(&mut ctx, format_label(id, LabelType::Local))
-                .into(),
-            Operation::Loop { sub_dag, .. } => {
-                let AllocatedDag {
-                    nodes: loop_nodes,
-                    block_data: loop_allocation,
-                } = sub_dag;
+    // Resolve all the inputs to register ranges.
+    let inputs = raw_inputs
+        .into_iter()
+        .map(|input| match input {
+            NodeInput::Constant(c) => WasmOpInput::Constant(c),
+            NodeInput::Reference(origin) => WasmOpInput::Register(allocation.get(&origin).unwrap()),
+        })
+        .collect_vec();
 
-                // Find where the loop expects its inputs to be.
-                let input_ranges = loop_allocation.get_for_node(0);
+    let mut ctx = Context::new(common_ctx, allocation, node_idx, &inputs);
+    let node_directives = match operation {
+        Operation::Inputs => {
+            // Inputs node marks the start of the block. If this the toplevel function, we must issue the function label here.
+            // Add the function label with the frame size.
+            if ctrl_stack.len() == 1 {
+                let mut directives = Vec::with_capacity(2);
+                directives.push(
+                    s.emit_label(&mut ctx, format_label(func_idx, LabelType::Function))
+                        .into(),
+                );
 
-                // Copy the loop inputs if needed.
-                let mut loop_directives =
-                    copy_inputs_if_needed(s, &mut ctx, &inputs, input_ranges);
-
-                // Generate loop label.
-                let loop_label = ctx.new_label(LabelType::Loop);
-                loop_directives.push(s.emit_label(&mut ctx, loop_label.clone()).into());
-
-                // Process the loop body.
-                ctrl_stack.push_front(StackEntry {
-                    loop_label: Some(loop_label),
-                    allocation: loop_allocation,
-                });
-                let loop_tree = process_dag(s, common_ctx, ctrl_stack, loop_nodes, func_idx);
-                ctrl_stack.pop_front().unwrap();
-
-                // Push the loop directives.
-                loop_directives.push(loop_tree);
-                loop_directives.into()
-            }
-            Operation::Br(break_target) => {
-                emit_jump(s, &mut ctx, ctrl_stack, break_target, &inputs, func_idx)
-                    .into_tree(s)
-            }
-            Operation::BrIf(target) | Operation::BrIfZero(target) => {
-                let (cond, inverse_cond) = match operation {
-                    Operation::BrIf(..) => (JumpCondition::IfNotZero, JumpCondition::IfZero),
-                    Operation::BrIfZero(..) => (JumpCondition::IfZero, JumpCondition::IfNotZero),
-                    _ => unreachable!(),
-                };
-
-                // Get the conditional variable from the inputs.
-                let (cond_reg, inputs) = ctx.node_inputs.split_last().unwrap();
-                let cond_reg = cond_reg.as_register().unwrap().clone();
-                assert_reg::<S>(&cond_reg, ValType::I32);
-
-                let jump_directives =
-                    emit_jump(s, &mut ctx, ctrl_stack, target, inputs, func_idx);
-                if S::is_jump_condition_available(cond)
-                    && let JumpResult::PlainJump(target) = jump_directives
-                {
-                    s.emit_conditional_jump(&mut ctx, cond, target, cond_reg)
-                        .into()
-                } else {
-                    let jump_directives = jump_directives.into_tree(s);
-                    if S::is_jump_condition_available(inverse_cond) {
-                        // Uses branch on inverse condition for the general case. This is the second best case.
-                        let cont_label = ctx.new_label(LabelType::Local);
-                        vec![
-                            // Emit the jump to continuation if the condition is non-zero.
-                            s.emit_conditional_jump(
-                                &mut ctx,
-                                inverse_cond,
-                                cont_label.clone(),
-                                cond_reg,
-                            )
-                            .into(),
-                            // Emit the jump to the target label.
-                            jump_directives,
-                            // Emit the continuation label.
-                            s.emit_label(&mut ctx, cont_label).into(),
-                        ]
-                        .into()
-                    } else if S::is_jump_condition_available(cond) {
-                        // Uses conditional branch for the general case. This is the worst case, because it
-                        // it requires two labels and two jumps.
-                        let cont_label = ctx.new_label(LabelType::Local);
-                        let jump_label = ctx.new_label(LabelType::Local);
-
-                        vec![
-                            // Emit the jump to the to the jump code
-                            s.emit_conditional_jump(
-                                &mut ctx,
-                                cond,
-                                jump_label.clone(),
-                                cond_reg,
-                            )
-                            .into(),
-                            // Emit the jump to the continuation label.
-                            s.emit_jump(cont_label.clone()).into(),
-                            // Emit the jump label.
-                            s.emit_label(&mut ctx, jump_label).into(),
-                            // Emit the jump code.
-                            jump_directives,
-                            // Emit the contin\uation label.
-                            s.emit_label(&mut ctx, cont_label).into(),
-                        ]
-                        .into()
-                    } else {
-                        panic!(
-                            "Neither branch if zero nor branch if not zero is available in the settings."
-                        );
-                    }
-                }
-            }
-            Operation::BrTable { targets } => {
-                let (selector, table_inputs) = inputs.split_last().unwrap();
-                let selector = selector.as_register().unwrap().clone();
-
-                let mut choice_inputs = Vec::with_capacity(table_inputs.len());
-                let mut jump_instructions = targets
-                    .into_iter()
-                    .map(|target| {
-                        // The inputs for one particular target are a permutation of the inputs
-                        // of the BrTable operation.
-                        choice_inputs.clear();
-                        for &idx in &target.input_permutation {
-                            choice_inputs.push(table_inputs[idx as usize].clone());
-                        }
-
-                        // Emit the jump to the target label.
-                        emit_jump(
-                            s,
-                            &mut ctx,
-                            ctrl_stack,
-                            target.target,
-                            &choice_inputs,
-                            func_idx,
-                        )
-                    })
-                    .collect_vec();
-
-                // The last target is special, because it is the default target.
-                let default_target = jump_instructions.pop().unwrap();
-
-                // We need to handle the default target separately first, because it will be
-                // the target in case the selector is out of bounds.
-                let mut directives = Vec::new();
-                match default_target {
-                    JumpResult::PlainJump(target) => {
-                        // If the default target is a plain jump to a local label,
-                        // just jump if the selector is out of bounds.
-                        directives.push(
-                            s.emit_conditional_jump_cmp_immediate(
-                                &mut ctx,
-                                ComparisonFunction::GreaterThanOrEqualUnsigned,
-                                selector.clone(),
-                                jump_instructions.len() as u32,
-                                target,
-                            )
-                            .into(),
-                        );
-                    }
-                    JumpResult::Directives(jump_directives) => {
-                        // If the default target is a complex jump.
-                        let table_label = ctx.new_label(LabelType::Local);
-                        directives.extend([
-                            // Jump to the table if the selector is in bounds.
-                            s.emit_conditional_jump_cmp_immediate(
-                                &mut ctx,
-                                ComparisonFunction::LessThanUnsigned,
-                                selector.clone(),
-                                jump_instructions.len() as u32,
-                                table_label.clone(),
-                            )
-                            .into(),
-                            // Otherwise fall through to the default target.
-                            jump_directives.into(),
-                            // Emit the label for the jump table that will follow.
-                            s.emit_label(&mut ctx, table_label).into(),
-                        ])
-                    }
-                }
-
-                if !S::is_relative_jump_available() {
-                    // TODO: emit a sequence of conditional jumps if relative jumps are not available.
-                    todo!();
-                } else {
-                    // TODO: do the way it is currently done below.
-                }
-
-                // For robustness, the jump table has two indirections:
-                // - jump_offset $selector
-                // - choice_0:
-                // - jump jump_to_target_0
-                // - choice_1:
-                // - jump jump_to_target_1
-                // - ...
-                // - choice_n:
-                // - jump jump_to_target_n
-                // - jump_to_target_0:
-                // - <actual instructions to jump to target 0>
-                // - jump_to_target_1:
-                // - <actual instructions to jump to target 1>
-                // - ...
-                // - jump_to_target_n:
-                // - <actual instructions to jump to target n>
-                //
-                // The exception is if the target jump contains one single local jump instruction,
-                // which can be embedded in the jump table directly.
-                //
-                // TODO: theoretically, any single instruction can be embedded in the jump table,
-                // but it would require the guarantee that further translations wouldn't implement
-                // any of them as multiple ISA instructions. It is safer to assume just Jump will
-                // remain a single instruction. Maybe also Return?
-                //
-                // TODO: if jump_offset can jump $selector * N, where N is some immediate, this
-                // can be implemented with a single indirection, but that would also require
-                // 1-to-1 mapping in all the instructions belonging to the jump table.
-                directives.push(s.emit_relative_jump(&mut ctx, selector).into());
-
-                let jump_instructions = jump_instructions
-                    .into_iter()
-                    .filter_map(|jump_directives| {
-                        // This label is not actually refereced statically, but it marks
-                        // one possible target of the relative jump. It is useful on backends
-                        // that rely on labels to find all the possible jump targets.
-                        let marker_label = ctx.new_label(LabelType::Marker);
-                        directives.push(s.emit_label(&mut ctx, marker_label).into());
-                        match jump_directives {
-                            JumpResult::PlainJump(target) => {
-                                // This is a plain jump, just emit it directly.
-                                directives.push(s.emit_jump(target).into());
-                                None
-                            }
-                            JumpResult::Directives(jump_directives) => {
-                                // This is a complex jump, we need to create a new label
-                                // and do one indirection.
-                                let jump_label = ctx.new_label(LabelType::Local);
-                                directives.push(s.emit_jump(jump_label.clone()).into());
-                                Some((jump_label, jump_directives))
-                            }
-                        }
-                    })
-                    // Collecting here is essential, because of side effects of pushing
-                    // into `directives`.
-                    .collect_vec();
-
-                // Finally emit the jump directives for each target.
-                for (jump_label, jump_directives) in jump_instructions {
-                    directives.push(s.emit_label(&mut ctx, jump_label).into());
-                    directives.push(jump_directives.into());
+                if let Some(name) = ctx.common.prog.get_exported_func(func_idx) {
+                    // Add an alternative label, using the exported function name.
+                    directives.push(s.emit_label(&mut ctx, name.to_string()).into());
                 }
                 directives.into()
+            } else {
+                Tree::Empty
             }
-            Operation::WASMOp(Op::Call { function_index }) => {
-                let curr_entry = ctrl_stack.front().unwrap();
+        }
+        Operation::Label { id } => s
+            .emit_label(&mut ctx, format_label(id, LabelType::Local))
+            .into(),
+        Operation::Loop { sub_dag, .. } => {
+            let AllocatedDag {
+                nodes: loop_nodes,
+                block_data: loop_allocation,
+            } = sub_dag;
 
-                if let Some((module, function)) =
-                    ctx.common.prog.get_imported_func(function_index)
-                {
-                    // Imported functions are kinda like system calls, and we assume
-                    // the implementation can access the input and output registers directly,
-                    // so we just have to emit the call directive.
-                    let outputs = (0..output_types.len())
-                        .map(|output_idx| {
-                            curr_entry
-                                .allocation
-                                .get(&ValueOrigin {
-                                    node: node_idx,
-                                    output_idx: output_idx as u32,
-                                })
-                                .unwrap()
-                        })
-                        .collect_vec();
+            // Find where the loop expects its inputs to be.
+            let input_ranges = loop_allocation.get_for_node(0);
 
-                    s.emit_imported_call(&mut ctx, module, function, &inputs, outputs)
-                        .into()
-                } else {
-                    // Normal function calls requires inputs to be copied to where they are needed in the
-                    // function frame, and also may require outputs to be copied to where the users expect
-                    // the values.
-                    let func_type = &ctx.common.prog.get_func_type(function_index).ty;
-                    let call = prepare_function_call(
-                        s,
-                        &mut ctx,
-                        &curr_entry.allocation,
-                        node_idx,
-                        &inputs,
-                        func_type,
-                    );
+            // Copy the loop inputs if needed.
+            let mut loop_directives = copy_inputs_if_needed(s, &mut ctx, &inputs, input_ranges);
 
+            // Generate loop label.
+            let loop_label = ctx.new_label(LabelType::Loop);
+            loop_directives.push(s.emit_label(&mut ctx, loop_label.clone()).into());
+
+            // Process the loop body.
+            ctrl_stack.push_front(StackEntry {
+                loop_label: Some(loop_label),
+                allocation: loop_allocation,
+            });
+            let loop_tree = process_dag(s, common_ctx, ctrl_stack, loop_nodes, func_idx);
+            ctrl_stack.pop_front().unwrap();
+
+            // Push the loop directives.
+            loop_directives.push(loop_tree);
+            return loop_directives.into();
+        }
+        Operation::Br(break_target) => {
+            emit_jump(s, &mut ctx, ctrl_stack, break_target, &inputs, func_idx).into_tree(s)
+        }
+        Operation::BrIf(target) | Operation::BrIfZero(target) => {
+            let (cond, inverse_cond) = match operation {
+                Operation::BrIf(..) => (JumpCondition::IfNotZero, JumpCondition::IfZero),
+                Operation::BrIfZero(..) => (JumpCondition::IfZero, JumpCondition::IfNotZero),
+                _ => unreachable!(),
+            };
+
+            // Get the conditional variable from the inputs.
+            let (cond_reg, inputs) = ctx.node_inputs.split_last().unwrap();
+            let cond_reg = cond_reg.as_register().unwrap().clone();
+            assert_reg::<S>(&cond_reg, ValType::I32);
+
+            let jump_directives = emit_jump(s, &mut ctx, ctrl_stack, target, inputs, func_idx);
+            if S::is_jump_condition_available(cond)
+                && let JumpResult::PlainJump(target) = jump_directives
+            {
+                s.emit_conditional_jump(&mut ctx, cond, target, cond_reg)
+                    .into()
+            } else {
+                let jump_directives = jump_directives.into_tree(s);
+                if S::is_jump_condition_available(inverse_cond) {
+                    // Uses branch on inverse condition for the general case. This is the second best case.
+                    let cont_label = ctx.new_label(LabelType::Local);
                     vec![
-                        call.prefix_directives.into(),
-                        s.emit_function_call(
+                        // Emit the jump to continuation if the condition is non-zero.
+                        s.emit_conditional_jump(
                             &mut ctx,
-                            format_label(function_index, LabelType::Function),
-                            call.frame_start,
-                            call.ret_pc,
-                            call.ret_fp,
+                            inverse_cond,
+                            cont_label.clone(),
+                            cond_reg,
                         )
                         .into(),
-                        call.suffix_directives.into(),
-                        s.emit_drop_from(&mut ctx, call.drop_from).into(),
+                        // Emit the jump to the target label.
+                        jump_directives,
+                        // Emit the continuation label.
+                        s.emit_label(&mut ctx, cont_label).into(),
                     ]
                     .into()
+                } else if S::is_jump_condition_available(cond) {
+                    // Uses conditional branch for the general case. This is the worst case, because it
+                    // it requires two labels and two jumps.
+                    let cont_label = ctx.new_label(LabelType::Local);
+                    let jump_label = ctx.new_label(LabelType::Local);
+
+                    vec![
+                        // Emit the jump to the to the jump code
+                        s.emit_conditional_jump(&mut ctx, cond, jump_label.clone(), cond_reg)
+                            .into(),
+                        // Emit the jump to the continuation label.
+                        s.emit_jump(cont_label.clone()).into(),
+                        // Emit the jump label.
+                        s.emit_label(&mut ctx, jump_label).into(),
+                        // Emit the jump code.
+                        jump_directives,
+                        // Emit the contin\uation label.
+                        s.emit_label(&mut ctx, cont_label).into(),
+                    ]
+                    .into()
+                } else {
+                    panic!(
+                        "Neither branch if zero nor branch if not zero is available in the settings."
+                    );
                 }
             }
-            Operation::WASMOp(Op::CallIndirect {
-                table_index,
-                type_index,
-            }) => {
-                let curr_entry = ctrl_stack.front().unwrap();
+        }
+        Operation::BrTable { targets } => {
+            let (selector, table_inputs) = inputs.split_last().unwrap();
+            let selector = selector.as_register().unwrap().clone();
 
-                // The last input of the CallIndirect operation is the table entry, the others are the function arguments.
-                let (entry_idx, inputs) = inputs.split_last().unwrap();
-                let entry_idx = entry_idx.as_register().unwrap().clone();
+            let mut choice_inputs = Vec::with_capacity(table_inputs.len());
+            let mut jump_instructions = targets
+                .into_iter()
+                .map(|target| {
+                    // The inputs for one particular target are a permutation of the inputs
+                    // of the BrTable operation.
+                    choice_inputs.clear();
+                    for &idx in &target.input_permutation {
+                        choice_inputs.push(table_inputs[idx as usize].clone());
+                    }
 
-                let fn_type = ctx.common.prog.get_type(type_index);
+                    // Emit the jump to the target label.
+                    emit_jump(
+                        s,
+                        &mut ctx,
+                        ctrl_stack,
+                        target.target,
+                        &choice_inputs,
+                        func_idx,
+                    )
+                })
+                .collect_vec();
+
+            // The last target is special, because it is the default target.
+            let default_target = jump_instructions.pop().unwrap();
+
+            // We need to handle the default target separately first, because it will be
+            // the target in case the selector is out of bounds.
+            let mut directives = Vec::new();
+            match default_target {
+                JumpResult::PlainJump(target) => {
+                    // If the default target is a plain jump to a local label,
+                    // just jump if the selector is out of bounds.
+                    directives.push(
+                        s.emit_conditional_jump_cmp_immediate(
+                            &mut ctx,
+                            ComparisonFunction::GreaterThanOrEqualUnsigned,
+                            selector.clone(),
+                            jump_instructions.len() as u32,
+                            target,
+                        )
+                        .into(),
+                    );
+                }
+                JumpResult::Directives(jump_directives) => {
+                    // If the default target is a complex jump.
+                    let table_label = ctx.new_label(LabelType::Local);
+                    directives.extend([
+                        // Jump to the table if the selector is in bounds.
+                        s.emit_conditional_jump_cmp_immediate(
+                            &mut ctx,
+                            ComparisonFunction::LessThanUnsigned,
+                            selector.clone(),
+                            jump_instructions.len() as u32,
+                            table_label.clone(),
+                        )
+                        .into(),
+                        // Otherwise fall through to the default target.
+                        jump_directives.into(),
+                        // Emit the label for the jump table that will follow.
+                        s.emit_label(&mut ctx, table_label).into(),
+                    ])
+                }
+            }
+
+            if !S::is_relative_jump_available() {
+                // TODO: emit a sequence of conditional jumps if relative jumps are not available.
+                todo!();
+            } else {
+                // TODO: do the way it is currently done below.
+            }
+
+            // For robustness, the jump table has two indirections:
+            // - jump_offset $selector
+            // - choice_0:
+            // - jump jump_to_target_0
+            // - choice_1:
+            // - jump jump_to_target_1
+            // - ...
+            // - choice_n:
+            // - jump jump_to_target_n
+            // - jump_to_target_0:
+            // - <actual instructions to jump to target 0>
+            // - jump_to_target_1:
+            // - <actual instructions to jump to target 1>
+            // - ...
+            // - jump_to_target_n:
+            // - <actual instructions to jump to target n>
+            //
+            // The exception is if the target jump contains one single local jump instruction,
+            // which can be embedded in the jump table directly.
+            //
+            // TODO: theoretically, any single instruction can be embedded in the jump table,
+            // but it would require the guarantee that further translations wouldn't implement
+            // any of them as multiple ISA instructions. It is safer to assume just Jump will
+            // remain a single instruction. Maybe also Return?
+            //
+            // TODO: if jump_offset can jump $selector * N, where N is some immediate, this
+            // can be implemented with a single indirection, but that would also require
+            // 1-to-1 mapping in all the instructions belonging to the jump table.
+            directives.push(s.emit_relative_jump(&mut ctx, selector).into());
+
+            let jump_instructions = jump_instructions
+                .into_iter()
+                .filter_map(|jump_directives| {
+                    // This label is not actually refereced statically, but it marks
+                    // one possible target of the relative jump. It is useful on backends
+                    // that rely on labels to find all the possible jump targets.
+                    let marker_label = ctx.new_label(LabelType::Marker);
+                    directives.push(s.emit_label(&mut ctx, marker_label).into());
+                    match jump_directives {
+                        JumpResult::PlainJump(target) => {
+                            // This is a plain jump, just emit it directly.
+                            directives.push(s.emit_jump(target).into());
+                            None
+                        }
+                        JumpResult::Directives(jump_directives) => {
+                            // This is a complex jump, we need to create a new label
+                            // and do one indirection.
+                            let jump_label = ctx.new_label(LabelType::Local);
+                            directives.push(s.emit_jump(jump_label.clone()).into());
+                            Some((jump_label, jump_directives))
+                        }
+                    }
+                })
+                // Collecting here is essential, because of side effects of pushing
+                // into `directives`.
+                .collect_vec();
+
+            // Finally emit the jump directives for each target.
+            for (jump_label, jump_directives) in jump_instructions {
+                directives.push(s.emit_label(&mut ctx, jump_label).into());
+                directives.push(jump_directives.into());
+            }
+            directives.into()
+        }
+        Operation::WASMOp(Op::Call { function_index }) => {
+            let curr_entry = ctrl_stack.front().unwrap();
+
+            if let Some((module, function)) = ctx.common.prog.get_imported_func(function_index) {
+                // Imported functions are kinda like system calls, and we assume
+                // the implementation can access the input and output registers directly,
+                // so we just have to emit the call directive.
+                let outputs = (0..output_types.len())
+                    .map(|output_idx| {
+                        curr_entry
+                            .allocation
+                            .get(&ValueOrigin {
+                                node: node_idx,
+                                output_idx: output_idx as u32,
+                            })
+                            .unwrap()
+                    })
+                    .collect_vec();
+
+                s.emit_imported_call(&mut ctx, module, function, &inputs, outputs)
+                    .into()
+            } else {
+                // Normal function calls requires inputs to be copied to where they are needed in the
+                // function frame, and also may require outputs to be copied to where the users expect
+                // the values.
+                let func_type = &ctx.common.prog.get_func_type(function_index).ty;
                 let call = prepare_function_call(
                     s,
                     &mut ctx,
                     &curr_entry.allocation,
                     node_idx,
-                    inputs,
-                    &fn_type.ty,
+                    &inputs,
+                    func_type,
                 );
 
-                // We need to load the function reference from the table, so we allocate
-                // the space for it and emit the table.get directive.
-                let func_ref_reg = ctx.allocate_tmp_type::<S>(ValType::FUNCREF);
-
-                // Split the components of the function reference:
-                let split_ref = split_func_ref_regs::<S>(func_ref_reg.clone());
-
-                // Indirect calls require checking the function type first.
-                // We need a label for the OK case.
-                let ok_label = ctx.new_label(LabelType::Local);
-
-                // The sequence to load the function reference, check the type,
-                // and then perform the indirect call.
                 vec![
-                    s.emit_wasm_op(
-                        &mut ctx,
-                        Op::TableGet { table: table_index },
-                        &[WasmOpInput::Register(entry_idx)],
-                        Some(func_ref_reg),
-                    )
-                    .into(),
-                    s.emit_conditional_jump_cmp_immediate(
-                        &mut ctx,
-                        ComparisonFunction::Equal,
-                        split_ref[FunctionRef::<S>::TYPE_ID].clone(),
-                        fn_type.unique_id,
-                        ok_label.clone(),
-                    )
-                    .into(),
-                    s.emit_trap(&mut ctx, TrapReason::WrongIndirectCallFunctionType)
-                        .into(),
-                    s.emit_label(&mut ctx, ok_label).into(),
                     call.prefix_directives.into(),
-                    s.emit_indirect_call(
+                    s.emit_function_call(
                         &mut ctx,
-                        split_ref[FunctionRef::<S>::FUNC_ADDR].clone(),
+                        format_label(function_index, LabelType::Function),
                         call.frame_start,
                         call.ret_pc,
                         call.ret_fp,
@@ -517,37 +432,101 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                 ]
                 .into()
             }
-            Operation::WASMOp(Op::Unreachable) => s
-                .emit_trap(&mut ctx, TrapReason::UnreachableInstruction)
+        }
+        Operation::WASMOp(Op::CallIndirect {
+            table_index,
+            type_index,
+        }) => {
+            let curr_entry = ctrl_stack.front().unwrap();
+
+            // The last input of the CallIndirect operation is the table entry, the others are the function arguments.
+            let (entry_idx, inputs) = inputs.split_last().unwrap();
+            let entry_idx = entry_idx.as_register().unwrap().clone();
+
+            let fn_type = ctx.common.prog.get_type(type_index);
+            let call = prepare_function_call(
+                s,
+                &mut ctx,
+                &curr_entry.allocation,
+                node_idx,
+                inputs,
+                &fn_type.ty,
+            );
+
+            // We need to load the function reference from the table, so we allocate
+            // the space for it and emit the table.get directive.
+            let func_ref_reg = ctx.allocate_tmp_type::<S>(ValType::FUNCREF);
+
+            // Split the components of the function reference:
+            let split_ref = split_func_ref_regs::<S>(func_ref_reg.clone());
+
+            // Indirect calls require checking the function type first.
+            // We need a label for the OK case.
+            let ok_label = ctx.new_label(LabelType::Local);
+
+            // The sequence to load the function reference, check the type,
+            // and then perform the indirect call.
+            vec![
+                s.emit_wasm_op(
+                    &mut ctx,
+                    Op::TableGet { table: table_index },
+                    &[WasmOpInput::Register(entry_idx)],
+                    Some(func_ref_reg),
+                )
                 .into(),
-            Operation::WASMOp(op) => {
-                // Normal WASM operations are handled by the ISA emmiter directly.
-                let curr_entry = ctrl_stack.front().unwrap();
-                let output = match output_types.len() {
-                    0 => None,
-                    1 => Some(
-                        curr_entry
-                            .allocation
-                            .get(&ValueOrigin {
-                                node: node_idx,
-                                output_idx: 0,
-                            })
-                            .unwrap(),
-                    ),
-                    _ => {
-                        panic!("WASM instructions with multiple outputs! This is a bug.");
-                    }
-                };
-                s.emit_wasm_op(&mut ctx, op, &inputs, output).into()
-            }
+                s.emit_conditional_jump_cmp_immediate(
+                    &mut ctx,
+                    ComparisonFunction::Equal,
+                    split_ref[FunctionRef::<S>::TYPE_ID].clone(),
+                    fn_type.unique_id,
+                    ok_label.clone(),
+                )
+                .into(),
+                s.emit_trap(&mut ctx, TrapReason::WrongIndirectCallFunctionType)
+                    .into(),
+                s.emit_label(&mut ctx, ok_label).into(),
+                call.prefix_directives.into(),
+                s.emit_indirect_call(
+                    &mut ctx,
+                    split_ref[FunctionRef::<S>::FUNC_ADDR].clone(),
+                    call.frame_start,
+                    call.ret_pc,
+                    call.ret_fp,
+                )
+                .into(),
+                call.suffix_directives.into(),
+                s.emit_drop_from(&mut ctx, call.drop_from).into(),
+            ]
+            .into()
+        }
+        Operation::WASMOp(Op::Unreachable) => s
+            .emit_trap(&mut ctx, TrapReason::UnreachableInstruction)
+            .into(),
+        Operation::WASMOp(op) => {
+            // Normal WASM operations are handled by the ISA emmiter directly.
+            let curr_entry = ctrl_stack.front().unwrap();
+            let output = match output_types.len() {
+                0 => None,
+                1 => Some(
+                    curr_entry
+                        .allocation
+                        .get(&ValueOrigin {
+                            node: node_idx,
+                            output_idx: 0,
+                        })
+                        .unwrap(),
+                ),
+                _ => {
+                    panic!("WASM instructions with multiple outputs! This is a bug.");
+                }
+            };
+            s.emit_wasm_op(&mut ctx, op, &inputs, output).into()
         }
     };
 
-    if is_terminal {
-        node_directives
-    } else if let Some(drops) = drop_map.get(&node_idx) {
-        let allocation = &ctrl_stack[0].allocation;
-        let mut ctx = Context::new(common_ctx, allocation, node_idx, &inputs);
+    // Operation::Loop returns early, and never gets here. That is fine, because it is_terminal is true.
+
+    if !is_terminal && let Some(drops) = drop_map.get(&node_idx) {
         let mut result = vec![node_directives];
         for &reg in drops {
             result.push(s.emit_drop(&mut ctx, reg).into());
