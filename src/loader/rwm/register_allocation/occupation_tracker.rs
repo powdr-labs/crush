@@ -1,5 +1,5 @@
 use crate::loader::rwm::liveness_dag::single_range;
-use crate::loader::rwm::register_allocation::Allocation;
+use crate::loader::rwm::register_allocation::{Allocation, PerNodeOccupation, RangeReg};
 use crate::loader::{dag::ValueOrigin, rwm::liveness_dag::Liveness};
 use crate::utils::range_consolidation::RangeConsolidationIterator;
 use iset::IntervalMap;
@@ -126,7 +126,7 @@ impl Occupation {
 
     pub fn per_node_tracker(&self) -> PerNodeOccupation {
         // Sort all the allocated chunks by their live range start.
-        let mut rev_sorted_allocs = self
+        let mut rev_sorted_next_allocs = self
             .allocations
             .iter()
             .filter(|alloc| matches!(alloc.kind, AllocationType::Value { .. }))
@@ -137,195 +137,13 @@ impl Occupation {
                 })
             })
             .collect_vec();
-        rev_sorted_allocs.sort_unstable_by_key(|r| Reverse(r.live.start));
+        rev_sorted_next_allocs.sort_unstable_by_key(|r| Reverse(r.live.start));
 
-        todo!();
-    }
-
-    /// Precomputes a map from node index to the set of registers that should be dropped
-    /// after processing that node.
-    ///
-    /// For each Value allocation's live range:
-    /// - Last range: the value is consumed at `range.end`, so drop after node `range.end`.
-    /// - Intermediate range: boundary death, drop after node `range.end - 1` (last node in range).
-    ///
-    /// A drop is suppressed for a register if it is immediately written at the drop point
-    /// (i.e., the node at the drop point produces an output in that register).
-    pub fn compute__drop_map(
-        &self,
-        _nodes_outputs: &BTreeMap<ValueOrigin, Range<u32>>,
-        labels: &HashMap<u32, usize>,
-    ) -> HashMap<usize, Vec<u32>> {
-        let mut drops: HashMap<usize, BTreeSet<u32>> = HashMap::new();
-
-        for entry in &self.allocations {
-            if !matches!(entry.kind, AllocationType::Value { .. }) {
-                continue;
-            }
-
-            for range in entry.live_ranges.iter() {
-                if range.start >= range.end {
-                    // Dimensionless (truly unused) ranges: nothing to drop —
-                    // the register never had a meaningful value placed in it.
-                    continue;
-                }
-
-                // The value is consumed at `range.end` (either read by a node
-                // there or dying at a control-flow boundary), so the drop goes
-                // right after it.
-                let drop_at = range.end;
-
-                let drop_set = drops.entry(drop_at).or_default();
-                // Check which registers are occupied by actual data at drop_at.
-                // Only Value (another live value) and ExplicitlyBlocked (RA/FP)
-                // suppress drops. Structural reservations (FunctionFrame,
-                // SubBlockInternal, BlockedRegistersAtParent) do not.
-                let occupied_at_drop: Vec<Range<u32>> = self
-                    .alive_interval_map
-                    .values(drop_at..(drop_at + 1))
-                    .filter_map(|idx| {
-                        let alloc = &self.allocations[*idx];
-                        matches!(
-                            alloc.kind,
-                            AllocationType::Value { .. }
-                                | AllocationType::ExplicitlyBlocked
-                                | AllocationType::BlockedRegistersAtParent
-                                | AllocationType::SubBlockInternal
-                        )
-                        .then(|| alloc.reg_range.clone())
-                    })
-                    .collect();
-
-                for reg in entry.reg_range.clone() {
-                    // Skip if any allocation occupies this register at the drop point.
-                    let is_occupied = occupied_at_drop
-                        .iter()
-                        .any(|r| r.start <= reg && reg < r.end);
-
-                    if !is_occupied {
-                        drop_set.insert(reg);
-                    }
-                }
-            }
+        PerNodeOccupation {
+            next_node: 0,
+            rev_sorted_next_allocs,
+            active_allocs: BinaryHeap::new(),
         }
-
-        // Second pass: at each label, drop registers that were alive just before
-        // the label but are dead at the label. This handles values consumed by
-        // terminal jumps (Br/BrTable) targeting the label, whose drops couldn't
-        // be emitted at the terminal node.
-        let value_or_blocked = |node: usize| -> Vec<Range<u32>> {
-            self.alive_interval_map
-                .values(node..(node + 1))
-                .filter_map(|idx| {
-                    let alloc = &self.allocations[*idx];
-                    matches!(
-                        alloc.kind,
-                        AllocationType::Value { .. } | AllocationType::ExplicitlyBlocked
-                    )
-                    .then(|| alloc.reg_range.clone())
-                })
-                .collect()
-        };
-
-        for &label_node in labels.values() {
-            if label_node == 0 {
-                continue;
-            }
-            let prev_occ = value_or_blocked(label_node - 1);
-            let label_occ = value_or_blocked(label_node);
-            let drop_set = drops.entry(label_node).or_default();
-            for prev_range in &prev_occ {
-                for reg in prev_range.clone() {
-                    let alive_at_label = label_occ.iter().any(|r| r.start <= reg && reg < r.end);
-                    if !alive_at_label {
-                        drop_set.insert(reg);
-                    }
-                }
-            }
-        }
-
-        drops
-            .into_iter()
-            .map(|(node, regs)| (node, regs.into_iter().collect()))
-            .collect()
-    }
-}
-
-/// Struct to track every live chunk independently.
-///
-/// It compares by reverse live range end so it can be inserted in a BinaryHeap
-/// to efficiently track the currently alive chunks by their end point.
-#[derive(Eq)]
-struct RangeReg {
-    live: Range<usize>,
-    regs: Range<u32>,
-}
-impl PartialEq for RangeReg {
-    fn eq(&self, other: &Self) -> bool {
-        self.live.end == other.live.end
-    }
-}
-impl PartialOrd for RangeReg {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for RangeReg {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Reverse order: think of higer as "first to die".
-        other.live.end.cmp(&self.live.end)
-    }
-}
-
-/// This is a tracker that reply the allocation state per node, and
-/// can be used to detect when a value is no longer alive and its
-/// register can be dropped.
-pub struct PerNodeOccupation {
-    next_node: usize,
-    /// The allocations that have not yet become alive, sorted by their live
-    /// range start in reverse order (so we can pop to get the next allocation).
-    rev_sorted_next_allocs: Vec<RangeReg>,
-    active_allocs: BinaryHeap<RangeReg>,
-}
-
-impl PerNodeOccupation {
-    /// Advances the tracker to the next node, returning the set of registers that
-    /// are just dying at this node. To get what actually must be dropped, make
-    /// the difference with the registers that are alive at this node (which doesn't
-    /// include the dying, but includes the ones just becoming live).
-    pub fn advance(&mut self) -> (usize, HashSet<u32>) {
-        let curr_node = self.next_node;
-        self.next_node += 1;
-
-        // The following order is important: add the new allocations first, then remove
-        // the dying ones, because some allocations are degenerate (live range is a single node).
-
-        // Add the new allocations.
-        while let Some(next_to_live) = self.rev_sorted_next_allocs.last()
-            && next_to_live.live.start <= self.next_node
-        {
-            self.active_allocs
-                .push(self.rev_sorted_next_allocs.pop().unwrap());
-        }
-
-        // Remove the dying allocations and collect their registers.
-        let mut dying = HashSet::new();
-        while let Some(next_to_die) = self.active_allocs.peek()
-            && next_to_die.live.end <= curr_node
-        {
-            for reg in next_to_die.regs.clone() {
-                dying.insert(reg);
-            }
-            self.active_allocs.pop();
-        }
-
-        (curr_node, dying)
-    }
-
-    pub fn alive(&self) -> impl Iterator<Item = u32> {
-        self.active_allocs
-            .iter()
-            .flat_map(|alloc| alloc.regs.clone())
     }
 }
 

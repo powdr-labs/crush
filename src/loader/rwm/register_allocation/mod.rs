@@ -1,7 +1,7 @@
 mod occupation_tracker;
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
     num::NonZeroU32,
     ops::Range,
 };
@@ -88,9 +88,8 @@ impl Allocation {
     }
 
     /// Precomputes a map from node index to registers that should be dropped after that node.
-    pub fn compute_drop_map(&self) -> HashMap<usize, Vec<u32>> {
-        self.occupation
-            .compute_drop_map(&self.nodes_outputs, &self.labels)
+    pub fn per_node_occupation(&self) -> PerNodeOccupation {
+        self.occupation.per_node_tracker()
     }
 
     /// Returns `true` if the value at `origin` is read by at least one node.
@@ -108,6 +107,92 @@ impl Allocation {
 
 pub type AllocatedDag<'a> = GenericBlocklessDag<'a, Allocation>;
 pub type Node<'a> = GenericNode<'a, Allocation>;
+
+/// Struct to track every live chunk independently.
+///
+/// It compares by reverse live range end so it can be inserted in a BinaryHeap
+/// to efficiently track the currently alive chunks by their end point.
+#[derive(Eq)]
+struct RangeReg {
+    live: Range<usize>,
+    regs: Range<u32>,
+}
+impl PartialEq for RangeReg {
+    fn eq(&self, other: &Self) -> bool {
+        self.live.end == other.live.end
+    }
+}
+impl PartialOrd for RangeReg {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for RangeReg {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse order: think of higer as "first to die".
+        other.live.end.cmp(&self.live.end)
+    }
+}
+
+/// This is a tracker that reply the allocation state per node, and
+/// can be used to detect when a value is no longer alive and its
+/// register can be dropped.
+pub struct PerNodeOccupation {
+    next_node: usize,
+    /// The allocations that have not yet become alive, sorted by their live
+    /// range start in reverse order (so we can pop to get the next allocation).
+    rev_sorted_next_allocs: Vec<RangeReg>,
+    active_allocs: BinaryHeap<RangeReg>,
+}
+
+impl PerNodeOccupation {
+    /// Advances the tracker to the next node, returning the set of registers that
+    /// are just dying at this node. To get what actually must be dropped, make
+    /// the difference with the registers that are alive at this node (which doesn't
+    /// include the dying, but includes the ones just becoming live).
+    pub fn advance(&mut self) -> (usize, BTreeSet<u32>, Vec<u32>) {
+        let curr_node = self.next_node;
+        self.next_node += 1;
+
+        // Remove the dying allocations and collect their registers.
+        let mut dying = BTreeSet::new();
+        while let Some(next_to_die) = self.active_allocs.peek()
+            && next_to_die.live.end <= curr_node
+        {
+            for reg in next_to_die.regs.clone() {
+                dying.insert(reg);
+            }
+            self.active_allocs.pop();
+        }
+
+        // Add the new allocations.
+        let mut newly_live = Vec::new();
+        while let Some(next_to_live) = self.rev_sorted_next_allocs.last()
+            && next_to_live.live.start <= curr_node
+        {
+            let next_to_live = self.rev_sorted_next_allocs.pop().unwrap();
+            if next_to_live.live.end == curr_node {
+                // This is an ephemeral value that must be discarded right away
+                for reg in next_to_live.regs {
+                    dying.insert(reg);
+                }
+            } else {
+                for reg in next_to_live.regs.clone() {
+                    newly_live.push(reg);
+                }
+                self.active_allocs.push(next_to_live);
+            }
+        }
+
+        (curr_node, dying, newly_live)
+    }
+
+    pub fn alive(&self) -> impl Iterator<Item = u32> {
+        self.active_allocs
+            .iter()
+            .flat_map(|alloc| alloc.regs.clone())
+    }
+}
 
 struct OptimisticAllocator {
     occupation_tracker: OccupationTracker,

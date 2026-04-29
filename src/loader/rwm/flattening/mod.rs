@@ -17,7 +17,7 @@ use crate::{
         },
         rwm::{
             flattening::sequence_parallel_copies::Register,
-            register_allocation::{self, AllocatedDag, Allocation},
+            register_allocation::{self, AllocatedDag, Allocation, PerNodeOccupation},
             settings::Settings,
         },
         settings::{
@@ -28,7 +28,7 @@ use crate::{
     utils::{range_consolidation::RangeConsolidationIterator, tree::Tree},
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashSet, VecDeque},
     ops::Range,
     sync::atomic::AtomicU32,
 };
@@ -73,14 +73,21 @@ fn process_dag<'a, 'b, S: Settings<'a>>(
     nodes: Vec<register_allocation::Node<'a>>,
     func_idx: u32,
 ) -> Tree<S::Directive> {
-    // Precompute the drop map for this DAG level.
-    let drop_map = ctrl_stack[0].allocation.compute_drop_map();
+    let mut occupation_tracker = ctrl_stack[0].allocation.per_node_occupation();
 
     nodes
         .into_iter()
         .enumerate()
         .map(|(node_idx, node)| {
-            process_node(s, ctx, ctrl_stack, node, node_idx, func_idx, &drop_map)
+            process_node(
+                s,
+                ctx,
+                ctrl_stack,
+                node,
+                node_idx,
+                func_idx,
+                &mut occupation_tracker,
+            )
         })
         .collect_vec()
         .into()
@@ -93,23 +100,17 @@ fn process_node<'a, 'b, S: Settings<'a>>(
     node: register_allocation::Node<'a>,
     node_idx: usize,
     func_idx: u32,
-    drop_map: &HashMap<usize, Vec<u32>>,
+    occupation_tracker: &mut PerNodeOccupation,
 ) -> Tree<S::Directive> {
+    let (tracked_node_idx, mut dying_values, newly_live_values) = occupation_tracker.advance();
+    assert_eq!(tracked_node_idx, node_idx);
+
     // Destructure the node so we can use parts in separate scopes.
     let register_allocation::Node {
         operation,
         inputs: raw_inputs,
         output_types,
     } = node;
-
-    // Terminal nodes have no fall-through, so no drops are needed after them.
-    let is_terminal = matches!(
-        &operation,
-        Operation::Br(_)
-            | Operation::BrTable { .. }
-            | Operation::Loop { .. }
-            | Operation::WASMOp(Op::Unreachable)
-    );
 
     let allocation = &ctrl_stack[0].allocation;
 
@@ -175,7 +176,8 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             return loop_directives.into();
         }
         Operation::Br(break_target) => {
-            emit_jump(s, &mut ctx, ctrl_stack, break_target, &inputs, func_idx).into_tree(s)
+            return emit_jump(s, &mut ctx, ctrl_stack, break_target, &inputs, func_idx)
+                .into_tree(s);
         }
         Operation::BrIf(target) | Operation::BrIfZero(target) => {
             let (cond, inverse_cond) = match operation {
@@ -380,7 +382,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                 directives.push(s.emit_label(&mut ctx, jump_label).into());
                 directives.push(jump_directives.into());
             }
-            directives.into()
+            return directives.into();
         }
         Operation::WASMOp(Op::Call { function_index }) => {
             let curr_entry = ctrl_stack.front().unwrap();
@@ -499,9 +501,11 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             ]
             .into()
         }
-        Operation::WASMOp(Op::Unreachable) => s
-            .emit_trap(&mut ctx, TrapReason::UnreachableInstruction)
-            .into(),
+        Operation::WASMOp(Op::Unreachable) => {
+            return s
+                .emit_trap(&mut ctx, TrapReason::UnreachableInstruction)
+                .into();
+        }
         Operation::WASMOp(op) => {
             // Normal WASM operations are handled by the ISA emmiter directly.
             let curr_entry = ctrl_stack.front().unwrap();
@@ -524,11 +528,28 @@ fn process_node<'a, 'b, S: Settings<'a>>(
         }
     };
 
-    // Operation::Loop returns early, and never gets here. That is fine, because it is_terminal is true.
+    // Some nodes return early, and execution never gets here. They are:
+    //
+    // Operations that don't have fallthrough, so it is not necessary to emit drops following them:
+    // - Operation::Br
+    // - Operation::BrTable
+    // - Operation::Loop
+    // - Operation::WASMOp(Op::Unreachable)
+    //
+    // Calls, because they emit their own drops, as they need to emit the more encompassing DropFrom,
+    // which cleans the entire function frame.
+    // - Operation::WASMOp(Op::Call)
+    // - Operation::WASMOp(Op::CallIndirect)
 
-    if !is_terminal && let Some(drops) = drop_map.get(&node_idx) {
+    if !dying_values.is_empty() {
+        // We need to filter newly live values out of dying values
+        // (i.e. values that were overritten at this node, reusing the same input register as output)
+        for reused_reg in newly_live_values {
+            dying_values.remove(&reused_reg);
+        }
+
         let mut result = vec![node_directives];
-        for &reg in drops {
+        for reg in dying_values {
             result.push(s.emit_drop(&mut ctx, reg).into());
         }
         result.into()
@@ -640,7 +661,12 @@ fn copy_inputs_if_needed<'a, S: Settings<'a>>(
             (source != destiny).then_some((source, destiny))
         })
         .collect_vec();
-    parallel_copy(s, ctx, copy_set)
+    let (tmp_register, mut directives) = parallel_copy(s, ctx, copy_set);
+    if let Some(tmp_register) = tmp_register {
+        // If a temporary register was needed, we need to emit a directive to drop it at the end.
+        directives.push(s.emit_drop(ctx, tmp_register).into());
+    }
+    directives
 }
 
 /// Given a set of source-destination register ranges, emits the sequence of copy instructions
@@ -649,7 +675,7 @@ fn parallel_copy<'a, S: Settings<'a>>(
     s: &S,
     ctx: &mut Context<'a, '_>,
     copy_set: Vec<(Range<u32>, Range<u32>)>,
-) -> Vec<Tree<S::Directive>> {
+) -> (Option<u32>, Vec<Tree<S::Directive>>) {
     // Turn a set of range copies into a set of single register copies.
     let copy_set = copy_set
         .into_iter()
@@ -674,13 +700,14 @@ fn parallel_copy<'a, S: Settings<'a>>(
         }
     };
 
-    copy_sequence
+    let directives = copy_sequence
         .map(|(src, dest)| {
             let src = materialize(ctx, src);
             let dest = materialize(ctx, dest);
             s.emit_copy(ctx, src, dest).into()
         })
-        .collect_vec()
+        .collect_vec();
+    (tmp_register, directives)
 }
 
 /// Calculates the register address for a tightly packed list types.
@@ -849,9 +876,6 @@ impl<'a, 'b> Context<'a, 'b> {
 
 struct FunctionCall<D> {
     frame_start: u32,
-    /// First register past the return values in the callee's frame.
-    /// Everything from here onward is garbage after the call returns.
-    drop_from: u32,
     prefix_directives: Vec<Tree<D>>,
     suffix_directives: Vec<Tree<D>>,
     ret_pc: Range<u32>,
@@ -865,6 +889,8 @@ fn prepare_function_call<'a, S: Settings<'a>>(
     node_idx: usize,
     inputs: &[WasmOpInput],
     func_type: &FuncType,
+    mut dying_values: BTreeSet<u32>,
+    mut newly_live_values: Vec<u32>,
 ) -> FunctionCall<S::Directive> {
     // Normal function calls requires inputs to be copied to where they are needed in the
     // function frame, and also may require outputs to be copied to where the users expect
@@ -901,45 +927,36 @@ fn prepare_function_call<'a, S: Settings<'a>>(
 
     // Set the end of the function call prelude, so tmps can be allocated in the function frame if needed.
     ctx.function_call_prelude_size = Some(ret_fp.end);
+    // Calculate what drop instructions to emit.
+    for written_reg in &newly_live_values {
+        dying_values.remove(written_reg);
+    }
 
-    let mut drop_from = outputs_offset;
-    let mut scan_offset = outputs_offset;
-    for output_idx in (0..func_type.results().len()).rev() {
-        let size = word_count_type::<S>(func_type.results()[output_idx]);
-        scan_offset -= size;
-        let natural_range = scan_offset..(scan_offset + size);
-
-        let output_origin = ValueOrigin {
-            node: node_idx,
-            output_idx: output_idx as u32,
-        };
-        let dest_range = allocation.get(&output_origin).unwrap();
-
-        // If the output was copied elsewhere, it's used (just relocated).
-        if dest_range != natural_range {
-            break;
-        }
-
-        // Output is at its natural position. Drop it only if truly unused —
-        // i.e. its live range is dimensionless. A value consumed at the very
-        // next node has live range `[node_idx, node_idx + 1)` which would not
-        // show up in `occupation_for_node(node_idx + 1)`, but `is_value_used`
-        // correctly tells it apart from a dimensionless `[node_idx, node_idx)`.
-        if allocation.is_value_used(&output_origin) {
-            break;
-        }
-
-        // This trailing output is unused. Include it in the DropFrom range.
-        drop_from = scan_offset;
+    // Everything from frame_start onward that is not a newly live value must be dropped.
+    // I.e. we must keep function outputs that were allocated inside the callee frame.
+    newly_live_values.retain(|reg| *reg >= frame_start);
+    newly_live_values.sort_unstable();
+    let mut drop_from = frame_start;
+    for reg in newly_live_values {
+        dying_values.extend(drop_from..reg);
+        drop_from = reg + 1;
     }
 
     // Generate the actual directives for input and output copy.
     let prefix_directives = copy_inputs_if_needed(s, ctx, inputs, input_ranges);
-    let suffix_directives = parallel_copy(s, ctx, output_copy_set);
+    let (tmp_reg, mut suffix_directives) = parallel_copy(s, ctx, output_copy_set);
+    if let Some(tmp_reg) = tmp_reg {
+        dying_values.insert(tmp_reg);
+    }
+
+    // Emit the actual drops
+    for reg in dying_values.range(..drop_from) {
+        suffix_directives.push(s.emit_drop(ctx, *reg).into());
+    }
+    suffix_directives.push(s.emit_drop_from(ctx, drop_from).into());
 
     FunctionCall {
         frame_start,
-        drop_from,
         prefix_directives,
         suffix_directives,
         ret_pc,
