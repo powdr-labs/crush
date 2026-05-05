@@ -186,12 +186,6 @@ impl PerNodeOccupation {
 
         (curr_node, dying, newly_live)
     }
-
-    pub fn alive(&self) -> impl Iterator<Item = u32> {
-        self.active_allocs
-            .iter()
-            .flat_map(|alloc| alloc.regs.clone())
-    }
 }
 
 struct OptimisticAllocator {
