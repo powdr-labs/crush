@@ -1,7 +1,7 @@
 mod occupation_tracker;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque},
     num::NonZeroU32,
     ops::Range,
 };

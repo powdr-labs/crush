@@ -725,7 +725,7 @@ fn emit_jump<'a, S: Settings<'a>>(
             (
                 target_entry.allocation.labels[&id],
                 format_label(id, LabelType::Local),
-                label_borrow.get_mut(&id).unwrap(),
+                label_borrow.entry(id).or_default(),
             )
         }
     };

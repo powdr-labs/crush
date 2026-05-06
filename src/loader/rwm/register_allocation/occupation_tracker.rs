@@ -5,7 +5,7 @@ use crate::utils::range_consolidation::RangeConsolidationIterator;
 use iset::IntervalMap;
 use itertools::Itertools;
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::io::Write;
 use std::sync::{Arc, LazyLock};
 use std::{
