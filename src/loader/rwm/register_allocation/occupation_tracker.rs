@@ -37,7 +37,28 @@ struct AllocationEntry {
     /// that renders the value dead or at the last node that uses it in that execution path.
     ///
     /// The ranges are half-open, sorted and disjoint.
+    ///
+    /// A single empty range `[X, X)` is a valid value, meaning the allocation is
+    /// produced at node `X` but never used (dimensionless lifetime). It is stored
+    /// that way so that "produced but immediately discarded" can be distinguished
+    /// from "last used at X + 1" (whose range is `[X, X + 1)`). The IntervalMap
+    /// cannot store empty intervals, so entries for dimensionless allocations are
+    /// still inserted into the IntervalMap as `[X, X + 1)` to block allocations at
+    /// that register for the node `X` (the value is written there at origin, so
+    /// no other live value can share the slot at that moment).
     live_ranges: Arc<[Range<usize>]>,
+}
+
+/// Produces the IntervalMap interval corresponding to a live range stored in
+/// an `AllocationEntry`. Dimensionless ranges `[X, X)` are widened to `[X, X + 1)`
+/// because `iset::IntervalMap` does not accept empty intervals. All other ranges
+/// pass through unchanged.
+fn interval_map_range(r: &Range<usize>) -> Range<usize> {
+    if r.start < r.end {
+        r.clone()
+    } else {
+        r.start..(r.start + 1)
+    }
 }
 
 /// Maps occupied registers over nodes.
@@ -50,10 +71,25 @@ pub struct Occupation {
 }
 
 impl Occupation {
+    /// Returns the register ranges of allocations whose live range overlaps any
+    /// of the given `live_ranges`.
+    ///
+    /// A dimensionless query range `[X, X)` is interpreted as a point query at
+    /// `X`, returning all intervals containing `X`. This is required for
+    /// correctness when allocating values with empty liveness (e.g. an unused
+    /// output of a non-call node): the point query surfaces the allocations
+    /// that are alive at the origin, so the allocator places the doomed write
+    /// past them instead of clobbering a still-needed register.
+    ///
+    /// Implemented by widening `[X, X)` to `[X, X + 1)` before calling
+    /// `iset::IntervalMap::values`, which rejects empty intervals. This yields
+    /// the same set of stored intervals as the point query (both match
+    /// intervals `[a, b)` with `a ≤ X < b`), so the widening is
+    /// semantics-preserving.
     pub fn reg_occupation(&self, live_ranges: &[Range<usize>]) -> Vec<Range<u32>> {
         live_ranges
             .iter()
-            .cloned()
+            .map(interval_map_range)
             .flat_map(|live_range| {
                 self.alive_interval_map
                     .values(live_range)
@@ -281,8 +317,8 @@ impl OccupationTracker {
                 let live_range = self.liveness.query_liveness(&origin);
                 assert_eq!(
                     live_range.as_ref(),
-                    single_range(origin.node..(origin.node + 1)).as_ref(),
-                    "unused function output should have one node liveness"
+                    single_range(origin.node..origin.node).as_ref(),
+                    "unused function output should have dimensionless liveness"
                 );
 
                 self.insert(
@@ -553,7 +589,7 @@ impl OccupationTracker {
         for range in live_ranges.iter() {
             self.occupation
                 .alive_interval_map
-                .force_insert(range.clone(), entry_idx);
+                .force_insert(interval_map_range(range), entry_idx);
         }
 
         self.occupation.allocations.push(AllocationEntry {
@@ -577,7 +613,7 @@ impl OccupationTracker {
         for live_range in alloc.live_ranges.iter() {
             self.occupation
                 .alive_interval_map
-                .remove_where(live_range.clone(), |idx| *idx == entry_idx);
+                .remove_where(interval_map_range(live_range), |idx| *idx == entry_idx);
         }
 
         // Now we need to fix the references to the entry moved by swap_remove.
@@ -593,12 +629,13 @@ impl OccupationTracker {
         }
 
         for live_range in moved_entry.live_ranges.iter() {
+            let im_range = interval_map_range(live_range);
             self.occupation
                 .alive_interval_map
-                .remove_where(live_range.clone(), |idx| *idx == old_idx);
+                .remove_where(im_range.clone(), |idx| *idx == old_idx);
             self.occupation
                 .alive_interval_map
-                .force_insert(live_range.clone(), entry_idx);
+                .force_insert(im_range, entry_idx);
         }
     }
 }
