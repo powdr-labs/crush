@@ -852,53 +852,64 @@ fn pack_bytes_into_words(bytes: &[u8], mut alignment: u32) -> Vec<MemoryEntry> {
     words
 }
 
-#[derive(Debug, Default)]
-pub struct Statistics {
-    /// Number of register copies saved by the "smart" register allocation.
-    pub register_copies_saved: usize,
-    /// Number of constants collapsed into instructions.
-    pub constants_collapsed: usize,
-    /// Number of constants deduplicated in the DAG.
-    pub constants_deduplicated: usize,
-    /// Number of dangling nodes removed from the DAG.
-    pub dangling_nodes_removed: usize,
-    /// Number of loop inputs removed from the DAG.
-    pub loop_inputs_removed: usize,
-    /// Number of block outputs removed from the DAG.
-    pub block_outputs_removed: usize,
-    /// Number of useless jumps removed from flattened assembly.
-    pub useless_jumps_removed: usize,
-    /// Number of useless labels removed from flattened assembly.
-    pub orphan_labels_removed: usize,
+/// Macro to define the `Statistics` struct and its implementations of `AddAssign` and `Display`.
+macro_rules! define_statistics {
+    (
+        $(#[$struct_meta:meta])*
+        $vis:vis struct $name:ident {
+            $(
+                $(#[$field_meta:meta])*
+                $field:ident: $ty:ty => $display_name:literal,
+            )*
+        }
+    ) => {
+        $(#[$struct_meta])*
+        $vis struct $name {
+            $(
+                $(#[$field_meta])*
+                pub $field: $ty,
+            )*
+        }
+
+        impl AddAssign for $name {
+            fn add_assign(&mut self, other: Self) {
+                $(
+                    self.$field += other.$field;
+                )*
+            }
+        }
+
+        impl Display for $name {
+            fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+                write!(f, "Optimization statistics:")?;
+                $(
+                    write!(f, "\n - {} {}", self.$field, $display_name)?;
+                )*
+                Ok(())
+            }
+        }
+    };
 }
 
-impl AddAssign for Statistics {
-    fn add_assign(&mut self, other: Self) {
-        self.register_copies_saved += other.register_copies_saved;
-        self.constants_collapsed += other.constants_collapsed;
-        self.constants_deduplicated += other.constants_deduplicated;
-        self.dangling_nodes_removed += other.dangling_nodes_removed;
-        self.loop_inputs_removed += other.loop_inputs_removed;
-        self.block_outputs_removed += other.block_outputs_removed;
-        self.useless_jumps_removed += other.useless_jumps_removed;
-        self.orphan_labels_removed += other.orphan_labels_removed;
-    }
-}
-
-impl Display for Statistics {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "Optimization statistics:\n - {} register copies saved\n - {} constants collapsed\n - {} constants deduplicated\n - {} dangling nodes removed\n - {} loop inputs removed\n - {} block outputs removed\n - {} useless jumps removed\n - {} orphan labels removed",
-            self.register_copies_saved,
-            self.constants_collapsed,
-            self.constants_deduplicated,
-            self.dangling_nodes_removed,
-            self.loop_inputs_removed,
-            self.block_outputs_removed,
-            self.useless_jumps_removed,
-            self.orphan_labels_removed,
-        )
+define_statistics! {
+    #[derive(Debug, Default)]
+    pub struct Statistics {
+        /// Number of register copies saved by the "smart" register allocation.
+        register_copies_saved: usize => "register copies saved",
+        /// Number of constants collapsed into instructions.
+        constants_collapsed: usize => "constants collapsed",
+        /// Number of constants deduplicated in the DAG.
+        constants_deduplicated: usize => "constants deduplicated",
+        /// Number of dangling nodes removed from the DAG.
+        dangling_nodes_removed: usize => "dangling nodes removed",
+        /// Number of loop inputs removed from the DAG.
+        loop_inputs_removed: usize => "loop inputs removed",
+        /// Number of block outputs removed from the DAG.
+        block_outputs_removed: usize => "block outputs removed",
+        /// Number of useless jumps removed from flattened assembly.
+        useless_jumps_removed: usize => "useless jumps removed",
+        /// Number of useless labels removed from flattened assembly.
+        orphan_labels_removed: usize => "orphan labels removed",
     }
 }
 
