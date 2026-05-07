@@ -496,6 +496,8 @@ pub enum CommonStages<'a> {
     /// The blockless DAG representation of the function, where block nodes are expanded
     /// into the parent block and labels are introduced. Loops are still kept as blocks.
     BlocklessDag(BlocklessDag<'a>),
+    /// The blockless DAG with unused labels and the unreachable code below them removed.
+    CleanBlocklessDag(BlocklessDag<'a>),
 }
 
 impl<'a, S: Settings> FunctionProcessingStage<'a, S> for CommonStages<'a> {
@@ -572,15 +574,24 @@ impl<'a, S: Settings> FunctionProcessingStage<'a, S> for CommonStages<'a> {
                 let blockless_dag = BlocklessDag::from_dag(dag, label_gen);
                 Self::BlocklessDag(blockless_dag)
             }
-            Self::BlocklessDag(blockless_dag) => {
+            Self::BlocklessDag(mut blockless_dag) => {
+                // Optimization pass: remove unused labels and the unreachable code below them.
+                let removed =
+                    passes::unreachable_code_removal::remove_unreachable_code(&mut blockless_dag);
+                if let Some(stats) = stats {
+                    stats.unreachable_nodes_removed += removed;
+                }
+                Self::CleanBlocklessDag(blockless_dag)
+            }
+            Self::CleanBlocklessDag(blockless_dag) => {
                 // This is the last stage in this part of the pipeline. Just return itself.
-                Self::BlocklessDag(blockless_dag)
+                Self::CleanBlocklessDag(blockless_dag)
             }
         })
     }
 
     fn consume_last_stage(self) -> Result<Self::LastStage, Self> {
-        if let Self::BlocklessDag(blockless_dag) = self {
+        if let Self::CleanBlocklessDag(blockless_dag) = self {
             Ok(blockless_dag)
         } else {
             Err(self)
@@ -870,6 +881,9 @@ pub struct Statistics {
     pub useless_jumps_removed: usize,
     /// Number of useless labels removed from flattened assembly.
     pub orphan_labels_removed: usize,
+    /// Number of unreachable nodes (unused labels and dead code below them)
+    /// removed from the blockless DAG.
+    pub unreachable_nodes_removed: usize,
 }
 
 impl AddAssign for Statistics {
@@ -882,6 +896,7 @@ impl AddAssign for Statistics {
         self.block_outputs_removed += other.block_outputs_removed;
         self.useless_jumps_removed += other.useless_jumps_removed;
         self.orphan_labels_removed += other.orphan_labels_removed;
+        self.unreachable_nodes_removed += other.unreachable_nodes_removed;
     }
 }
 
@@ -889,7 +904,7 @@ impl Display for Statistics {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(
             f,
-            "Optimization statistics:\n - {} register copies saved\n - {} constants collapsed\n - {} constants deduplicated\n - {} dangling nodes removed\n - {} loop inputs removed\n - {} block outputs removed\n - {} useless jumps removed\n - {} orphan labels removed",
+            "Optimization statistics:\n - {} register copies saved\n - {} constants collapsed\n - {} constants deduplicated\n - {} dangling nodes removed\n - {} loop inputs removed\n - {} block outputs removed\n - {} useless jumps removed\n - {} orphan labels removed\n - {} unreachable nodes removed",
             self.register_copies_saved,
             self.constants_collapsed,
             self.constants_deduplicated,
@@ -898,6 +913,7 @@ impl Display for Statistics {
             self.block_outputs_removed,
             self.useless_jumps_removed,
             self.orphan_labels_removed,
+            self.unreachable_nodes_removed,
         )
     }
 }
