@@ -436,6 +436,27 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_block_drop_hint() {
+        // arg == 0: br_if not taken, falls into `br 1`, exits outer block,
+        // and uses the local: returns 100 + 1 = 101.
+        test_interpreter_from_sample_programs(
+            "nested_block_drop_hint.wasm",
+            "nested_block_drop_hint",
+            &[0],
+            vec![],
+            &[101],
+        );
+        // arg != 0: br_if taken, exits inner block, does not use the local: returns 7.
+        test_interpreter_from_sample_programs(
+            "nested_block_drop_hint.wasm",
+            "nested_block_drop_hint",
+            &[1],
+            vec![],
+            &[7],
+        );
+    }
+
+    #[test]
     fn test_label_namespace_uses_exports_and_name_section() {
         let wat = r#"
             (module

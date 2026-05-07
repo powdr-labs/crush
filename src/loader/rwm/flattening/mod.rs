@@ -156,21 +156,22 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                 .emit_label(&mut ctx, format_label(id, LabelType::Local))
                 .into();
 
-            // There must be no register dying exactly at a label...
-            assert!(dying_regs.is_empty());
+            // The execution always reaches a local label through a jump. Registers dying in
+            // the previous PC are not relevant here, as this is unreachable through that path.
+            drop(dying_regs);
 
             // If there were registers dying at the jumps targeting this label, we need to emit the drops for them right after the label.
             let entry = &ctrl_stack[0];
-            if let Some(live_at_jump) = entry.local_jump_live_regs.borrow_mut().remove(&id) {
+            return if let Some(live_at_jump) = entry.local_jump_live_regs.borrow_mut().remove(&id) {
                 let live_regs_at_label = entry.allocation.occupation_for_node(node_idx);
                 vec![
-                    emit_drops_after_label(s, &mut ctx, live_at_jump, live_regs_at_label).into(),
                     label,
+                    emit_drops_after_label(s, &mut ctx, live_at_jump, live_regs_at_label).into(),
                 ]
                 .into()
             } else {
                 label
-            }
+            };
         }
         Operation::Loop { sub_dag, .. } => {
             let AllocatedDag {
