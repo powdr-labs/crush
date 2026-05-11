@@ -116,6 +116,7 @@ impl<'a> RwmSettings<'a> for GenericIrSetting<'a> {
         value_ptr: Range<u32>,
         immediate: u32,
         label: String,
+        last_reg_usage: bool,
     ) -> Vec<Directive<'a>> {
         let cmp_op = match cmp {
             ComparisonFunction::Equal => Op::I32Eq,
@@ -123,26 +124,39 @@ impl<'a> RwmSettings<'a> for GenericIrSetting<'a> {
             ComparisonFunction::LessThanUnsigned => Op::I32LtU,
         };
 
-        let const_value = c.allocate_tmp_type::<Self>(ValType::I32);
-        let comparison = c.allocate_tmp_type::<Self>(ValType::I32);
-        vec![
-            Directive::WASMOp {
-                op: Op::I32Const {
-                    value: immediate as i32,
-                },
-                inputs: Vec::new(),
-                output: Some(const_value.clone()),
+        let tmp = c.allocate_tmp_type::<Self>(ValType::I32);
+
+        let mut directives = Vec::with_capacity(5);
+        directives.push(Directive::WASMOp {
+            op: Op::I32Const {
+                value: immediate as i32,
             },
+            inputs: Vec::new(),
+            output: Some(tmp.clone()),
+        });
+
+        if last_reg_usage {
+            directives.push(Directive::DropOnNextInstr {
+                register: value_ptr.start,
+            });
+        }
+
+        directives.extend([
             Directive::WASMOp {
                 op: cmp_op,
-                inputs: vec![value_ptr.clone(), const_value],
-                output: Some(comparison.clone()),
+                inputs: vec![value_ptr.clone(), tmp.clone()],
+                output: Some(tmp.clone()),
+            },
+            Directive::DropOnNextInstr {
+                register: value_ptr.start,
             },
             Directive::JumpIf {
                 target: label,
-                condition: comparison.start,
+                condition: tmp.start,
             },
-        ]
+        ]);
+
+        directives
     }
 
     fn emit_relative_jump(&self, _c: &mut RwmCtx, offset_ptr: Range<u32>) -> Directive<'a> {

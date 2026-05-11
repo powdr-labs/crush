@@ -374,6 +374,8 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             let mut directives = Vec::new();
             match default_target {
                 JumpResult::PlainJump(target) => {
+                    // TODO: add the temp to the set of live registers at the target label, to make sure it gets dropped there.
+
                     // If the default target is a plain jump to a local label,
                     // just jump if the selector is out of bounds.
                     directives.push(
@@ -383,6 +385,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                             selector.clone(),
                             jump_instructions.len() as u32,
                             target,
+                            false,
                         )
                         .into(),
                     );
@@ -398,8 +401,16 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                             selector.clone(),
                             jump_instructions.len() as u32,
                             table_label.clone(),
+                            false,
                         )
                         .into(),
+                    ]);
+
+                    if drop_selector {
+                        directives.push(s.emit_drop(&mut ctx, selector.start).into());
+                    }
+
+                    directives.extend([
                         // Otherwise fall through to the default target.
                         jump_directives.into(),
                         // Emit the label for the jump table that will follow.
@@ -580,15 +591,14 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                 // Func frame size is not used in RW mode.
                 s.emit_drop(&mut ctx, split_ref[FunctionRef::<S>::FUNC_FRAME_SIZE].start)
                     .into(),
-                // Type id is only used in this trap check, so we can drop it right after the check.
-                s.emit_drop_on_next_instr(&mut ctx, split_ref[FunctionRef::<S>::TYPE_ID].start)
-                    .into(),
                 s.emit_conditional_jump_cmp_immediate(
                     &mut ctx,
                     ComparisonFunction::Equal,
                     split_ref[FunctionRef::<S>::TYPE_ID].clone(),
                     fn_type.unique_id,
                     ok_label.clone(),
+                    // TYPE_ID is no longer needed after this jump.
+                    true,
                 )
                 .into(),
                 s.emit_drop(&mut ctx, split_ref[FunctionRef::<S>::FUNC_ADDR].start)

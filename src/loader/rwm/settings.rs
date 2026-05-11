@@ -46,6 +46,9 @@ pub trait Settings<'a>: loader::Settings {
     ) -> impl Into<Tree<Self::Directive>>;
 
     /// Emits a jump to a label conditioned on cmp(value, immediate).
+    ///
+    /// last_reg_usage will be set to true if this is the last usage of the value
+    /// in value_ptr, and false otherwise. This can be used to optimize register usage.
     fn emit_conditional_jump_cmp_immediate(
         &self,
         c: &mut Context<'a, '_>,
@@ -53,6 +56,7 @@ pub trait Settings<'a>: loader::Settings {
         value_ptr: Range<u32>,
         immediate: u32,
         label: String,
+        last_reg_usage: bool,
     ) -> impl Into<Tree<Self::Directive>>;
 
     /// Emits a jump relative to the next instruction (i.e. to PC+1+offset, where offset is unsigned).
