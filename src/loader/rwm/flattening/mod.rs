@@ -28,7 +28,6 @@ use crate::{
     utils::{range_consolidation::RangeConsolidationIterator, tree::Tree},
 };
 use std::{
-    cell::RefCell,
     collections::{BTreeSet, HashMap, VecDeque},
     ops::Range,
     sync::atomic::AtomicU32,
@@ -47,15 +46,24 @@ pub fn flatten_dag<'a, S: Settings<'a>>(
         function_name: prog.get_function_name(func_idx),
     };
 
+    // For each local label, what registers are live at jumps targeting it.
+    // This is used to calculate what drops to emit after the label.
+    let mut live_regs_at_jump = HashMap::new();
+
     let mut ctrl_stack = VecDeque::new();
     ctrl_stack.push_front(StackEntry {
         loop_label: None,
-        loop_jump_live_regs: RefCell::new(BTreeSet::new()),
-        local_jump_live_regs: RefCell::new(HashMap::new()),
         allocation: dag.block_data,
     });
 
-    let directives = process_dag(s, &common_ctx, &mut ctrl_stack, dag.nodes, func_idx);
+    let directives = process_dag(
+        s,
+        &common_ctx,
+        &mut ctrl_stack,
+        &mut live_regs_at_jump,
+        dag.nodes,
+        func_idx,
+    );
 
     FunctionAsm {
         func_idx,
@@ -66,10 +74,6 @@ pub fn flatten_dag<'a, S: Settings<'a>>(
 
 struct StackEntry {
     loop_label: Option<String>,
-    /// Set of registers that are live at every backjump to this loop.
-    loop_jump_live_regs: RefCell<BTreeSet<u32>>,
-    /// Maps local label ids to the registers that were live at jump points targeting those labels.
-    local_jump_live_regs: RefCell<HashMap<u32, BTreeSet<u32>>>,
     allocation: Allocation,
 }
 
@@ -77,6 +81,7 @@ fn process_dag<'a, 'b, S: Settings<'a>>(
     s: &S,
     ctx: &'b CommonContext<'a, 'b>,
     ctrl_stack: &mut VecDeque<StackEntry>,
+    live_regs_at_jump: &mut HashMap<String, BTreeSet<u32>>,
     nodes: Vec<register_allocation::Node<'a>>,
     func_idx: u32,
 ) -> Tree<S::Directive> {
@@ -90,6 +95,7 @@ fn process_dag<'a, 'b, S: Settings<'a>>(
                 s,
                 ctx,
                 ctrl_stack,
+                live_regs_at_jump,
                 node,
                 node_idx,
                 func_idx,
@@ -104,6 +110,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
     s: &S,
     common_ctx: &'b CommonContext<'a, 'b>,
     ctrl_stack: &mut VecDeque<StackEntry>,
+    live_regs_at_jump: &mut HashMap<String, BTreeSet<u32>>,
     node: register_allocation::Node<'a>,
     node_idx: usize,
     func_idx: u32,
@@ -152,17 +159,18 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             }
         }
         Operation::Label { id } => {
-            let label = s
-                .emit_label(&mut ctx, format_label(id, LabelType::Local))
-                .into();
-
             // The execution always reaches a local label through a jump. Registers dying in
             // the previous PC are not relevant here, as this is unreachable through that path.
             drop(dying_regs);
 
-            // If there were registers dying at the jumps targeting this label, we need to emit the drops for them right after the label.
+            let label = format_label(id, LabelType::Local);
             let entry = &ctrl_stack[0];
-            return if let Some(live_at_jump) = entry.local_jump_live_regs.borrow_mut().remove(&id) {
+            let live_at_jump = live_regs_at_jump.remove(&label);
+
+            let label = s.emit_label(&mut ctx, label).into();
+
+            // If there were registers dying at the jumps targeting this label, we need to emit the drops for them right after the label.
+            return if let Some(live_at_jump) = live_at_jump {
                 let live_regs_at_label = entry.allocation.occupation_for_node(node_idx);
                 vec![
                     label,
@@ -203,12 +211,22 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             // Process the loop body.
             ctrl_stack.push_front(StackEntry {
                 loop_label: Some(loop_label),
-                loop_jump_live_regs: RefCell::new(BTreeSet::new()),
-                local_jump_live_regs: RefCell::new(HashMap::new()),
                 allocation: loop_allocation,
             });
-            let loop_tree = process_dag(s, common_ctx, ctrl_stack, loop_nodes, func_idx);
+            let loop_tree = process_dag(
+                s,
+                common_ctx,
+                ctrl_stack,
+                live_regs_at_jump,
+                loop_nodes,
+                func_idx,
+            );
             let sub_entry = ctrl_stack.pop_front().unwrap();
+
+            // Get the registers that were live at the call site of the loop.
+            let live_at_jump = live_regs_at_jump
+                .remove(&sub_entry.loop_label.unwrap())
+                .unwrap_or_default();
 
             // Generate the drops right after loop label
             let live_regs_at_loop_start = sub_entry.allocation.occupation_for_node(0);
@@ -220,14 +238,9 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                 tmp_tracker,
                 allocation: &ctrl_stack[0].allocation,
             };
+
             loop_directives.push(
-                emit_drops_after_label(
-                    s,
-                    &mut ctx,
-                    sub_entry.loop_jump_live_regs.into_inner(),
-                    live_regs_at_loop_start,
-                )
-                .into(),
+                emit_drops_after_label(s, &mut ctx, live_at_jump, live_regs_at_loop_start).into(),
             );
 
             // Push the loop directives.
@@ -241,6 +254,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                 s,
                 &mut ctx,
                 ctrl_stack,
+                live_regs_at_jump,
                 break_target,
                 &inputs,
                 func_idx,
@@ -272,7 +286,15 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             // done in the outer scope.
             let dying_regs = dying_regs.clone();
             let jump_directives = emit_jump(
-                s, &mut ctx, ctrl_stack, target, inputs, func_idx, &live_regs, dying_regs,
+                s,
+                &mut ctx,
+                ctrl_stack,
+                live_regs_at_jump,
+                target,
+                inputs,
+                func_idx,
+                &live_regs,
+                dying_regs,
             );
 
             let mut directives = Vec::new();
@@ -357,6 +379,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                         s,
                         &mut ctx,
                         ctrl_stack,
+                        live_regs_at_jump,
                         target.target,
                         &choice_inputs,
                         func_idx,
@@ -374,7 +397,11 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             let mut directives = Vec::new();
             match default_target {
                 JumpResult::PlainJump(target) => {
-                    // TODO: add the temp to the set of live registers at the target label, to make sure it gets dropped there.
+                    // add the temp to the set of live registers at the target label, to make sure it gets dropped there.
+                    live_regs_at_jump
+                        .entry(target.clone())
+                        .or_default()
+                        .insert(selector.start);
 
                     // If the default target is a plain jump to a local label,
                     // just jump if the selector is out of bounds.
@@ -702,6 +729,7 @@ fn emit_jump<'a, S: Settings<'a>>(
     s: &S,
     ctx: &mut Context<'a, '_>,
     ctrl_stack: &VecDeque<StackEntry>,
+    live_regs_at_jump: &mut HashMap<String, BTreeSet<u32>>,
     target: BreakTarget,
     inputs: &[WasmOpInput],
     func_idx: u32,
@@ -716,20 +744,16 @@ fn emit_jump<'a, S: Settings<'a>>(
 
     let target_entry = &ctrl_stack[target.depth as usize];
     let allocation = &target_entry.allocation;
-    let mut loop_borrow;
-    let mut label_borrow;
-    let (output_node_idx, target, live_set) = match target.kind {
+    let (output_node_idx, target) = match target.kind {
         TargetType::Loop => {
             let loop_label = target_entry
                 .loop_label
                 .as_ref()
                 .expect("Loop target should have a loop label");
 
-            loop_borrow = target_entry.loop_jump_live_regs.borrow_mut();
-            let live_set: &mut BTreeSet<u32> = &mut loop_borrow;
             // This is a jump to a new loop iteration.
             // The node whose outputs we want are the Inputs node of the loop (index 0).
-            (0, loop_label.as_str().into(), live_set)
+            (0, loop_label.as_str().into())
         }
         TargetType::Function => {
             assert!(target_entry.loop_label.is_none());
@@ -757,14 +781,14 @@ fn emit_jump<'a, S: Settings<'a>>(
         TargetType::Label(id) => {
             // This is a jump to a label in the current function.
             // The node we want is the target label's node.
-            label_borrow = target_entry.local_jump_live_regs.borrow_mut();
             (
                 target_entry.allocation.labels[&id],
                 format_label(id, LabelType::Local),
-                label_borrow.entry(id).or_default(),
             )
         }
     };
+
+    let live_set = live_regs_at_jump.entry(target.clone()).or_default();
 
     // Whenever this jump is a conditional jump (br_table included), we can have extra "sudden" register
     // deaths: registers that must be kept alive if this branch is not taken, but are no longer needed if
@@ -785,7 +809,7 @@ fn emit_jump<'a, S: Settings<'a>>(
         }
         JumpResult::PlainJump(target)
     } else {
-        // Stuff remaining in dying_regs (BrIf, BrIfZero, BrTable selectors, unused inputs in BrTable)
+        // Stuff remaining in dying_regs (i.e., unused inputs in BrTable)
         // must be dropped before the jump.
         for reg in dying_regs {
             directives.push(s.emit_drop(ctx, reg).into());
