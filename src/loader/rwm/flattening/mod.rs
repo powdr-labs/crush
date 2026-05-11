@@ -582,6 +582,8 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             let (entry_idx, inputs) = inputs.split_last().unwrap();
             let entry_idx = entry_idx.as_register().unwrap().clone();
 
+            let fn_entry_is_dying = dying_regs.remove(&entry_idx.start);
+
             let fn_type = ctx.common.prog.get_type(type_index);
             let call = prepare_function_call(
                 s,
@@ -607,14 +609,22 @@ fn process_node<'a, 'b, S: Settings<'a>>(
 
             // The sequence to load the function reference, check the type,
             // and then perform the indirect call.
-            return vec![
+            let mut directives = Vec::with_capacity(11);
+            directives.push(
                 s.emit_wasm_op(
                     &mut ctx,
                     Op::TableGet { table: table_index },
-                    &[WasmOpInput::Register(entry_idx)],
+                    &[WasmOpInput::Register(entry_idx.clone())],
                     Some(func_ref_reg),
                 )
                 .into(),
+            );
+
+            if fn_entry_is_dying {
+                directives.push(s.emit_drop(&mut ctx, entry_idx.start).into());
+            }
+
+            directives.extend([
                 // Func frame size is not used in RW mode.
                 s.emit_drop(&mut ctx, split_ref[FunctionRef::<S>::FUNC_FRAME_SIZE].start)
                     .into(),
@@ -645,8 +655,9 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                 )
                 .into(),
                 call.suffix_directives.into(),
-            ]
-            .into();
+            ]);
+
+            return directives.into();
         }
         Operation::WASMOp(Op::Unreachable) => {
             return s
@@ -1159,8 +1170,9 @@ fn prepare_function_call<'a, S: Settings<'a>>(
     // Generate the actual directives for input and output copy.
     let mut prefix_directives =
         copy_inputs_if_needed(s, ctx, inputs, input_ranges, &mut dying_values);
-    // The only remaining dying value possible should be the function reference in case of an indirect call:
-    assert!(dying_values.len() <= 1);
+
+    // Everything dying here should be function inputs, which were handled by copy_inputs_if_needed.
+    assert!(dying_values.is_empty());
     for reg in dying_values {
         prefix_directives.push(s.emit_drop(ctx, reg).into());
     }
