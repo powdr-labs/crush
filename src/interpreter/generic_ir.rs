@@ -148,7 +148,7 @@ impl<'a> RwmSettings<'a> for GenericIrSetting<'a> {
                 output: Some(tmp.clone()),
             },
             Directive::DropOnNextInstr {
-                register: value_ptr.start,
+                register: tmp.start,
             },
             Directive::JumpIf {
                 target: label,
