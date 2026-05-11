@@ -115,19 +115,20 @@ pub trait Settings<'a>: loader::Settings {
         output: Option<Range<u32>>,
     ) -> impl Into<Tree<Self::Directive>>;
 
-    /// Emits a drop instruction, signaling that the given register is no longer needed.
-    fn emit_drop(
+    /// Emits a drop hint, signaling that the given register is no longer needed at this point.
+    fn emit_drop(&self, c: &mut Context<'a, '_>, reg: u32) -> impl Into<Tree<Self::Directive>>;
+
+    /// Emits a drop hint, signaling that the given register will no longer be needed after
+    /// the next instruction.
+    fn emit_drop_on_next_instr(
         &self,
         c: &mut Context<'a, '_>,
         reg: u32,
     ) -> impl Into<Tree<Self::Directive>>;
 
-    /// Emits a drop-from instruction after a function call, signaling that all registers
+    /// Emits a drop-from hint after a function call, signaling that all registers
     /// from `reg` onward (in the current frame) are no longer needed. This covers the
     /// callee's frame space past the return values (saved RA/FP, locals, temporaries).
-    fn emit_drop_from(
-        &self,
-        c: &mut Context<'a, '_>,
-        reg: u32,
-    ) -> impl Into<Tree<Self::Directive>>;
+    fn emit_drop_from(&self, c: &mut Context<'a, '_>, reg: u32)
+    -> impl Into<Tree<Self::Directive>>;
 }

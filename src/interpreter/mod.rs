@@ -468,6 +468,7 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
     fn run_loop(&mut self) {
         let mut cycles = 0usize;
 
+        let mut to_be_dropped_on_next_instr = Vec::new();
         let mut t = Tracer::new(self);
         let final_fp = loop {
             t.reset();
@@ -475,17 +476,25 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
             let instr = t.i.flat_program[t.i.pc as usize].clone();
 
             let mut should_inc_pc = true;
-
+            // If the directive is not an instruction (drop hint or label), this is set to false.
+            let mut instruction_processed = true;
             match instr {
                 Directive::Label { .. } => {
                     should_inc_pc = false;
+                    instruction_processed = false;
                     // do nothing
                 }
                 Directive::Drop { register } => {
                     t.i.regs.drop_reg(t.i.fp + register);
+                    instruction_processed = false;
+                }
+                Directive::DropOnNextInstr { register } => {
+                    to_be_dropped_on_next_instr.push(t.i.fp + register);
+                    instruction_processed = false;
                 }
                 Directive::DropFrom { first } => {
                     t.i.regs.drop_from(t.i.fp + first);
+                    instruction_processed = false;
                 }
                 Directive::Return { ret_pc, ret_fp } => {
                     let pc = t.get_reg_relative_u32(ret_pc..ret_pc + 1);
@@ -1945,6 +1954,13 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                 Directive::Trap { reason } => {
                     panic!("Trap encountered: {reason:?}");
                 }
+            }
+
+            if instruction_processed {
+                for reg in &to_be_dropped_on_next_instr {
+                    t.i.regs.drop_reg(*reg);
+                }
+                to_be_dropped_on_next_instr.clear();
             }
 
             t.print_trace();

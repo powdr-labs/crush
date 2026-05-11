@@ -229,6 +229,10 @@ impl<'a> RwmSettings<'a> for GenericIrSetting<'a> {
         Directive::Drop { register: reg }
     }
 
+    fn emit_drop_on_next_instr(&self, _c: &mut RwmCtx<'a, '_>, reg: u32) -> Directive<'a> {
+        Directive::DropOnNextInstr { register: reg }
+    }
+
     fn emit_drop_from(&self, _c: &mut RwmCtx, reg: u32) -> Directive<'a> {
         Directive::DropFrom { first: reg }
     }
@@ -629,6 +633,10 @@ pub enum Directive<'a> {
     Drop {
         register: Register, // size: 1 word
     },
+    /// Signals that a register will no longer be needed after the next instruction.
+    DropOnNextInstr {
+        register: Register, // size: 1 word
+    },
     /// Signals that all registers from `first` onward are no longer needed.
     /// Emitted after function calls to mark the callee's frame space (past return values) as free.
     DropFrom {
@@ -811,6 +819,9 @@ impl Display for Directive<'_> {
             }
             Directive::Drop { register } => {
                 write!(f, "    Drop ${register}")?;
+            }
+            Directive::DropOnNextInstr { register } => {
+                write!(f, "    DropOnNextInstr ${register}")?;
             }
             Directive::DropFrom { first } => {
                 write!(f, "    DropFrom ${first}")?;

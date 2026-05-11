@@ -263,6 +263,10 @@ fn process_node<'a, 'b, S: Settings<'a>>(
 
             assert!(newly_live_values.is_empty());
 
+            // If the selector is dying, it must be dropped wether the branch is taken or not,
+            // so we handle it as a special case.
+            let drop_selector = dying_regs.remove(&cond_reg.start);
+
             let live_regs = ctx.allocation.occupation_for_node(node_idx);
             // Must clone, because the we also need to emit the drops if branch is not taken,
             // done in the outer scope.
@@ -271,17 +275,24 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                 s, &mut ctx, ctrl_stack, target, inputs, func_idx, &live_regs, dying_regs,
             );
 
+            let mut directives = Vec::new();
+            if drop_selector {
+                directives.push(s.emit_drop_on_next_instr(&mut ctx, cond_reg.start).into());
+            }
+
             if S::is_jump_condition_available(cond)
                 && let JumpResult::PlainJump(target) = jump_directives
             {
-                s.emit_conditional_jump(&mut ctx, cond, target, cond_reg)
-                    .into()
+                directives.push(
+                    s.emit_conditional_jump(&mut ctx, cond, target, cond_reg)
+                        .into(),
+                );
             } else {
                 let jump_directives = jump_directives.into_tree(s);
                 if S::is_jump_condition_available(inverse_cond) {
                     // Uses branch on inverse condition for the general case. This is the second best case.
                     let cont_label = ctx.new_label(LabelType::Local);
-                    vec![
+                    directives.extend([
                         // Emit the jump to continuation if the condition is non-zero.
                         s.emit_conditional_jump(
                             &mut ctx,
@@ -294,15 +305,14 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                         jump_directives,
                         // Emit the continuation label.
                         s.emit_label(&mut ctx, cont_label).into(),
-                    ]
-                    .into()
+                    ]);
                 } else if S::is_jump_condition_available(cond) {
                     // Uses conditional branch for the general case. This is the worst case, because it
                     // it requires two labels and two jumps.
                     let cont_label = ctx.new_label(LabelType::Local);
                     let jump_label = ctx.new_label(LabelType::Local);
 
-                    vec![
+                    directives.extend([
                         // Emit the jump to the to the jump code
                         s.emit_conditional_jump(&mut ctx, cond, jump_label.clone(), cond_reg)
                             .into(),
@@ -314,18 +324,20 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                         jump_directives,
                         // Emit the continuation label.
                         s.emit_label(&mut ctx, cont_label).into(),
-                    ]
-                    .into()
+                    ]);
                 } else {
                     panic!(
                         "Neither branch if zero nor branch if not zero is available in the settings."
                     );
                 }
             }
+
+            directives.into()
         }
         Operation::BrTable { targets } => {
             let (selector, table_inputs) = inputs.split_last().unwrap();
             let selector = selector.as_register().unwrap().clone();
+            let drop_selector = dying_regs.remove(&selector.start);
 
             let live_regs = ctx.allocation.occupation_for_node(node_idx);
 
@@ -431,6 +443,9 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             // TODO: if jump_offset can jump $selector * N, where N is some immediate, this
             // can be implemented with a single indirection, but that would also require
             // 1-to-1 mapping in all the instructions belonging to the jump table.
+            if drop_selector {
+                directives.push(s.emit_drop_on_next_instr(&mut ctx, selector.start).into());
+            }
             directives.push(s.emit_relative_jump(&mut ctx, selector).into());
 
             let jump_instructions = jump_instructions
@@ -562,6 +577,12 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                     Some(func_ref_reg),
                 )
                 .into(),
+                // Func frame size is not used in RW mode.
+                s.emit_drop(&mut ctx, split_ref[FunctionRef::<S>::FUNC_FRAME_SIZE].start)
+                    .into(),
+                // Type id is only used in this trap check, so we can drop it right after the check.
+                s.emit_drop_on_next_instr(&mut ctx, split_ref[FunctionRef::<S>::TYPE_ID].start)
+                    .into(),
                 s.emit_conditional_jump_cmp_immediate(
                     &mut ctx,
                     ComparisonFunction::Equal,
@@ -570,10 +591,14 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                     ok_label.clone(),
                 )
                 .into(),
+                s.emit_drop(&mut ctx, split_ref[FunctionRef::<S>::FUNC_ADDR].start)
+                    .into(),
                 s.emit_trap(&mut ctx, TrapReason::WrongIndirectCallFunctionType)
                     .into(),
                 s.emit_label(&mut ctx, ok_label).into(),
                 call.prefix_directives.into(),
+                s.emit_drop_on_next_instr(&mut ctx, split_ref[FunctionRef::<S>::FUNC_ADDR].start)
+                    .into(),
                 s.emit_indirect_call(
                     &mut ctx,
                     split_ref[FunctionRef::<S>::FUNC_ADDR].clone(),
