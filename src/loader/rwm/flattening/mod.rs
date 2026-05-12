@@ -1168,14 +1168,12 @@ fn prepare_function_call<'a, S: Settings<'a>>(
     ctx.function_call_prelude_size = Some(ret_fp.end);
 
     // Generate the actual directives for input and output copy.
-    let mut prefix_directives =
-        copy_inputs_if_needed(s, ctx, inputs, input_ranges, &mut dying_values);
+    let prefix_directives = copy_inputs_if_needed(s, ctx, inputs, input_ranges, &mut dying_values);
 
-    // Everything dying here should be function inputs, which were handled by copy_inputs_if_needed.
-    assert!(dying_values.is_empty());
-    for reg in dying_values {
-        prefix_directives.push(s.emit_drop(ctx, reg).into());
-    }
+    // Every dying register is either a function input, which was handled in copy_inputs_if_needed,
+    // or an unused output register, which is inside the function frame, and is automatically
+    // handled by the DropFrom after the function call.
+    assert!(dying_values.iter().all(|reg| *reg >= frame_start));
 
     let (tmp_reg, mut suffix_directives) = parallel_copy(s, ctx, output_copy_set);
 
