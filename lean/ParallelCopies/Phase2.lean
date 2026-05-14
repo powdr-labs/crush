@@ -269,6 +269,78 @@ theorem walkEmits_dsts
       · simp [h]
       · simp [h]
 
+/-! ## walkEmits Nodup invariant
+
+The destinations emitted by `walkCycle` are pairwise distinct because each
+visit causes the visited register's edge to be erased, preventing future
+walks from finding that register as a source again. -/
+
+/-- Auxiliary version with a "visited so far" set `V`. -/
+theorem walkEmits_dsts_nodup_aux
+    (fuel : Nat) (start curr : UInt32) (es : Edges)
+    (V : List UInt32)
+    (h_V_erased : ∀ r ∈ V, srcOf? r es = none)
+    (h_curr_not_in_V : curr ∉ V) :
+    ((walkEmits fuel start curr es).map Prod.snd).Nodup ∧
+    ∀ d ∈ (walkEmits fuel start curr es).map Prod.snd, d ∉ V := by
+  induction fuel generalizing curr es V with
+  | zero => simp [walkEmits]
+  | succ n ih =>
+    simp only [walkEmits]
+    cases hsrc : srcOf? curr es with
+    | none => simp
+    | some source =>
+      by_cases h_start : source = start
+      · simp [h_start]
+      · simp only [h_start, if_false, List.map_cons, List.nodup_cons, List.mem_cons]
+        -- Want to apply IH with V' = V ++ [curr] and new_curr = source on (eraseDst curr es).
+        -- Need: new V' is "erased", new curr ∉ V'.
+        -- But source might be in V. Handle that case directly.
+        have h_V'_erased : ∀ r ∈ curr :: V, srcOf? r (eraseDst curr es) = none := by
+          intro r hr
+          rcases List.mem_cons.mp hr with heq | hmem
+          · rw [heq]; exact srcOf?_eraseDst_self es curr
+          · have h_r_ne_curr : r ≠ curr := by
+              intro heq; rw [heq] at hmem; exact h_curr_not_in_V hmem
+            rw [srcOf?_eraseDst_ne _ _ _ h_r_ne_curr]
+            exact h_V_erased r hmem
+        by_cases h_src_in_V : source ∈ curr :: V
+        · -- source ∈ V': srcOf? source (eraseDst curr es) = none, so recursion returns [].
+          have h_src_erased : srcOf? source (eraseDst curr es) = none :=
+            h_V'_erased source h_src_in_V
+          have h_rec_empty :
+              walkEmits n start source (eraseDst curr es) = [] := by
+            cases n with
+            | zero => rfl
+            | succ m => simp [walkEmits, h_src_erased]
+          rw [h_rec_empty]
+          refine ⟨⟨?_, by simp⟩, ?_⟩
+          · simp
+          · intro d hd
+            simp at hd
+            subst hd
+            exact h_curr_not_in_V
+        · -- source ∉ V': apply IH.
+          have h_new_curr_not_in_V' : source ∉ curr :: V := h_src_in_V
+          have ⟨h_nodup, h_disj⟩ :=
+            ih source (eraseDst curr es) (curr :: V) h_V'_erased h_new_curr_not_in_V'
+          refine ⟨⟨?_, h_nodup⟩, ?_⟩
+          · intro h_curr_in_rec
+            have := h_disj curr h_curr_in_rec
+            simp at this
+          · intro d hd
+            rcases hd with heq | hmem
+            · subst heq; exact h_curr_not_in_V
+            · have := h_disj d hmem
+              simp at this
+              exact this.2
+
+/-- Top-level Nodup for walkEmits. -/
+theorem walkEmits_dsts_nodup
+    (fuel : Nat) (start curr : UInt32) (es : Edges) :
+    ((walkEmits fuel start curr es).map Prod.snd).Nodup :=
+  (walkEmits_dsts_nodup_aux fuel start curr es [] (by simp) (by simp)).1
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
