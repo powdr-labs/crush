@@ -152,6 +152,25 @@ theorem find?_dst_of_mem
         rw [hap_false]
         exact ih hWF' hmem'
 
+/-! ## `peelStep_sound` at the peeled destination -/
+
+/-- The key special case of `peelStep_sound` at `r = .given d`: the
+    peeled edge `(s, d)` matches the parallel block's effect on `d`,
+    namely writing `σ (.given s)` into `d`. -/
+theorem peelStep_sound_at_d
+    (s d : UInt32) (es : List Edge)
+    (hWF : UniqueDst es) (h_mem : (s, d) ∈ es) (h_ne : s ≠ d) (σ : SState) :
+    applyParallelLS es σ (.given d) =
+      applyParallelLS (peelStep s d es) (step σ (.given s, .given d)) (.given d) := by
+  show (match es.find? (Pair.appliesTo · d) with
+        | some (src, _) => σ (.given src)
+        | none          => σ (.given d)) =
+       (match (peelStep s d es).find? (Pair.appliesTo · d) with
+        | some (src, _) => step σ (.given s, .given d) (.given src)
+        | none          => step σ (.given s, .given d) (.given d))
+  rw [find?_dst_of_mem s d es hWF h_mem h_ne, find?_peelStep_self s d es hWF h_mem]
+  simp [step]
+
 /-- The contrapositive form: if no edge in `es` writes to `r`, then
     `find?` returns `none`. -/
 theorem find?_of_no_writer
