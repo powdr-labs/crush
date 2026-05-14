@@ -392,6 +392,109 @@ theorem ForwardPath.of_eraseDst
     have : _ ∈ es := ((mem_eraseDst _ _ _).mp h_e).1
     exact ForwardPath.step this ih
 
+/-! ## Cycle traversal: walkCycle's full visit sequence
+
+The list of registers `walkCycle` visits in order (including the initial
+`curr`). This is `walkEmits.map Prod.snd` extended with the source of the
+final emit — i.e., the full reverse-direction walk path. -/
+
+/-- All registers visited by walkCycle, in walk order. The last element is
+    the `curr` value when walkCycle terminates. -/
+def walkVisits (fuel : Nat) (start curr : UInt32) (es : Edges) : List UInt32 :=
+  match fuel with
+  | 0 => [curr]
+  | n+1 =>
+    match srcOf? curr es with
+    | none => [curr]
+    | some source =>
+      if source = start then [curr]
+      else curr :: walkVisits n start source (eraseDst curr es)
+
+@[simp] theorem walkVisits_zero (start curr : UInt32) (es : Edges) :
+    walkVisits 0 start curr es = [curr] := rfl
+
+@[simp] theorem walkVisits_head_eq
+    (fuel : Nat) (start curr : UInt32) (es : Edges) :
+    (walkVisits fuel start curr es).head? = some curr := by
+  cases fuel with
+  | zero => simp [walkVisits]
+  | succ n =>
+    unfold walkVisits
+    cases srcOf? curr es with
+    | none => simp
+    | some source =>
+      by_cases h : source = start
+      · simp [h]
+      · simp [h]
+
+theorem walkVisits_ne_nil
+    (fuel : Nat) (start curr : UInt32) (es : Edges) :
+    walkVisits fuel start curr es ≠ [] := by
+  cases fuel with
+  | zero => simp [walkVisits]
+  | succ n =>
+    unfold walkVisits
+    cases srcOf? curr es with
+    | none => simp
+    | some source =>
+      by_cases h : source = start
+      · simp [h]
+      · simp [h]
+
+/-- walkEmits's destinations are exactly the *initial portion* of
+    walkVisits — every visit except the last gets its edge emitted. -/
+theorem walkEmits_dsts_eq_walkVisits_init
+    (fuel : Nat) (start curr : UInt32) (es : Edges) :
+    (walkEmits fuel start curr es).map Prod.snd =
+      (walkVisits fuel start curr es).dropLast := by
+  induction fuel generalizing curr es with
+  | zero => simp [walkEmits, walkVisits]
+  | succ n ih =>
+    unfold walkEmits walkVisits
+    cases hsrc : srcOf? curr es with
+    | none => simp
+    | some source =>
+      by_cases h : source = start
+      · simp [h]
+      · simp only [h, if_false, List.map_cons, ih]
+        rw [List.dropLast_cons_of_ne_nil (walkVisits_ne_nil _ _ _ _)]
+
+/-- The head of walkVisits is always `curr`. -/
+theorem walkVisits_head_cons
+    (fuel : Nat) (start curr : UInt32) (es : Edges) :
+    ∃ rest, walkVisits fuel start curr es = curr :: rest := by
+  cases fuel with
+  | zero => exact ⟨[], rfl⟩
+  | succ n =>
+    unfold walkVisits
+    cases srcOf? curr es with
+    | none => exact ⟨[], rfl⟩
+    | some source =>
+      by_cases h : source = start
+      · simp [h]
+      · simp [h]
+
+/-- walkEmits's sources are the *tail* of walkVisits — each step's source
+    becomes the next visit. -/
+theorem walkEmits_srcs_eq_walkVisits_tail
+    (fuel : Nat) (start curr : UInt32) (es : Edges) :
+    (walkEmits fuel start curr es).map Prod.fst =
+      (walkVisits fuel start curr es).tail := by
+  induction fuel generalizing curr es with
+  | zero => simp [walkEmits, walkVisits]
+  | succ n ih =>
+    unfold walkEmits walkVisits
+    cases hsrc : srcOf? curr es with
+    | none => simp
+    | some source =>
+      by_cases h : source = start
+      · simp [h]
+      · simp only [h, if_false, List.map_cons, List.tail_cons, ih]
+        obtain ⟨rest, hrest⟩ :=
+          walkVisits_head_cons n start source (eraseDst curr es)
+        rw [hrest]
+        simp
+
 /-! ## Sources of walkEmits are not the start
 
 If `walkCycle` emits `(s, d)`, then `s ≠ start` — because the algorithm
