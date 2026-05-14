@@ -593,6 +593,105 @@ theorem walkEmits_sources_ne_start
         · subst heq; exact h_start
         · exact ih source (eraseDst curr es) cp hmem
 
+/-! ## Non-clobbering of walkEmits under walkVisits.Nodup
+
+By construction `walkEmits = consPairs walkVisits`, and we prove
+non-clobbering by induction on the cycle path (which is what
+walkVisits matches under `OnCycle`). -/
+
+/-- Pair each consecutive pair as `(next, current)` for a list. -/
+def consPairs : List UInt32 → List (UInt32 × UInt32)
+  | []           => []
+  | [_]          => []
+  | a :: b :: rs => (b, a) :: consPairs (b :: rs)
+
+@[simp] theorem consPairs_nil : consPairs [] = [] := rfl
+
+@[simp] theorem consPairs_single (a : UInt32) : consPairs [a] = [] := rfl
+
+theorem walkEmits_eq_consPairs_walkVisits
+    (fuel : Nat) (start curr : UInt32) (es : Edges) :
+    walkEmits fuel start curr es = consPairs (walkVisits fuel start curr es) := by
+  induction fuel generalizing curr es with
+  | zero => simp [walkEmits, walkVisits, consPairs]
+  | succ n ih =>
+    unfold walkEmits walkVisits
+    cases hsrc : srcOf? curr es with
+    | none => simp [consPairs]
+    | some source =>
+      by_cases h : source = start
+      · simp [h, consPairs]
+      · simp only [h, if_false]
+        rw [ih]
+        -- walkVisits returns curr :: rest where rest starts with source.
+        obtain ⟨rest, hrest⟩ := walkVisits_head_cons n start source (eraseDst curr es)
+        rw [hrest]
+        simp [consPairs]
+
+/-- consPairs's sources are exactly the tail of the input list. -/
+theorem consPairs_sources_eq_tail (xs : List UInt32) :
+    (consPairs xs).map Prod.fst = xs.tail := by
+  match xs with
+  | [] => simp [consPairs]
+  | [_] => simp [consPairs]
+  | a :: b :: rest =>
+    simp only [consPairs, List.map_cons, List.tail_cons]
+    have := consPairs_sources_eq_tail (b :: rest)
+    simp only [List.tail_cons] at this
+    rw [this]
+
+/-- For a Nodup list, `consPairs` produces a schedule where no source is
+    an earlier dst. -/
+theorem consPairs_non_clobbering
+    (xs : List UInt32) (h_nodup : xs.Nodup) :
+    ∀ pre s d post, consPairs xs = pre ++ (s, d) :: post →
+      ∀ cp' ∈ pre, cp'.2 ≠ s := by
+  induction xs with
+  | nil => simp [consPairs]
+  | cons a rest ih =>
+    cases rest with
+    | nil => simp [consPairs]
+    | cons b rest' =>
+      simp only [consPairs]
+      intro pre s d post hsplit cp' hcp' hcontra
+      rw [List.nodup_cons] at h_nodup
+      obtain ⟨ha_notin, h_rest_nodup⟩ := h_nodup
+      cases pre with
+      | nil => simp at hcp'
+      | cons p pre' =>
+        rw [List.cons_append, List.cons.injEq] at hsplit
+        obtain ⟨hp_eq_ba, htail⟩ := hsplit
+        -- hp_eq_ba : (b, a) = p. So p = (b, a).
+        rw [← hp_eq_ba] at hcp'
+        rcases List.mem_cons.mp hcp' with hp_eq | hp_in
+        · -- cp' = (b, a). cp'.2 = a. hcontra: a = s. Goal: False.
+          subst hp_eq
+          have h_srcs_eq :
+              (consPairs (b :: rest')).map Prod.fst = rest' := by
+            have := consPairs_sources_eq_tail (b :: rest')
+            simp [List.tail_cons] at this
+            exact this
+          have h_s_in_srcs : s ∈ (consPairs (b :: rest')).map Prod.fst := by
+            rw [htail]
+            rw [List.mem_map]
+            exact ⟨(s, d), List.mem_append.mpr (Or.inr List.mem_cons_self), rfl⟩
+          rw [h_srcs_eq] at h_s_in_srcs
+          have h_a_in_rest' : a ∈ rest' := by
+            simp at hcontra
+            rw [hcontra]
+            exact h_s_in_srcs
+          exact ha_notin (List.mem_cons_of_mem _ h_a_in_rest')
+        · exact ih h_rest_nodup pre' s d post htail cp' hp_in hcontra
+
+/-- The non-clobbering condition for `walkEmits` under walkVisits.Nodup. -/
+theorem walkEmits_non_clobbering
+    (fuel : Nat) (start curr : UInt32) (es : Edges)
+    (h_nodup : (walkVisits fuel start curr es).Nodup) :
+    ∀ pre s d post, walkEmits fuel start curr es = pre ++ (s, d) :: post →
+      ∀ cp' ∈ pre, cp'.2 ≠ s := by
+  rw [walkEmits_eq_consPairs_walkVisits]
+  exact consPairs_non_clobbering _ h_nodup
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
