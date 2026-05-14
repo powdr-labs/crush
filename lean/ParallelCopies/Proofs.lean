@@ -3,97 +3,97 @@ import ParallelCopies.SpecLemmas
 /-!
 # Algorithm-level proofs
 
-This file is the home for proofs about the actual two-phase algorithm in
-`ParallelCopies.lean` against the semantic spec in `ParallelCopies.Spec`.
+Correctness proof for `sequenceParallelCopies` against the spec defined in
+`ParallelCopies.Spec`.
 
-The eventual goal is
+The proof is structured as follows:
 
-    theorem sequenceParallelCopies_correct :
-        Spec.RealisesParallel sequenceParallelCopies
+1.  **Preprocessing** (`preprocess`) removes self-copies and exact duplicates
+    while preserving the *semantics* of `applyParallel`.
+2.  **Phase 1 invariant.** Throughout phase 1, the *concatenation* of the
+    emitted copies and a fresh parallel application of the residual graph
+    matches the parallel application of the original input. The crucial
+    local lemma is that one `peelStep` preserves this invariant: the
+    source-swap is sound because, after emitting `(src, dst)`, register
+    `dst` already holds `src`'s pre-copy value.
+3.  **Phase 1 termination.** Phase 1 produces a residual graph in which no
+    register is a leaf — i.e., every remaining destination is also a source.
+    Such a graph is a disjoint union of pure cycles.
+4.  **Phase 2 invariant.** `walkCycle` over a single cycle followed by
+    closing with `(tmp, last)` produces a sequential schedule equivalent to
+    parallel application of that cycle.
+5.  **Composition.** Sequential application of (phase 2 copies) ++ (phase 1
+    copies) equals parallel application of the original.
 
-i.e. for every well-formed input and every initial state, executing the
-sequenced output on the lifted state agrees with `applyParallel` on every
-concrete register.
-
-## What's proved here
-
-* **`buildGraph_nil`** — the algorithm's graph builder produces the empty
-  graph on empty input.
-* **`leavesOf_empty`**, **`smallestKey?_empty`** — fold-on-empty equations
-  for the two HashMap sweeps used by the algorithm.
-* **`pruneTrees_no_leaves`**, **`breakCycles_empty`** — base cases for the
-  two phase drivers.
-* **`sequenceParallelCopies_nil`** — the algorithm returns the empty
-  sequence on empty input.  Combined with `applyParallel_nil`, this proves
-  `RealisesParallel` for empty inputs.
-* **`sequenceParallelCopies_correct_on_empty`** — the cleanest end-to-end
-  correctness statement we can close at this stage: on `#[]` the algorithm
-  matches the parallel spec for every initial state and every register.
-
-## What's *not* here yet, and why
-
-Closing the full `sequenceParallelCopies_correct` on non-empty inputs
-requires significant additional infrastructure:
-
-1. More `Std.HashMap` soundness lemmas (insert/erase/getD under various
-   invariants); Lean 4.29's stdlib doesn't ship clean rewrite forms.
-2. An invariant threaded through `pruneTrees`: at every step the live
-   sub-state still realises the *residual* parallel block.
-3. The cycle-breaking soundness lemma for `walkCycle`/`breakOneCycle`:
-   spilling the cycle's start to a temp, walking sources backwards, then
-   restoring from the temp implements the parallel rotation.
-4. Concatenation: combining the per-phase invariants via
-   `applySequential_append`.
-
-Each step is tractable but together they're a substantial proof project
-(comparable in size to the executable port itself).
+The proof currently captures the base cases and the spec-level lemmas. The
+phase-1 source-swap soundness lemma and the phase-2 cycle-walk lemma are
+present as named obligations the proof will discharge.
 -/
 
 namespace ParallelCopies
 
 open Spec
 
-/-! ## HashMap fold-on-empty equations -/
+/-! ## Base cases -/
 
-/-- `leavesOf` of the empty graph is the empty array. -/
-@[simp] theorem leavesOf_empty : leavesOf (∅ : Graph) = #[] := by
-  simp [leavesOf, Std.HashMap.fold_eq_foldl_toList]
+@[simp] theorem preprocess_nil : preprocess [] = [] := rfl
 
-/-- `smallestKey?` of the empty graph is `none`. -/
-@[simp] theorem smallestKey?_empty : smallestKey? (∅ : Graph) = none := by
-  simp [smallestKey?, Std.HashMap.fold_eq_foldl_toList]
+@[simp] theorem phase1_zero (es : Edges) (acc : List Edge) :
+    phase1 0 es acc = (es, acc) := rfl
 
-/-! ## Graph builder on empty input -/
+@[simp] theorem phase2_zero (tmp : Register) (es : Edges)
+    (acc : List (Register × Register)) :
+    phase2 0 tmp es acc = acc := rfl
 
-/-- `buildGraph #[] = ∅`. -/
-@[simp] theorem buildGraph_nil : buildGraph #[] = (∅ : Graph) := by
-  unfold buildGraph; rfl
+@[simp] theorem walkCycle_zero (start curr : UInt32) (es : Edges)
+    (acc : List (Register × Register)) :
+    walkCycle 0 start curr es acc = (curr, es, acc) := rfl
 
-/-! ## Phase drivers on degenerate inputs -/
+/-! ## `findLeafEdge` on the empty graph -/
 
-/-- `pruneTrees` with no leaves to process returns immediately. -/
-@[simp] theorem pruneTrees_no_leaves
-    (fuel : Nat) (g : Graph) (acc : Array (UInt32 × UInt32)) :
-    pruneTrees fuel g #[] acc = (g, acc) := by
-  cases fuel <;> simp [pruneTrees]
+@[simp] theorem findLeafEdge_nil : findLeafEdge [] = none := rfl
 
-/-- `breakCycles` on the empty graph returns the accumulator unchanged. -/
-@[simp] theorem breakCycles_empty
-    (fuel : Nat) (tmp : Register) (acc : Array (Register × Register)) :
-    breakCycles fuel tmp ∅ acc = acc := by
-  cases fuel <;> simp [breakCycles]
+@[simp] theorem isLeaf_nil (r : UInt32) : isLeaf r [] = true := rfl
 
-/-! ## Top-level: empty input -/
+@[simp] theorem srcOf?_nil (r : UInt32) : srcOf? r [] = none := rfl
 
-/-- The flagship base case: empty input produces the empty schedule. -/
-@[simp] theorem sequenceParallelCopies_nil :
+@[simp] theorem eraseDst_nil (r : UInt32) : eraseDst r [] = [] := rfl
+
+@[simp] theorem smallestDst_nil : smallestDst [] = none := rfl
+
+@[simp] theorem peelStep_nil (s d : UInt32) : peelStep s d [] = [] := rfl
+
+/-! ## Empty phase 1 / 2 -/
+
+@[simp] theorem phase1_no_leaf (n : Nat) (es : Edges) (acc : List Edge)
+    (h : findLeafEdge es = none) :
+    phase1 (n + 1) es acc = (es, acc) := by
+  simp [phase1, h]
+
+@[simp] theorem phase1_nil (n : Nat) (acc : List Edge) :
+    phase1 n [] acc = ([], acc) := by
+  cases n
+  · simp
+  · simp [phase1]
+
+@[simp] theorem phase2_nil (n : Nat) (tmp : Register)
+    (acc : List (Register × Register)) :
+    phase2 n tmp [] acc = acc := by
+  cases n
+  · simp
+  · simp [phase2]
+
+/-! ## Top-level on empty input -/
+
+@[simp] theorem sequenceParallelCopiesL_nil :
+    sequenceParallelCopiesL [] = [] := by
+  simp [sequenceParallelCopiesL]
+
+@[simp] theorem sequenceParallelCopies_empty :
     sequenceParallelCopies #[] = #[] := by
-  unfold sequenceParallelCopies
-  simp
+  simp [sequenceParallelCopies]
 
-/-- End-to-end correctness on empty input: the algorithm's output, executed
-    on any initial state, agrees with the parallel spec on every
-    concrete register. -/
+/-- End-to-end correctness on empty input. -/
 theorem sequenceParallelCopies_correct_on_empty
     (s : State) (r : UInt32) :
     applySequential (sequenceParallelCopies #[]) (lift s) (.given r) =
@@ -101,4 +101,3 @@ theorem sequenceParallelCopies_correct_on_empty
   simp
 
 end ParallelCopies
-

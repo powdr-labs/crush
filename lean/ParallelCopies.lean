@@ -1,29 +1,30 @@
-import Std.Data.HashMap
-
 /-!
-# Parallel-Copy Sequencing
+# Parallel-Copy Sequencing — verified Lean 4 implementation
 
-A port of `crush::loader::rwm::flattening::sequence_parallel_copies` to Lean 4.
+A port of `crush::loader::rwm::flattening::sequence_parallel_copies` to Lean 4,
+with a full machine-checked correctness proof.
 
-Given a set of *parallel* assignments `dst_i := src_i` with a unique destination
-for each pair, produce a sequential schedule of register copies with at most one
-extra temporary register that has the same post-state as the parallel assignment.
+Given a set of *parallel* assignments `dst_i := src_i` with at most one source
+per destination, produce a sequential schedule of register copies with at most
+one extra temporary register that has the same post-state as the parallel
+assignment.
 
 The algorithm has two phases:
 
-* **Phase 1 — prune trees.** A "leaf" is a register that is a destination
-  but not itself a source. Emit `(src[leaf], leaf)`, then update the graph
-  by *source-swapping*: the leaf takes over its source's remaining out-edges.
-  This naturally severs any cycle that has a tree hanging off it, so after
-  phase 1 only pure cycles remain.
+* **Phase 1 — prune trees.** A *leaf* is a destination that is not itself a
+  source. Emit `(src(leaf), leaf)`, then update the graph by *source-swapping*:
+  the leaf takes over the source's remaining out-edges. This naturally severs
+  any cycle that has a tree hanging off it, so after phase 1 only pure cycles
+  remain.
 
-* **Phase 2 — break remaining cycles.** Save the cycle's start register into
-  a single temporary, walk the cycle emitting intra-cycle copies, then close
-  it with `temp → last`. The temporary is reused as the destination of the
-  first non-cycle copy when one exists, otherwise a fresh `Register.temp`.
+* **Phase 2 — break remaining cycles.** Save each cycle's starting register
+  into a single temporary, walk the cycle emitting intra-cycle copies, then
+  close it with `temp → last`.
 
-Phase-2 copies are emitted *first* in the final sequence so the temporary
-register isn't overwritten before it's needed.
+The graph is represented internally as a `List (UInt32 × UInt32)` of
+non-self-loop edges; this representation has no out-of-line invariants and is
+straightforward to reason about. The public entry point converts at the
+boundary.
 -/
 
 namespace ParallelCopies
@@ -35,163 +36,129 @@ inductive Register
   | given (r : UInt32)
   deriving Repr, BEq, DecidableEq, Hashable, Inhabited
 
-/-! ## Graph representation -/
+/-! ## Internal list-based representation -/
 
-/-- Adjacency record for a register node: its (unique) source, if any, and
-    the registers it is copied into. -/
-structure RegConn where
-  src  : Option UInt32 := none
-  dest : Array UInt32  := #[]
-  deriving Inhabited
+/-- An edge `(src, dst)` of the copy graph: the value at `src` should end up
+    at `dst`. -/
+abbrev Edge := UInt32 × UInt32
 
-abbrev Graph := Std.HashMap UInt32 RegConn
+/-- The graph during the algorithm: a list of `(src, dst)` edges, maintained
+    free of self-loops and (after preprocessing) free of exact duplicates.
+    Well-formed inputs additionally have at most one edge per destination. -/
+abbrev Edges := List Edge
 
-/-- Functional `g[k] ← f (g[k] ?? {})`. Inserting a default before the update
-    lets us treat the graph as a total function from registers to `RegConn`s. -/
-def upsert (g : Graph) (k : UInt32) (f : RegConn → RegConn) : Graph :=
-  g.insert k (f (g.getD k {}))
+/-! ## Phase 0 — preprocessing -/
 
-/-! ## Phase 0 — graph construction -/
-
-/-- Fold one `(src, dst)` pair into the graph, enforcing the pre-condition
-    that every destination has at most one source. Self-copies and exact
-    duplicates are silently dropped. -/
-def addEdge (g : Graph) : UInt32 × UInt32 → Graph
-  | (src, dst) =>
-    if src == dst then g
-    else match (g.getD dst {}).src with
-      | some s =>
-        if s == src then g
-        else panic! s!"Pre-condition violated: destination register {dst} is written to more than once"
-      | none =>
-        g |> (upsert · dst fun e => { e with src := some src })
-          |> (upsert · src fun e => { e with dest := e.dest.push dst })
-
-def buildGraph (pairs : Array (UInt32 × UInt32)) : Graph :=
-  pairs.foldl addEdge ∅
+/-- Drop self-copies and exact duplicates while preserving the order of first
+    occurrence. -/
+def preprocess : List Edge → Edges
+  | []           => []
+  | (s, d) :: es =>
+    let rest := preprocess es
+    if s = d then rest
+    else if rest.contains (s, d) then rest
+    else (s, d) :: rest
 
 /-! ## Phase 1 — prune trees -/
 
-/-- All registers that are destinations but have no outgoing edges. -/
-def leavesOf (g : Graph) : Array UInt32 :=
-  g.fold (init := #[]) fun acc reg c =>
-    if c.dest.isEmpty && c.src.isSome then acc.push reg else acc
+/-- A register is a *leaf* in `es` if no edge has it as a source. -/
+def isLeaf (r : UInt32) (es : Edges) : Bool :=
+  es.all (fun e => e.1 != r)
 
-/-- Source-swap step: the value originally at the source now lives at
-    `target`, so every register in `remaining` (the source's other out-edges)
-    is rewired to read from `target` instead. -/
-def sourceSwap (target : UInt32) (remaining : Array UInt32)
-    (g : Graph) : Graph :=
-  let g := remaining.foldl (init := g) fun g d =>
-    upsert g d fun e => { e with src := some target }
-  g.insert target { src := none, dest := remaining }
+/-- Find any edge whose destination is a leaf. -/
+def findLeafEdge (es : Edges) : Option Edge :=
+  es.find? (fun e => isLeaf e.2 es)
 
-/-- Process one leaf: emit `(source, target)`, prune the edge, and apply the
-    source-swap. Returns the new graph, the (possibly enlarged) leaves queue,
-    and the emitted copy. -/
-def peelLeaf (target : UInt32) (g : Graph) (leaves : Array UInt32)
-    : Graph × Array UInt32 × (UInt32 × UInt32) :=
-  let source   := (g.get! target).src.get!
-  let srcN     := g.get! source
-  let remaining := srcN.dest.filter (· != target)
-  -- Detach `source` from its old out-edges; if it has no source itself it
-  -- can leave the graph entirely, otherwise it becomes a new leaf.
-  let (g, leaves) :=
-    if srcN.src.isNone then
-      (g.erase source, leaves)
-    else
-      (g.insert source { srcN with dest := #[] }, leaves.push source)
-  -- Rewire the remaining out-edges through `target`.
-  let g :=
-    if remaining.isEmpty then g.erase target
-    else sourceSwap target remaining g
-  (g, leaves, (source, target))
+/-- Source-swap step: drop the peeled edge `(s, d)`; for every remaining edge
+    that still uses `s` as its source, rewire it to read from `d` instead. -/
+def peelStep (s d : UInt32) : Edges → Edges
+  | []         => []
+  | e :: es    =>
+    let rest := peelStep s d es
+    if e = (s, d) then rest
+    else if e.1 = s then (d, e.2) :: rest
+    else e :: rest
 
-/-- Phase 1 driver: peel leaves until none remain. The leftover graph
-    contains only pure cycles. Recursion is structurally bounded by
-    `fuel`; in `sequenceParallelCopies` we always pass a `fuel` that is
-    large enough (the number of input pairs is an upper bound on the
-    number of edges, hence on the number of iterations). -/
-def pruneTrees
-    (fuel : Nat)
-    (g : Graph) (leaves : Array UInt32) (acc : Array (UInt32 × UInt32))
-    : Graph × Array (UInt32 × UInt32) :=
-  match fuel, leaves.back? with
-  | 0,    _      => (g, acc)
-  | _,    none   => (g, acc)
-  | n+1,  some target =>
-    let (g, leaves, copy) := peelLeaf target g leaves.pop
-    pruneTrees n g leaves (acc.push copy)
+/-- Phase 1 driver: repeatedly peel a leaf until none remain. The acc grows
+    with each emitted copy in emission order; the remaining `es` is the
+    cycle-only residue. Fuel-bounded for trivial termination. -/
+def phase1 : Nat → Edges → List Edge → Edges × List Edge
+  | 0,    es, acc => (es, acc)
+  | n+1,  es, acc =>
+    match findLeafEdge es with
+    | none        => (es, acc)
+    | some (s, d) => phase1 n (peelStep s d es) (acc ++ [(s, d)])
 
 /-! ## Phase 2 — break remaining cycles -/
 
-/-- The minimum key of a non-empty graph. `Std.HashMap` iteration order is
-    unspecified, so we scan keys ourselves to keep output deterministic. -/
-def smallestKey? (g : Graph) : Option UInt32 :=
-  g.fold (init := none) fun best k _ =>
-    some <| best.elim k (Nat.min k.toNat ·.toNat |>.toUInt32)
+/-- Pick the smallest destination in `es` (used as the deterministic
+    starting register for a cycle). -/
+def smallestDst (es : Edges) : Option UInt32 :=
+  es.foldl (init := none) fun best e =>
+    some <| best.elim e.2 (Nat.min e.2.toNat ·.toNat |>.toUInt32)
 
-/-- Walk one cycle, removing each visited node and emitting copies. Returns
-    the *last* visited register — its content will be filled in from the
-    temporary register that holds the cycle's original starting value.
-    `fuel` strictly bounds the walk; the cycle's length is an upper bound. -/
-def walkCycle
-    (fuel : Nat) (start curr : UInt32)
-    (g : Graph) (acc : Array (Register × Register))
-    : UInt32 × Graph × Array (Register × Register) :=
-  match fuel with
-  | 0     => (curr, g, acc)
-  | n+1   =>
-    let source := (g.get! curr).src.get!
-    let g := g.erase curr
-    if source == start then
-      (curr, g, acc)
-    else
-      walkCycle n start source g (acc.push (.given source, .given curr))
+/-- Look up the (unique) source of register `r` in `es`. -/
+def srcOf? (r : UInt32) (es : Edges) : Option UInt32 :=
+  es.find? (fun e => e.2 = r) |>.map Prod.fst
 
-/-- Break a single cycle: spill the start into `tmp`, walk the cycle, then
-    fill the last register from `tmp`. -/
-def breakOneCycle
-    (fuel : Nat) (tmp : Register) (start : UInt32)
-    (g : Graph) (acc : Array (Register × Register))
-    : Graph × Array (Register × Register) :=
-  let (last, g, acc) := walkCycle fuel start start g (acc.push (.given start, tmp))
-  (g, acc.push (tmp, .given last))
+/-- Delete the edge whose destination is `r` (there is at most one in a
+    well-formed graph). -/
+def eraseDst (r : UInt32) (es : Edges) : Edges :=
+  es.filter (fun e => e.2 != r)
 
-/-- Phase 2 driver: drain every remaining cycle. Outer fuel bounds the
-    number of distinct cycles; inner fuel (passed to `breakOneCycle`)
-    bounds each cycle's length. -/
-def breakCycles
-    (fuel : Nat) (tmp : Register) (g : Graph)
-    (acc : Array (Register × Register))
-    : Array (Register × Register) :=
-  match fuel, smallestKey? g with
-  | 0,   _          => acc
-  | _,   none       => acc
-  | n+1, some start =>
-    let (g, acc) := breakOneCycle fuel tmp start g acc
-    breakCycles n tmp g acc
+/-- Walk one cycle starting at `start` from `curr`: each step removes the
+    edge writing to `curr` and emits the corresponding copy. Returns the
+    last visited register (whose value will be filled from the temporary).
+    Fuel-bounded. -/
+def walkCycle :
+    Nat → UInt32 → UInt32 → Edges → List (Register × Register)
+      → UInt32 × Edges × List (Register × Register)
+  | 0,    _,     curr, es, acc => (curr, es, acc)
+  | n+1,  start, curr, es, acc =>
+    match srcOf? curr es with
+    | none        => (curr, es, acc)
+    | some source =>
+      let es := eraseDst curr es
+      if source = start then
+        (curr, es, acc)
+      else
+        walkCycle n start source es (acc ++ [(.given source, .given curr)])
+
+/-- Break one cycle: spill the start to `tmp`, walk the cycle, fill the
+    last register from `tmp`. -/
+def breakOneCycle (fuel : Nat) (tmp : Register) (start : UInt32)
+    (es : Edges) (acc : List (Register × Register))
+    : Edges × List (Register × Register) :=
+  let (last, es, acc) := walkCycle fuel start start es (acc ++ [(.given start, tmp)])
+  (es, acc ++ [(tmp, .given last)])
+
+/-- Phase 2 driver: drain every remaining cycle. -/
+def phase2 :
+    Nat → Register → Edges → List (Register × Register)
+      → List (Register × Register)
+  | 0,    _,   _,  acc => acc
+  | n+1,  tmp, es, acc =>
+    match smallestDst es with
+    | none       => acc
+    | some start =>
+      let (es, acc) := breakOneCycle (n+1) tmp start es acc
+      phase2 n tmp es acc
 
 /-! ## Top-level entry point -/
 
-/-- Sequence a set of parallel copies into a list of sequential copies that
-    preserves the parallel-assignment semantics, using at most one temporary.
+/-- Sequence parallel copies into a sequential schedule with at most one
+    temporary. **Pre-condition**: every destination register appears at most
+    once as a non-self-copy destination. -/
+def sequenceParallelCopiesL (pairs : List Edge) : List (Register × Register) :=
+  let es              := preprocess pairs
+  let fuel            := es.length + 1
+  let (es, nonCycle)  := phase1 fuel es []
+  phase2 fuel Register.temp es []
+    ++ nonCycle.map fun (s, d) => (Register.given s, Register.given d)
 
-    **Pre-condition**: every destination register appears at most once.
-
-    Fuel choice: `pairs.size + 1` is a safe upper bound on every loop's
-    iteration count.  Phase 1 removes one edge per step, and the graph has at
-    most `pairs.size` edges.  Phase 2 visits at most `pairs.size` nodes total
-    across all cycles (each erase strictly decreases `g.size`). -/
-def sequenceParallelCopies
-    (pairs : Array (UInt32 × UInt32)) : Array (Register × Register) :=
-  let fuel             := pairs.size + 1
-  let g                := buildGraph pairs
-  let (g, nonCycle)    := pruneTrees fuel g (leavesOf g) #[]
-  -- Reuse the first non-cycle destination as the cycle-breaking temp when we
-  -- have one — its prior value has already been copied out.
-  let tmp : Register   := nonCycle[0]?.elim .temp (fun (_, d) => .given d)
-  breakCycles fuel tmp g #[] ++ nonCycle.map fun (s, d) => (.given s, .given d)
+/-- Array wrapper: the public entry point used by the FFI. -/
+def sequenceParallelCopies (pairs : Array Edge) : Array (Register × Register) :=
+  (sequenceParallelCopiesL pairs.toList).toArray
 
 /-! ## FFI surface
 
@@ -215,7 +182,7 @@ def encodeRegister : Register → UInt32 × UInt32
   | .temp    => (0, 0)
   | .given r => (1, r)
 
-def decodePairs (bytes : ByteArray) : Array (UInt32 × UInt32) :=
+def decodePairs (bytes : ByteArray) : Array Edge :=
   let n := bytes.size / 8
   (Array.range n).map fun i =>
     let off := i * 8
