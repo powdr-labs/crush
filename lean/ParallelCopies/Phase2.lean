@@ -88,4 +88,49 @@ theorem srcOf?_eraseDst_ne
       · simp [List.filter_cons, h_keep, List.find?_cons, h_e_r', ih, h]
 
 
+/-! ## Basic structural properties of `walkCycle` -/
+
+/-- `walkCycle` extends `acc` — it only appends new copies, never modifies
+    existing ones. -/
+theorem walkCycle_acc_prefix
+    (fuel : Nat) (start curr : UInt32) (es : Edges)
+    (acc : List (Register × Register)) :
+    ∃ extra, (walkCycle fuel start curr es acc).2.2 = acc ++ extra := by
+  induction fuel generalizing curr es acc with
+  | zero => exact ⟨[], by simp [walkCycle]⟩
+  | succ n ih =>
+    unfold walkCycle
+    split
+    · exact ⟨[], by simp⟩
+    · split
+      · exact ⟨[], by simp⟩
+      · rename_i source hsrc h_ne_start
+        obtain ⟨extra, hex⟩ :=
+          ih source (eraseDst curr es) (acc ++ [(.given source, .given curr)])
+        refine ⟨(.given source, .given curr) :: extra, ?_⟩
+        rw [hex]
+        simp
+
+/-- `walkCycle` only emits `given _ → given _` copies (no `temp`). -/
+theorem walkCycle_emits_given
+    (fuel : Nat) (start curr : UInt32) (es : Edges)
+    (acc : List (Register × Register))
+    (h_acc_given : ∀ cp ∈ acc, ∃ s d, cp = (.given s, .given d)) :
+    ∀ cp ∈ (walkCycle fuel start curr es acc).2.2,
+      ∃ s d, cp = (.given s, .given d) := by
+  induction fuel generalizing curr es acc with
+  | zero => intro cp hcp; exact h_acc_given cp hcp
+  | succ n ih =>
+    unfold walkCycle
+    split
+    · exact h_acc_given
+    · split
+      · exact h_acc_given
+      · rename_i source hsrc _
+        apply ih source (eraseDst curr es)
+        intro cp hcp
+        rcases List.mem_append.mp hcp with hcp | hcp
+        · exact h_acc_given cp hcp
+        · simp at hcp; subst hcp; exact ⟨source, curr, rfl⟩
+
 end ParallelCopies.Spec
