@@ -392,6 +392,29 @@ theorem ForwardPath.of_eraseDst
     have : _ ∈ es := ((mem_eraseDst _ _ _).mp h_e).1
     exact ForwardPath.step this ih
 
+/-! ## Sources of walkEmits are not the start
+
+If `walkCycle` emits `(s, d)`, then `s ≠ start` — because the algorithm
+stops *before* emitting when it would emit a copy whose source is `start`. -/
+
+theorem walkEmits_sources_ne_start
+    (fuel : Nat) (start curr : UInt32) (es : Edges) :
+    ∀ cp ∈ walkEmits fuel start curr es, cp.1 ≠ start := by
+  induction fuel generalizing curr es with
+  | zero => simp [walkEmits]
+  | succ n ih =>
+    simp only [walkEmits]
+    cases hsrc : srcOf? curr es with
+    | none => simp
+    | some source =>
+      by_cases h_start : source = start
+      · simp [h_start]
+      · intro cp hcp
+        simp only [h_start, if_false, List.mem_cons] at hcp
+        rcases hcp with heq | hmem
+        · subst heq; exact h_start
+        · exact ih source (eraseDst curr es) cp hmem
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
