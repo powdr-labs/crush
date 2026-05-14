@@ -17,7 +17,9 @@ use crate::{
         },
         rwm::{
             flattening::sequence_parallel_copies::Register,
-            register_allocation::{self, AllocatedDag, Allocation, PerNodeOccupation},
+            register_allocation::{
+                self, AllocatedDag, Allocation, NodeRegChanges, PerNodeOccupation,
+            },
             settings::Settings,
         },
         settings::{
@@ -116,8 +118,8 @@ fn process_node<'a, 'b, S: Settings<'a>>(
     func_idx: u32,
     occupation_tracker: &mut PerNodeOccupation,
 ) -> Tree<S::Directive> {
-    let (tracked_node_idx, mut dying_regs, newly_live_values) = occupation_tracker.advance();
-    assert_eq!(tracked_node_idx, node_idx);
+    let mut reg_changes = occupation_tracker.advance();
+    assert_eq!(reg_changes.node_index, node_idx);
 
     // Destructure the node so we can use parts in separate scopes.
     let register_allocation::Node {
@@ -136,6 +138,28 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             NodeInput::Reference(origin) => WasmOpInput::Register(allocation.get(&origin).unwrap()),
         })
         .collect_vec();
+
+    //// DEBUG ////
+    /*if func_idx == 4 {
+        let newly_live_values = BTreeSet::from_iter(newly_live_values.iter().copied());
+        let new_ranges = occupation_tracker
+            .active()
+            .filter(|range| newly_live_values.contains(&range.regs.start))
+            .collect_vec();
+        println!(
+            "## {node_idx} ## {operation:?}, new regs: {}, dying regs: {dying_regs:?}",
+            new_ranges
+                .into_iter()
+                .map(|range| {
+                    format!(
+                        "${}..${} [{}..{})",
+                        range.regs.start, range.regs.end, range.live.start, range.live.end
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }*/
 
     let mut ctx = Context::new(common_ctx, allocation, node_idx, &inputs);
     let node_directives = match operation {
@@ -161,7 +185,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
         Operation::Label { id } => {
             // The execution always reaches a local label through a jump. Registers dying in
             // the previous PC are not relevant here, as this is unreachable through that path.
-            drop(dying_regs);
+            drop(reg_changes.dying);
 
             let label = format_label(id, LabelType::Local);
             let entry = &ctrl_stack[0];
@@ -174,7 +198,14 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                 let live_regs_at_label = entry.allocation.occupation_for_node(node_idx);
                 vec![
                     label,
-                    emit_drops_after_label(s, &mut ctx, live_at_jump, live_regs_at_label).into(),
+                    emit_drops_after_label(
+                        s,
+                        &mut ctx,
+                        live_at_jump,
+                        live_regs_at_label,
+                        reg_changes.ephemeral,
+                    )
+                    .into(),
                 ]
                 .into()
             } else {
@@ -191,10 +222,10 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             let input_ranges = loop_allocation.get_for_node(0);
 
             // Copy the loop inputs if needed.
-            assert!(newly_live_values.is_empty());
+            assert!(reg_changes.newly_live.is_empty());
+            assert!(reg_changes.ephemeral.is_empty());
             let mut loop_directives =
-                copy_inputs_if_needed(s, &mut ctx, &inputs, input_ranges, &mut dying_regs);
-            assert!(dying_regs.is_empty());
+                drop_regs_and_copy_inputs(s, &mut ctx, &inputs, input_ranges, reg_changes.dying);
 
             // Generate loop label.
             let loop_label = ctx.new_label(LabelType::Loop);
@@ -240,7 +271,14 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             };
 
             loop_directives.push(
-                emit_drops_after_label(s, &mut ctx, live_at_jump, live_regs_at_loop_start).into(),
+                emit_drops_after_label(
+                    s,
+                    &mut ctx,
+                    live_at_jump,
+                    live_regs_at_loop_start,
+                    Vec::new(),
+                )
+                .into(),
             );
 
             // Push the loop directives.
@@ -248,20 +286,31 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             return loop_directives.into();
         }
         Operation::Br(break_target) => {
-            assert!(newly_live_values.is_empty());
-            let live_regs = ctx.allocation.occupation_for_node(node_idx);
-            return emit_jump(
+            assert!(reg_changes.newly_live.is_empty());
+            assert!(reg_changes.ephemeral.is_empty());
+            let jump_directives = emit_jump(
                 s,
                 &mut ctx,
                 ctrl_stack,
-                live_regs_at_jump,
                 break_target,
                 &inputs,
                 func_idx,
-                &live_regs,
-                dying_regs,
+                &mut reg_changes.dying,
             )
             .into_tree(s);
+
+            // Br is unconditional, so we can always put the remaining drops before it,
+            // without worrying about the case where the branch is not taken.
+            return if reg_changes.dying.is_empty() {
+                jump_directives
+            } else {
+                let mut directives = Vec::with_capacity(reg_changes.dying.len() + 1);
+                for reg in reg_changes.dying {
+                    directives.push(s.emit_drop(&mut ctx, reg).into());
+                }
+                directives.push(jump_directives);
+                directives.into()
+            };
         }
         Operation::BrIf(target) | Operation::BrIfZero(target) => {
             let (cond, inverse_cond) = match operation {
@@ -275,27 +324,29 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             let cond_reg = cond_reg.as_register().unwrap().clone();
             assert_reg::<S>(&cond_reg, ValType::I32);
 
-            assert!(newly_live_values.is_empty());
+            assert!(reg_changes.newly_live.is_empty());
+            assert!(reg_changes.ephemeral.is_empty());
 
             // If the selector is dying, it must be dropped wether the branch is taken or not,
             // so we handle it as a special case.
-            let drop_selector = dying_regs.remove(&cond_reg.start);
+            let drop_selector = reg_changes.dying.remove(&cond_reg.start);
 
-            let live_regs = ctx.allocation.occupation_for_node(node_idx);
             // Must clone, because the we also need to emit the drops if branch is not taken,
             // done in the outer scope.
-            let dying_regs = dying_regs.clone();
+            let mut dying_regs = reg_changes.dying.clone();
             let jump_directives = emit_jump(
                 s,
                 &mut ctx,
                 ctrl_stack,
-                live_regs_at_jump,
                 target,
                 inputs,
                 func_idx,
-                &live_regs,
-                dying_regs,
+                &mut dying_regs,
             );
+
+            // We must save all the currently live registers so that the target label can emit the relevant drops.
+            let live_regs = ctx.allocation.occupation_for_node(node_idx);
+            jump_directives.save_live_at_jump::<S>(live_regs_at_jump, &live_regs, dying_regs);
 
             let mut directives = Vec::new();
             if drop_selector {
@@ -357,9 +408,12 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             directives.into()
         }
         Operation::BrTable { targets } => {
+            assert!(reg_changes.newly_live.is_empty());
+            assert!(reg_changes.ephemeral.is_empty());
+
             let (selector, table_inputs) = inputs.split_last().unwrap();
             let selector = selector.as_register().unwrap().clone();
-            let drop_selector = dying_regs.remove(&selector.start);
+            let drop_selector = reg_changes.dying.remove(&selector.start);
 
             let live_regs = ctx.allocation.occupation_for_node(node_idx);
 
@@ -375,17 +429,18 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                     }
 
                     // Emit the jump to the target label.
-                    emit_jump(
+                    let mut dying = reg_changes.dying.clone();
+                    let jump_result = emit_jump(
                         s,
                         &mut ctx,
                         ctrl_stack,
-                        live_regs_at_jump,
                         target.target,
                         &choice_inputs,
                         func_idx,
-                        &live_regs,
-                        dying_regs.clone(),
-                    )
+                        &mut dying,
+                    );
+                    jump_result.save_live_at_jump::<S>(live_regs_at_jump, &live_regs, dying);
+                    jump_result
                 })
                 .collect_vec();
 
@@ -417,7 +472,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                         .into(),
                     );
                 }
-                JumpResult::Directives(jump_directives) => {
+                JumpResult::CopyJump(_, jump_directives) | JumpResult::Return(jump_directives) => {
                     // If the default target is a complex jump.
                     let table_label = ctx.new_label(LabelType::Local);
                     directives.extend([
@@ -500,7 +555,8 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                             directives.push(s.emit_jump(target).into());
                             None
                         }
-                        JumpResult::Directives(jump_directives) => {
+                        JumpResult::CopyJump(_, jump_directives)
+                        | JumpResult::Return(jump_directives) => {
                             // This is a complex jump, we need to create a new label
                             // and do one indirection.
                             let jump_label = ctx.new_label(LabelType::Local);
@@ -553,8 +609,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                     node_idx,
                     &inputs,
                     func_type,
-                    dying_regs,
-                    newly_live_values,
+                    reg_changes,
                 );
 
                 return vec![
@@ -582,7 +637,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             let (entry_idx, inputs) = inputs.split_last().unwrap();
             let entry_idx = entry_idx.as_register().unwrap().clone();
 
-            let fn_entry_is_dying = dying_regs.remove(&entry_idx.start);
+            let fn_entry_is_dying = reg_changes.dying.remove(&entry_idx.start);
 
             let fn_type = ctx.common.prog.get_type(type_index);
             let call = prepare_function_call(
@@ -592,8 +647,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                 node_idx,
                 inputs,
                 &fn_type.ty,
-                dying_regs,
-                newly_live_values,
+                reg_changes,
             );
 
             // We need to load the function reference from the table, so we allocate
@@ -702,15 +756,20 @@ fn process_node<'a, 'b, S: Settings<'a>>(
     // Labels, because they have to consider the dying registers from all the jumps targeting them.
     // - Operation::Label
 
-    if !dying_regs.is_empty() {
+    // On the general case, ephemeral registers must be dropped just like any dying register.
+    for reg in reg_changes.ephemeral {
+        reg_changes.dying.insert(reg);
+    }
+
+    if !reg_changes.dying.is_empty() {
         // We need to filter newly live values out of dying values
         // (i.e. values that were overritten at this node, reusing the same input register as output)
-        for reused_reg in newly_live_values {
-            dying_regs.remove(&reused_reg);
+        for reused_reg in reg_changes.newly_live {
+            reg_changes.dying.remove(&reused_reg);
         }
 
         let mut result = vec![node_directives];
-        for reg in dying_regs {
+        for reg in reg_changes.dying {
             result.push(s.emit_drop(&mut ctx, reg).into());
         }
         result.into()
@@ -720,7 +779,8 @@ fn process_node<'a, 'b, S: Settings<'a>>(
 }
 
 enum JumpResult<D> {
-    Directives(Vec<Tree<D>>),
+    Return(Vec<Tree<D>>),
+    CopyJump(String, Vec<Tree<D>>),
     PlainJump(String),
 }
 
@@ -730,8 +790,44 @@ impl<D> JumpResult<D> {
         Tree<D>: From<S::Directive>,
     {
         match self {
-            JumpResult::Directives(directives) => directives.into(),
+            JumpResult::CopyJump(_, directives) | JumpResult::Return(directives) => {
+                directives.into()
+            }
             JumpResult::PlainJump(target) => s.emit_jump(target).into(),
+        }
+    }
+
+    fn target(&self) -> Option<&String> {
+        match self {
+            JumpResult::CopyJump(target, _) | JumpResult::PlainJump(target) => Some(target),
+            JumpResult::Return(_) => None,
+        }
+    }
+
+    fn save_live_at_jump<'a, S: Settings<'a>>(
+        &self,
+        live_regs_at_jump: &mut HashMap<String, BTreeSet<u32>>,
+        currently_live: &[Range<u32>],
+        dying_regs: BTreeSet<u32>,
+    ) {
+        if let Some(live_set) = self
+            .target()
+            .and_then(|target| live_regs_at_jump.get_mut(target))
+        {
+            // Whenever this jump is a conditional jump (br_table included), we can have extra "sudden" register
+            // deaths: registers that must be kept alive if this branch is not taken, but are no longer needed if
+            // this branch is taken. We must save what are the registers that are currently live at the jump,
+            // so that the target can know what drops to emit.
+            for range in currently_live {
+                for reg in range.clone() {
+                    live_set.insert(reg);
+                }
+            }
+
+            // Whatever remains in dying_regs must also be dropped at the target label.
+            for reg in dying_regs {
+                live_set.insert(reg);
+            }
         }
     }
 }
@@ -740,12 +836,10 @@ fn emit_jump<'a, S: Settings<'a>>(
     s: &S,
     ctx: &mut Context<'a, '_>,
     ctrl_stack: &VecDeque<StackEntry>,
-    live_regs_at_jump: &mut HashMap<String, BTreeSet<u32>>,
     target: BreakTarget,
     inputs: &[WasmOpInput],
     func_idx: u32,
-    currently_live: &[Range<u32>],
-    mut dying_regs: BTreeSet<u32>,
+    dying_regs: &mut BTreeSet<u32>,
 ) -> JumpResult<S::Directive> {
     // There are 3 different kinds of jumps we have to deal with:
     //
@@ -777,8 +871,7 @@ fn emit_jump<'a, S: Settings<'a>>(
             let input_ranges = ranges_for_types::<S>(ret_types, &mut fn_output_size);
 
             // Use the current block's allocation to source the copied inputs:
-            let mut directives =
-                copy_inputs_if_needed(s, ctx, inputs, input_ranges, &mut dying_regs);
+            let mut directives = copy_inputs_if_needed(s, ctx, inputs, input_ranges, dying_regs);
 
             // Also calculate the space needed by the function inputs, to calculate where
             // the return address and caller frame pointer are stored.
@@ -787,7 +880,7 @@ fn emit_jump<'a, S: Settings<'a>>(
 
             directives.push(s.emit_return(ctx, ra, caller_fp).into());
 
-            return JumpResult::Directives(directives);
+            return JumpResult::Return(directives);
         }
         TargetType::Label(id) => {
             // This is a jump to a label in the current function.
@@ -799,54 +892,72 @@ fn emit_jump<'a, S: Settings<'a>>(
         }
     };
 
-    let live_set = live_regs_at_jump.entry(target.clone()).or_default();
-
-    // Whenever this jump is a conditional jump (br_table included), we can have extra "sudden" register
-    // deaths: registers that must be kept alive if this branch is not taken, but are no longer needed if
-    // this branch is taken. We must save what are the registers that are currently live at the jump,
-    // so that the target can know what drops to emit.
-    for range in currently_live {
-        for reg in range.clone() {
-            live_set.insert(reg);
-        }
-    }
-
     let input_ranges = allocation.get_for_node(output_node_idx);
-    let mut directives = copy_inputs_if_needed(s, ctx, inputs, input_ranges, &mut dying_regs);
+    let mut directives = copy_inputs_if_needed(s, ctx, inputs, input_ranges, dying_regs);
     if directives.is_empty() {
-        // Whatever remains in dying_regs must be dropped at the target label.
-        for reg in dying_regs {
-            live_set.insert(reg);
-        }
         JumpResult::PlainJump(target)
     } else {
         // Stuff remaining in dying_regs (i.e., unused inputs in BrTable)
         // must be dropped before the jump.
-        for reg in dying_regs {
+        for reg in std::mem::take(dying_regs) {
             directives.push(s.emit_drop(ctx, reg).into());
         }
-        directives.push(s.emit_jump(target).into());
+        directives.push(s.emit_jump(target.clone()).into());
 
-        JumpResult::Directives(directives)
+        JumpResult::CopyJump(target, directives)
     }
 }
 
 fn emit_drops_after_label<'a, S: Settings<'a>>(
     s: &S,
     ctx: &mut Context<'a, '_>,
-    mut live_at_jump: BTreeSet<u32>,
+    live_at_jump: BTreeSet<u32>,
     live_regs_at_label: Vec<Range<u32>>,
+    ephemeral_regs: Vec<u32>,
 ) -> Vec<Tree<S::Directive>> {
-    for range in live_regs_at_label.iter() {
-        for reg in range.clone() {
-            live_at_jump.remove(&reg);
+    let mut to_drop = live_at_jump;
+    for range in live_regs_at_label {
+        for reg in range {
+            to_drop.remove(&reg);
         }
     }
 
-    live_at_jump
+    // Due to previous optimizations, there shouldn't be any ephemeral registers
+    // produced by labels. But just in case there are, we drop them as well.
+    for reg in ephemeral_regs {
+        to_drop.insert(reg);
+    }
+
+    to_drop
         .into_iter()
         .map(|reg| s.emit_drop(ctx, reg).into())
         .collect_vec()
+}
+
+/// Applies copy_inputs_if_needed, but also emits the drops for the registers
+/// are not related to the copy, consuming `dying_regs` in the process.
+fn drop_regs_and_copy_inputs<'a, S: Settings<'a>>(
+    s: &S,
+    ctx: &mut Context<'a, '_>,
+    node_inputs: &[WasmOpInput],
+    expected_locations: impl IntoIterator<Item = Range<u32>>,
+    mut dying_regs: BTreeSet<u32>,
+) -> Vec<Tree<S::Directive>> {
+    let copy_directives =
+        copy_inputs_if_needed(s, ctx, node_inputs, expected_locations, &mut dying_regs);
+
+    if dying_regs.is_empty() {
+        copy_directives
+    } else {
+        let mut directives = Vec::with_capacity(dying_regs.len() + copy_directives.len());
+        directives.extend(
+            dying_regs
+                .into_iter()
+                .map(|reg| s.emit_drop(ctx, reg).into()),
+        );
+        directives.push(copy_directives.into());
+        directives
+    }
 }
 
 /// Every control flow that has inputs needs them at specific locations.
@@ -854,6 +965,8 @@ fn emit_drops_after_label<'a, S: Settings<'a>>(
 /// This function emits the copy instructions for the inputs that are not
 /// already at the expected locations, and the drops for the inputs are
 /// no longer used after the copy.
+///
+/// Dying registers that are not related to the copy are left in `dying_regs`.
 fn copy_inputs_if_needed<'a, S: Settings<'a>>(
     s: &S,
     ctx: &mut Context<'a, '_>,
@@ -878,30 +991,38 @@ fn copy_inputs_if_needed<'a, S: Settings<'a>>(
         })
         .collect_vec();
 
-    // drops is defined as (dying_regs ∩ source regs) - destination regs.
+    // TODO: If there are no copies to be done, drops are not immeditelly emmited.
+    // compare with the case where we emit the drops immediately, as it might
+    // worsen naive execution (as it requires one extra jump indirection)
+    // but might improve APC.
+    if copy_set.is_empty() {
+        return Vec::new();
+    }
+
+    // post_drops is defined as (dying_regs ∩ source regs) - destination regs.
     // I.e. everything that is read that isn't colocated with the output set.
-    let mut drops = BTreeSet::new();
+    let mut post_drops = BTreeSet::new();
     for (input, _) in &copy_set {
         for reg in input.clone() {
             if dying_regs.remove(&reg) {
-                drops.insert(reg);
+                post_drops.insert(reg);
             }
         }
     }
     for (_, dest) in &copy_set {
         for reg in dest.clone() {
-            drops.remove(&reg);
+            post_drops.remove(&reg);
         }
     }
 
     let (tmp_register, mut directives) = parallel_copy(s, ctx, copy_set);
     if let Some(tmp_register) = tmp_register {
         // If a temporary register was needed, we need to drop it, too.
-        drops.insert(tmp_register);
+        post_drops.insert(tmp_register);
     }
 
     // Emit the drops for the registers that are dying after the copy.
-    for reg in drops {
+    for reg in post_drops {
         directives.push(s.emit_drop(ctx, reg).into());
     }
 
@@ -1128,8 +1249,7 @@ fn prepare_function_call<'a, S: Settings<'a>>(
     node_idx: usize,
     inputs: &[WasmOpInput],
     func_type: &FuncType,
-    mut dying_values: BTreeSet<u32>,
-    mut newly_live_values: Vec<u32>,
+    mut reg_changes: NodeRegChanges,
 ) -> FunctionCall<S::Directive> {
     // Normal function calls requires inputs to be copied to where they are needed in the
     // function frame, and also may require outputs to be copied to where the users expect
@@ -1168,34 +1288,33 @@ fn prepare_function_call<'a, S: Settings<'a>>(
     ctx.function_call_prelude_size = Some(ret_fp.end);
 
     // Generate the actual directives for input and output copy.
-    let prefix_directives = copy_inputs_if_needed(s, ctx, inputs, input_ranges, &mut dying_values);
-
-    // Every dying register is either a function input, which was handled in copy_inputs_if_needed,
-    // or an unused output register, which is inside the function frame, and is automatically
-    // handled by the DropFrom after the function call.
-    assert!(dying_values.iter().all(|reg| *reg >= frame_start));
+    let prefix_directives =
+        drop_regs_and_copy_inputs(s, ctx, inputs, input_ranges, reg_changes.dying);
 
     let (tmp_reg, mut suffix_directives) = parallel_copy(s, ctx, output_copy_set);
 
     // After the function is called, we need another set of drops to clear the function frame.
-    let mut dying_values = BTreeSet::new();
-    if let Some(tmp_reg) = tmp_reg {
-        dying_values.insert(tmp_reg);
+    let mut individual_drops = BTreeSet::new();
+    if let Some(tmp_reg) = tmp_reg
+        && tmp_reg < frame_start
+    {
+        individual_drops.insert(tmp_reg);
     }
 
     // Everything from frame_start onward that is not a newly live value must be dropped.
     // I.e. we must keep usedfunction outputs that were allocated inside the callee frame,
-    // and drop the rest of the frame.
-    newly_live_values.retain(|reg| *reg >= frame_start);
-    newly_live_values.sort_unstable();
+    // and drop the rest of the frame. This should already include every ephemeral output.
+    assert!(reg_changes.ephemeral.iter().all(|reg| *reg >= frame_start));
+    reg_changes.newly_live.retain(|reg| *reg >= frame_start);
+    reg_changes.newly_live.sort_unstable();
     let mut drop_from = frame_start;
-    for reg in newly_live_values {
-        dying_values.extend(drop_from..reg);
+    for reg in reg_changes.newly_live {
+        individual_drops.extend(drop_from..reg);
         drop_from = reg + 1;
     }
 
     // Emit the after-call drops
-    for reg in dying_values.range(..drop_from) {
+    for reg in individual_drops.range(..drop_from) {
         suffix_directives.push(s.emit_drop(ctx, *reg).into());
     }
     suffix_directives.push(s.emit_drop_from(ctx, drop_from).into());

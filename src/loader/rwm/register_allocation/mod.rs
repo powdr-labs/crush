@@ -113,9 +113,9 @@ pub type Node<'a> = GenericNode<'a, Allocation>;
 /// It compares by reverse live range end so it can be inserted in a BinaryHeap
 /// to efficiently track the currently alive chunks by their end point.
 #[derive(Eq)]
-struct RangeReg {
-    live: Range<usize>,
-    regs: Range<u32>,
+pub struct RangeReg {
+    pub live: Range<usize>,
+    pub regs: Range<u32>,
 }
 impl PartialEq for RangeReg {
     fn eq(&self, other: &Self) -> bool {
@@ -145,19 +145,26 @@ pub struct PerNodeOccupation {
     active_allocs: BinaryHeap<RangeReg>,
 }
 
+pub struct NodeRegChanges {
+    pub node_index: usize,
+    pub dying: BTreeSet<u32>,
+    pub ephemeral: Vec<u32>,
+    pub newly_live: Vec<u32>,
+}
+
 impl PerNodeOccupation {
     /// Advances the tracker to the next node, returning the set of registers that
     /// are just dying at this node. To get what actually must be dropped, make
     /// the difference with the registers that are alive at this node (which doesn't
     /// include the dying, but includes the ones just becoming live).
-    pub fn advance(&mut self) -> (usize, BTreeSet<u32>, Vec<u32>) {
-        let curr_node = self.next_node;
+    pub fn advance(&mut self) -> NodeRegChanges {
+        let node_index = self.next_node;
         self.next_node += 1;
 
         // Remove the dying allocations and collect their registers.
         let mut dying = BTreeSet::new();
         while let Some(next_to_die) = self.active_allocs.peek()
-            && next_to_die.live.end <= curr_node
+            && next_to_die.live.end <= node_index
         {
             for reg in next_to_die.regs.clone() {
                 dying.insert(reg);
@@ -166,15 +173,16 @@ impl PerNodeOccupation {
         }
 
         // Add the new allocations.
+        let mut ephemeral = Vec::new();
         let mut newly_live = Vec::new();
         while let Some(next_to_live) = self.rev_sorted_next_allocs.last()
-            && next_to_live.live.start <= curr_node
+            && next_to_live.live.start <= node_index
         {
             let next_to_live = self.rev_sorted_next_allocs.pop().unwrap();
-            if next_to_live.live.end == curr_node {
+            if next_to_live.live.end == node_index {
                 // This is an ephemeral value that must be discarded right away
                 for reg in next_to_live.regs {
-                    dying.insert(reg);
+                    ephemeral.push(reg);
                 }
             } else {
                 for reg in next_to_live.regs.clone() {
@@ -184,7 +192,16 @@ impl PerNodeOccupation {
             }
         }
 
-        (curr_node, dying, newly_live)
+        NodeRegChanges {
+            node_index,
+            dying,
+            ephemeral,
+            newly_live,
+        }
+    }
+
+    pub fn active(&self) -> impl Iterator<Item = &RangeReg> {
+        self.active_allocs.iter()
     }
 }
 
