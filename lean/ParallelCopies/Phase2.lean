@@ -341,6 +341,57 @@ theorem walkEmits_dsts_nodup
     ((walkEmits fuel start curr es).map Prod.snd).Nodup :=
   (walkEmits_dsts_nodup_aux fuel start curr es [] (by simp) (by simp)).1
 
+/-! ## Forward-reachability in an edge list
+
+`ForwardPath es x y` says we can walk from `x` to `y` along edges in `es`,
+following each edge in its natural direction. -/
+
+inductive ForwardPath (es : Edges) : UInt32 → UInt32 → Prop where
+  | refl  : ∀ x, ForwardPath es x x
+  | step  : ∀ {x y z}, (x, y) ∈ es → ForwardPath es y z → ForwardPath es x z
+
+@[simp] theorem ForwardPath.refl_self (es : Edges) (x : UInt32) :
+    ForwardPath es x x := ForwardPath.refl x
+
+/-- Forward paths compose. -/
+theorem ForwardPath.trans
+    {es : Edges} {x y z : UInt32}
+    (h1 : ForwardPath es x y) (h2 : ForwardPath es y z) :
+    ForwardPath es x z := by
+  induction h1 with
+  | refl _ => exact h2
+  | step h_e _ ih => exact ForwardPath.step h_e (ih h2)
+
+/-- Single-edge path. -/
+theorem ForwardPath.single
+    {es : Edges} {x y : UInt32} (h : (x, y) ∈ es) :
+    ForwardPath es x y := ForwardPath.step h (ForwardPath.refl y)
+
+/-- If `x ≠ y` and there's a forward path from `x` to `y`, then there's
+    some first edge out of `x`. -/
+theorem ForwardPath.step_inv
+    {es : Edges} {x y : UInt32}
+    (h : ForwardPath es x y) (hne : x ≠ y) :
+    ∃ z, (x, z) ∈ es ∧ ForwardPath es z y := by
+  cases h with
+  | refl _ => exact absurd rfl hne
+  | step h_e h_rest => exact ⟨_, h_e, h_rest⟩
+
+/-! ## `ForwardPath` interacts cleanly with `eraseDst` -/
+
+/-- A forward path from `x` to `y` where `y` is the only "absorbing" register
+    (i.e., we don't pass through `r` along the way) survives erasing `r`'s
+    incoming edges, provided `y ≠ r`. -/
+theorem ForwardPath.of_eraseDst
+    {es : Edges} {x y r : UInt32}
+    (h : ForwardPath (eraseDst r es) x y) :
+    ForwardPath es x y := by
+  induction h with
+  | refl _ => exact ForwardPath.refl _
+  | step h_e _ ih =>
+    have : _ ∈ es := ((mem_eraseDst _ _ _).mp h_e).1
+    exact ForwardPath.step this ih
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
