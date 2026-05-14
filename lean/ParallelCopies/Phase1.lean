@@ -152,7 +152,69 @@ theorem find?_dst_of_mem
         rw [hap_false]
         exact ih hWF' hmem'
 
-/-! ## No-self-loop invariant -/
+/-! ## Strong membership characterisation of `peelStep` -/
+
+/-- Every element of `peelStep s d es` either comes from an *unchanged*
+    edge of `es` (whose source was not `s`) or from an edge `(s, x) ∈ es`
+    with `x ≠ d` whose source was rewritten to `d`. -/
+theorem mem_peelStep
+    (s d : UInt32) (es : List Edge) (e : Edge) :
+    e ∈ peelStep s d es →
+      (e ∈ es ∧ e.1 ≠ s) ∨ (∃ x, (s, x) ∈ es ∧ x ≠ d ∧ e = (d, x)) := by
+  induction es with
+  | nil => intro h; cases h
+  | cons e' rest ih =>
+    simp only [peelStep]
+    split
+    · rename_i heq; subst heq
+      intro h
+      rcases ih h with ⟨h1, h2⟩ | ⟨x, h1, h2, h3⟩
+      · exact Or.inl ⟨List.mem_cons_of_mem _ h1, h2⟩
+      · exact Or.inr ⟨x, List.mem_cons_of_mem _ h1, h2, h3⟩
+    · split
+      · rename_i hne_e'_sd hsrc
+        obtain ⟨a, b⟩ := e'
+        simp only at hsrc
+        subst hsrc
+        intro h
+        rcases List.mem_cons.mp h with heq | hmem
+        · refine Or.inr ⟨b, List.mem_cons_self, ?_, heq⟩
+          intro h_b_eq_d
+          subst h_b_eq_d
+          exact hne_e'_sd rfl
+        · rcases ih hmem with ⟨h1, h2⟩ | ⟨x, h1, h2, h3⟩
+          · exact Or.inl ⟨List.mem_cons_of_mem _ h1, h2⟩
+          · exact Or.inr ⟨x, List.mem_cons_of_mem _ h1, h2, h3⟩
+      · rename_i _ hsrc
+        intro h
+        rcases List.mem_cons.mp h with heq | hmem
+        · subst heq; exact Or.inl ⟨List.mem_cons_self, hsrc⟩
+        · rcases ih hmem with ⟨h1, h2⟩ | ⟨x, h1, h2, h3⟩
+          · exact Or.inl ⟨List.mem_cons_of_mem _ h1, h2⟩
+          · exact Or.inr ⟨x, List.mem_cons_of_mem _ h1, h2, h3⟩
+
+/-! ## `UniqueDst` preservation -/
+
+theorem peelStep_uniqueDst
+    (s d : UInt32) (es : List Edge)
+    (hWF : UniqueDst es) :
+    UniqueDst (peelStep s d es) := by
+  intro src1 src2 dst h1 h2
+  rcases mem_peelStep _ _ _ _ h1 with ⟨hr1, h1_src_ne⟩ | ⟨x1, hx1_mem, _, heq1⟩
+  · rcases mem_peelStep _ _ _ _ h2 with ⟨hr2, _⟩ | ⟨x2, hx2_mem, _, heq2⟩
+    · exact hWF src1 src2 dst hr1 hr2
+    · have h_x2 : x2 = dst := by injection heq2 with _ h; exact h.symm
+      rw [h_x2] at hx2_mem
+      have : src1 = s := hWF src1 s dst hr1 hx2_mem
+      exact absurd this h1_src_ne
+  · rcases mem_peelStep _ _ _ _ h2 with ⟨hr2, h2_src_ne⟩ | ⟨x2, hx2_mem, _, heq2⟩
+    · have h_x1 : x1 = dst := by injection heq1 with _ h; exact h.symm
+      rw [h_x1] at hx1_mem
+      have : src2 = s := hWF src2 s dst hr2 hx1_mem
+      exact absurd this h2_src_ne
+    · have h_a : src1 = d := by injection heq1 with h _
+      have h_b : src2 = d := by injection heq2 with h _
+      rw [h_a, h_b]
 
 /-- `peelStep` preserves the "no self-loops" invariant.
     Source-swap turns `(s, x)` into `(d, x)`; this is a self-loop only if
