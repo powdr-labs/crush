@@ -835,6 +835,56 @@ theorem breakOneCycle_schedule_eq
   unfold breakOneCycle
   simp [walkCycle_emits_eq]
 
+/-- walkCycle's returned first component = walkVisits's last element
+    (using `getLast!` to avoid dependent-type issues). -/
+theorem walkCycle_fst_eq_walkVisits_getLast!
+    (fuel : Nat) (start curr : UInt32) (es : Edges)
+    (acc : List (Register × Register)) :
+    (walkCycle fuel start curr es acc).1 =
+      (walkVisits fuel start curr es).getLast! := by
+  induction fuel generalizing curr es acc with
+  | zero => simp [walkCycle, walkVisits]
+  | succ n ih =>
+    cases hsrc : srcOf? curr es with
+    | none => simp [walkCycle, walkVisits, hsrc]
+    | some source =>
+      by_cases h : source = start
+      · simp [walkCycle, walkVisits, hsrc, h]
+      · have hwc : (walkCycle (n+1) start curr es acc).1 =
+                   (walkCycle n start source (eraseDst curr es)
+                     (acc ++ [(.given source, .given curr)])).1 := by
+          simp [walkCycle, hsrc, h]
+        have hwv : walkVisits (n+1) start curr es =
+                   curr :: walkVisits n start source (eraseDst curr es) := by
+          simp [walkVisits, hsrc, h]
+        rw [hwc, ih, hwv]
+        have h_ne_nil := walkVisits_ne_nil n start source (eraseDst curr es)
+        cases h_vis : walkVisits n start source (eraseDst curr es) with
+        | nil => exact absurd h_vis h_ne_nil
+        | cons a rest => simp [List.getLast!]
+
+/-! ## breakOneCycle correctness on a single cycle -/
+
+/-- Helper: applying breakOneCycle's schedule, registers OTHER than the
+    cycle's last (and not in walkEmits.dsts) are unchanged. -/
+theorem breakOneCycle_preserves_non_cycle_dst
+    (fuel : Nat) (start : UInt32) (es : Edges)
+    (σ : SState) (r : UInt32)
+    (h_ne_last : r ≠ (walkCycle fuel start start es
+                       [(Register.given start, Register.temp)]).1)
+    (h_not_dst : r ∉ (walkEmits fuel start start es).map Prod.snd) :
+    applySequentialL (breakOneCycle fuel .temp start es []).2 σ
+      (.given r) = σ (.given r) := by
+  rw [breakOneCycle_schedule_eq]
+  rw [applySequentialL_append, applySequentialL_append]
+  simp only [applySequentialL_cons, applySequentialL_nil, applySequentialL_singleton]
+  -- σ_3 = step σ_2 (.temp, .given last). For r ≠ last, σ_3(.given r) = σ_2(.given r).
+  rw [step_other _ _ (fun h => h_ne_last (by injection h))]
+  -- σ_2 = applySequentialL walkEmits.regify σ_1. For r ∉ walkEmits.dsts, σ_2(.given r) = σ_1(.given r).
+  rw [applySequentialL_walkEmits_regify_preserves_non_dst_given _ _ _ _ _ _ h_not_dst]
+  -- σ_1 = step σ (.given start, .temp). For r ≠ .temp constructor-wise, σ_1(.given r) = σ(.given r).
+  simp [step]
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
