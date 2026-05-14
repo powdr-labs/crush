@@ -4,3 +4,4 @@ defaultTargets = ["ParallelCopies"]
 [[lean_lib]]
 name = "ParallelCopies"
 precompileModules = true
+globs = ["ParallelCopies", "ParallelCopies.+"]

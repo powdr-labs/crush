@@ -41,7 +41,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: lean/.lake
-          key: ${{ runner.os }}-lake-${{ hashFiles('lean/lean-toolchain', 'lean/lakefile.toml', 'lean/ParallelCopies.lean') }}
+          key: ${{ runner.os }}-lake-${{ hashFiles('lean/lean-toolchain', 'lean/lakefile.toml', 'lean/ParallelCopies.lean', 'lean/ParallelCopies/*.lean') }}
+
+      - name: Check Lean proofs (no sorries, no extra axioms)
+        working-directory: lean
+        run: lake build
 
       - name: Build project
         run: cargo build --release
@@ -78,7 +82,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: lean/.lake
-          key: ${{ runner.os }}-lake-clippy-${{ hashFiles('lean/lean-toolchain', 'lean/lakefile.toml', 'lean/ParallelCopies.lean') }}
+          key: ${{ runner.os }}-lake-clippy-${{ hashFiles('lean/lean-toolchain', 'lean/lakefile.toml', 'lean/ParallelCopies.lean', 'lean/ParallelCopies/*.lean') }}
 
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
