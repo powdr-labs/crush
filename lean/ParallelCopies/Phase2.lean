@@ -692,6 +692,94 @@ theorem walkEmits_non_clobbering
   rw [walkEmits_eq_consPairs_walkVisits]
   exact consPairs_non_clobbering _ h_nodup
 
+/-- Nodup is preserved by mapping `Register.given`. -/
+theorem map_nodup_given (xs : List UInt32) (h : xs.Nodup) :
+    (xs.map Register.given).Nodup := by
+  induction xs with
+  | nil => simp
+  | cons a rest ih =>
+    rw [List.nodup_cons] at h
+    rw [List.map_cons, List.nodup_cons]
+    refine ⟨?_, ih h.2⟩
+    intro hcontra
+    rw [List.mem_map] at hcontra
+    obtain ⟨x, hx, hfx⟩ := hcontra
+    have : x = a := by injection hfx
+    subst this
+    exact h.1 hx
+
+/-! ## walkEmits writes the right values under OnCycle -/
+
+/-- For each `(s, d)` in `walkEmits`, the register-tagged schedule writes
+    `σ (.given s)` into `(.given d)` — the original-source value, intact. -/
+theorem walkEmits_regify_writes
+    (fuel : Nat) (start curr : UInt32) (es : Edges)
+    (h_nodup : (walkVisits fuel start curr es).Nodup)
+    (σ : SState) :
+    ∀ s d, (s, d) ∈ walkEmits fuel start curr es →
+      applySequentialL
+        ((walkEmits fuel start curr es).map
+          (fun e => (Register.given e.1, Register.given e.2))) σ
+          (.given d) = σ (.given s) := by
+  intro s d h_mem
+  let regify : UInt32 × UInt32 → Register × Register :=
+    fun e => (Register.given e.1, Register.given e.2)
+  let sched := (walkEmits fuel start curr es).map regify
+  have h_inj : Function.Injective (Register.given) := by
+    intro a b h; injection h
+  -- Membership in sched.
+  have h_mem' : (Register.given s, Register.given d) ∈ sched :=
+    List.mem_map.mpr ⟨(s, d), h_mem, rfl⟩
+  -- Apply applySequentialL_at_dst_unique.
+  apply applySequentialL_at_dst_unique sched σ _ _ h_mem'
+  · -- Nodup of dsts.
+    have h_map_eq : sched.map Prod.snd =
+        ((walkEmits fuel start curr es).map Prod.snd).map Register.given := by
+      show ((walkEmits fuel start curr es).map regify).map Prod.snd =
+        ((walkEmits fuel start curr es).map Prod.snd).map Register.given
+      rw [List.map_map, List.map_map]
+      rfl
+    rw [h_map_eq]
+    -- Need: (xs.map Register.given).Nodup, from xs.Nodup + given injective.
+    exact map_nodup_given _ (walkEmits_dsts_nodup fuel start curr es)
+  · -- Source not earlier dst.
+    intro pre post h_split cp' hcp' hcontra
+    -- Use List.map_eq_append_iff to decompose.
+    rw [List.map_eq_append_iff] at h_split
+    obtain ⟨l₁, l₂_full, h_orig_split, h_l₁_eq, h_l₂_eq⟩ := h_split
+    cases l₂_full with
+    | nil => simp at h_l₂_eq
+    | cons e l₂_rest =>
+      simp at h_l₂_eq
+      obtain ⟨h_e_eq, h_l₂_rest_eq⟩ := h_l₂_eq
+      -- h_e_eq : (regify e) = (.given s, .given d). Extract s, d from e.
+      have h_e_fst : e.1 = s := by
+        have : (regify e).1 = (Register.given s, Register.given d).1 := by rw [h_e_eq]
+        simp only [regify] at this
+        injection this
+      have h_e_snd : e.2 = d := by
+        have : (regify e).2 = (Register.given s, Register.given d).2 := by rw [h_e_eq]
+        simp only [regify] at this
+        injection this
+      have h_e_eq_pair : e = (s, d) := by
+        obtain ⟨a, b⟩ := e
+        simp at h_e_fst h_e_snd
+        congr
+      -- Now walkEmits = l₁ ++ (s, d) :: l₂_rest.
+      rw [h_e_eq_pair] at h_orig_split
+      -- cp' is in pre = l₁.map regify. So cp' = regify cp_orig for some cp_orig ∈ l₁.
+      rw [← h_l₁_eq, List.mem_map] at hcp'
+      obtain ⟨cp_orig, hcp_orig, hcp_eq⟩ := hcp'
+      -- hcontra : cp'.2 = .given s. cp'.2 = (regify cp_orig).2 = .given cp_orig.2.
+      have h_cp_orig_2 : cp_orig.2 = s := by
+        have : (regify cp_orig).2 = cp'.2 := by rw [hcp_eq]
+        simp only [regify] at this
+        rw [hcontra] at this
+        injection this
+      -- Now apply walkEmits_non_clobbering.
+      exact walkEmits_non_clobbering fuel start curr es h_nodup
+        l₁ s d l₂_rest h_orig_split cp_orig hcp_orig h_cp_orig_2
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
