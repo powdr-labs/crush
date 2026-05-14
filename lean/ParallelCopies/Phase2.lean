@@ -909,19 +909,14 @@ theorem breakOneCycle_writes_non_last
     (σ : SState) (s d : UInt32)
     (h_mem : (s, d) ∈ walkEmits fuel start start es)
     (h_ne_last : d ≠ (walkCycle fuel start start es
-                       [(Register.given start, Register.temp)]).1)
-    (h_s_ne_start_neq : s ≠ start ∨ s = start) :  -- always true; placeholder
+                       [(Register.given start, Register.temp)]).1) :
     applySequentialL (breakOneCycle fuel .temp start es []).2 σ
       (.given d) = σ (.given s) := by
   rw [breakOneCycle_schedule_eq]
   rw [applySequentialL_append, applySequentialL_append]
   simp only [applySequentialL_cons, applySequentialL_nil, applySequentialL_singleton]
-  -- σ_3 = step σ_2 (.temp, .given last). For d ≠ last: σ_3(.given d) = σ_2(.given d).
   rw [step_other _ _ (fun h => h_ne_last (by injection h))]
-  -- σ_2 = applySequentialL walkEmits.regify σ_1. By walkEmits_regify_writes:
-  -- σ_2(.given d) = σ_1(.given s).
   rw [walkEmits_regify_writes fuel start start es h_nodup _ s d h_mem]
-  -- σ_1 .given s = σ(.given s) since .given s ≠ .temp.
   simp [step]
 
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
