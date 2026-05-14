@@ -133,4 +133,49 @@ theorem walkCycle_emits_given
         · exact h_acc_given cp hcp
         · simp at hcp; subst hcp; exact ⟨source, curr, rfl⟩
 
+/-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
+
+/-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
+    starting at `a` produces a schedule whose sequential application
+    achieves the parallel swap effect on registers `a` and `b`. -/
+theorem breakOneCycle_swap_correct
+    (a b : UInt32) (hne : a ≠ b) (σ : SState) :
+    let sched := (breakOneCycle 2 .temp a [(a, b), (b, a)] []).2
+    applySequentialL sched σ (.given a) = σ (.given b) ∧
+    applySequentialL sched σ (.given b) = σ (.given a) := by
+  refine ⟨?_, ?_⟩ <;>
+    (simp [breakOneCycle, walkCycle, srcOf?, List.find?, eraseDst,
+           applySequentialL, step, hne, Ne.symm hne])
+
+/-- For a 3-cycle `[(a, b), (b, c), (c, a)]` with all distinct registers,
+    `breakOneCycle` starting at `a` produces a schedule whose sequential
+    application achieves the parallel rotation `a ← c, b ← a, c ← b`. -/
+theorem breakOneCycle_3cycle_correct
+    (a b c : UInt32) (hab : a ≠ b) (hbc : b ≠ c) (hac : a ≠ c) (σ : SState) :
+    let sched := (breakOneCycle 3 .temp a [(a, b), (b, c), (c, a)] []).2
+    applySequentialL sched σ (.given a) = σ (.given c) ∧
+    applySequentialL sched σ (.given b) = σ (.given a) ∧
+    applySequentialL sched σ (.given c) = σ (.given b) := by
+  refine ⟨?_, ?_, ?_⟩ <;>
+    (simp [breakOneCycle, walkCycle, srcOf?, List.find?, eraseDst,
+           applySequentialL, step,
+           hab, Ne.symm hab, hbc, Ne.symm hbc, hac, Ne.symm hac])
+
+/-- For a 4-cycle, `breakOneCycle` produces the correct rotation. -/
+theorem breakOneCycle_4cycle_correct
+    (a b c d : UInt32)
+    (hab : a ≠ b) (hac : a ≠ c) (had : a ≠ d)
+    (hbc : b ≠ c) (hbd : b ≠ d) (hcd : c ≠ d)
+    (σ : SState) :
+    let sched := (breakOneCycle 4 .temp a [(a, b), (b, c), (c, d), (d, a)] []).2
+    applySequentialL sched σ (.given a) = σ (.given d) ∧
+    applySequentialL sched σ (.given b) = σ (.given a) ∧
+    applySequentialL sched σ (.given c) = σ (.given b) ∧
+    applySequentialL sched σ (.given d) = σ (.given c) := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;>
+    (simp [breakOneCycle, walkCycle, srcOf?, List.find?, eraseDst,
+           applySequentialL, step,
+           hab, Ne.symm hab, hac, Ne.symm hac, had, Ne.symm had,
+           hbc, Ne.symm hbc, hbd, Ne.symm hbd, hcd, Ne.symm hcd])
+
 end ParallelCopies.Spec
