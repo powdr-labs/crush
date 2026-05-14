@@ -54,8 +54,7 @@ theorem srcOf?_mem (es : List Edge) (r s : UInt32)
     rw [hsplit]
     simp
 
-/-- After erasing the writer of `r`, looking up `r` again returns `none`,
-    provided `es` had unique destinations. -/
+/-- After erasing the writer of `r`, looking up `r` again returns `none`. -/
 theorem srcOf?_eraseDst_self
     (es : List Edge) (r : UInt32) :
     srcOf? r (eraseDst r es) = none := by
@@ -66,5 +65,27 @@ theorem srcOf?_eraseDst_self
     have ⟨_, h_ne⟩ := (mem_eraseDst r es e).mp he
     simp [h_ne]
   rw [this]; rfl
+
+/-- Erasing the writer of `r` leaves all other destinations unchanged. -/
+theorem srcOf?_eraseDst_ne
+    (es : List Edge) (r r' : UInt32) (h : r' ≠ r) :
+    srcOf? r' (eraseDst r es) = srcOf? r' es := by
+  unfold srcOf? eraseDst
+  congr 1
+  have h_sym : ¬ r = r' := fun heq => h heq.symm
+  induction es with
+  | nil => simp
+  | cons e rest ih =>
+    by_cases h_e_r : e.2 = r
+    · have h_e_ne_r' : ¬ e.2 = r' := by
+        intro heq
+        rw [heq] at h_e_r
+        exact h h_e_r
+      simp [List.filter_cons, h_e_r, List.find?_cons, h_e_ne_r', ih, h_sym]
+    · have h_keep : (e.2 != r) = true := by simp [h_e_r]
+      by_cases h_e_r' : e.2 = r'
+      · simp [List.filter_cons, h_keep, List.find?_cons, h_e_r', h]
+      · simp [List.filter_cons, h_keep, List.find?_cons, h_e_r', ih, h]
+
 
 end ParallelCopies.Spec
