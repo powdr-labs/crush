@@ -5,10 +5,12 @@
 //      `lean/.lake/build/ir/ParallelCopies.c` (Lean's C backend output).
 //   2. Compile that generated C plus our `lean/c/ffi.c` bridge into a static
 //      archive via the `cc` crate.
-//   3. Tell cargo to link the archive *and* `libleanshared`, which provides
-//      the Lean runtime (heap allocator, GC, IO primitives, prelude inits).
-//   4. Embed the toolchain's lib directory as an rpath so the dynamic loader
-//      finds `libleanshared.so` at runtime without `LD_LIBRARY_PATH`.
+//   3. Tell cargo to link the archive together with the official Lean static
+//      archives (`libleancpp`, `libLean`, `libStd`, `libInit`, `libleanrt`)
+//      plus `libc++`/`libc++abi`, GMP, and libuv — the recipe is the one
+//      `leanc --print-ldflags` produces. We avoid `libleanshared.so` on
+//      purpose: it bundles its own libunwind whose `_Unwind_RaiseException`
+//      shadows libgcc_s's and breaks Rust's panic machinery.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -34,8 +36,14 @@ fn main() {
     let ffi_c = lean_dir.join("c/ffi.c");
 
     // Rerun if any of the inputs change.
-    println!("cargo:rerun-if-changed={}", lean_dir.join("ParallelCopies.lean").display());
-    println!("cargo:rerun-if-changed={}", lean_dir.join("lakefile.toml").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        lean_dir.join("ParallelCopies.lean").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        lean_dir.join("lakefile.toml").display()
+    );
     println!("cargo:rerun-if-changed={}", ffi_c.display());
     println!("cargo:rerun-if-changed=build.rs");
 
