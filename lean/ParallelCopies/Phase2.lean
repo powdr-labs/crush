@@ -133,6 +133,42 @@ theorem walkCycle_emits_given
         · exact h_acc_given cp hcp
         · simp at hcp; subst hcp; exact ⟨source, curr, rfl⟩
 
+/-! ## walkCycle emits a deterministic list of copies
+
+The key insight: `walkCycle` produces a specific list of copies determined
+by the walk path. We separate the *structural* aspect (what gets emitted)
+from the *semantic* aspect (what the schedule does to the state). -/
+
+/-- The list of `(source, curr)` pairs `walkCycle` emits. -/
+def walkEmits : Nat → UInt32 → UInt32 → Edges → List (UInt32 × UInt32)
+  | 0,    _,     _,    _  => []
+  | n+1,  start, curr, es =>
+    match srcOf? curr es with
+    | none        => []
+    | some source =>
+      if source = start then []
+      else (source, curr) :: walkEmits n start source (eraseDst curr es)
+
+/-- `walkCycle`'s accumulator grows by exactly the `walkEmits` list. -/
+theorem walkCycle_emits_eq
+    (fuel : Nat) (start curr : UInt32) (es : Edges)
+    (acc : List (Register × Register)) :
+    (walkCycle fuel start curr es acc).2.2 =
+      acc ++ (walkEmits fuel start curr es).map
+        (fun e => (Register.given e.1, Register.given e.2)) := by
+  induction fuel generalizing curr es acc with
+  | zero => simp [walkCycle, walkEmits]
+  | succ n ih =>
+    unfold walkCycle walkEmits
+    cases hsrc : srcOf? curr es with
+    | none => simp
+    | some source =>
+      by_cases h : source = start
+      · simp [h]
+      · simp [h]
+        rw [ih]
+        simp
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
