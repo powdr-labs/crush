@@ -885,6 +885,45 @@ theorem breakOneCycle_preserves_non_cycle_dst
   -- σ_1 = step σ (.given start, .temp). For r ≠ .temp constructor-wise, σ_1(.given r) = σ(.given r).
   simp [step]
 
+/-- For the cycle's *last* register (the one walkCycle returns), the schedule
+    writes σ(.given start) into it via the restore copy. -/
+theorem breakOneCycle_writes_last
+    (fuel : Nat) (start : UInt32) (es : Edges)
+    (σ : SState) :
+    applySequentialL (breakOneCycle fuel .temp start es []).2 σ
+      (.given (walkCycle fuel start start es
+                 [(Register.given start, Register.temp)]).1) =
+      σ (.given start) := by
+  rw [breakOneCycle_schedule_eq]
+  rw [applySequentialL_append, applySequentialL_append]
+  simp only [applySequentialL_cons, applySequentialL_nil, applySequentialL_singleton, step]
+  -- After simp, the goal should be reduced. Let me check.
+  rw [applySequentialL_walkEmits_regify_preserves_temp]
+  simp [step]
+
+/-- For a cycle dst that's *not* the last (i.e., (s, d) ∈ walkEmits),
+    the schedule writes σ(.given s) into .given d. -/
+theorem breakOneCycle_writes_non_last
+    (fuel : Nat) (start : UInt32) (es : Edges)
+    (h_nodup : (walkVisits fuel start start es).Nodup)
+    (σ : SState) (s d : UInt32)
+    (h_mem : (s, d) ∈ walkEmits fuel start start es)
+    (h_ne_last : d ≠ (walkCycle fuel start start es
+                       [(Register.given start, Register.temp)]).1)
+    (h_s_ne_start_neq : s ≠ start ∨ s = start) :  -- always true; placeholder
+    applySequentialL (breakOneCycle fuel .temp start es []).2 σ
+      (.given d) = σ (.given s) := by
+  rw [breakOneCycle_schedule_eq]
+  rw [applySequentialL_append, applySequentialL_append]
+  simp only [applySequentialL_cons, applySequentialL_nil, applySequentialL_singleton]
+  -- σ_3 = step σ_2 (.temp, .given last). For d ≠ last: σ_3(.given d) = σ_2(.given d).
+  rw [step_other _ _ (fun h => h_ne_last (by injection h))]
+  -- σ_2 = applySequentialL walkEmits.regify σ_1. By walkEmits_regify_writes:
+  -- σ_2(.given d) = σ_1(.given s).
+  rw [walkEmits_regify_writes fuel start start es h_nodup _ s d h_mem]
+  -- σ_1 .given s = σ(.given s) since .given s ≠ .temp.
+  simp [step]
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
