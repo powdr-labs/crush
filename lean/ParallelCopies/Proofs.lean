@@ -1,93 +1,114 @@
-import ParallelCopies.SpecLemmas
+import ParallelCopies.Phase2
 
 /-!
-# Algorithm-level proofs
+# Algorithm-level proofs — current state
 
-Correctness proof for `sequenceParallelCopies` against the spec defined in
-`ParallelCopies.Spec`.
+This module re-exports the proofs from `Phase1` and `Phase2` and tracks
+progress toward the full `sequenceParallelCopies_correct` theorem.
 
-The proof is structured as follows:
+## Theorems proved (all axiom-clean: `propext` / `Classical.choice` /
+   `Quot.sound` only — no `sorry`, no `nativeDecide`)
 
-1.  **Preprocessing** (`preprocess`) removes self-copies and exact duplicates
-    while preserving the *semantics* of `applyParallel`.
-2.  **Phase 1 invariant.** Throughout phase 1, the *concatenation* of the
-    emitted copies and a fresh parallel application of the residual graph
-    matches the parallel application of the original input. The crucial
-    local lemma is that one `peelStep` preserves this invariant: the
-    source-swap is sound because, after emitting `(src, dst)`, register
-    `dst` already holds `src`'s pre-copy value.
-3.  **Phase 1 termination.** Phase 1 produces a residual graph in which no
-    register is a leaf — i.e., every remaining destination is also a source.
-    Such a graph is a disjoint union of pure cycles.
-4.  **Phase 2 invariant.** `walkCycle` over a single cycle followed by
-    closing with `(tmp, last)` produces a sequential schedule equivalent to
-    parallel application of that cycle.
-5.  **Composition.** Sequential application of (phase 2 copies) ++ (phase 1
-    copies) equals parallel application of the original.
+### Empty-input correctness (full algorithm)
 
-The proof currently captures the base cases and the spec-level lemmas. The
-phase-1 source-swap soundness lemma and the phase-2 cycle-walk lemma are
-present as named obligations the proof will discharge.
+* `sequenceParallelCopies_correct_on_empty` — for `pairs = #[]`, the
+  algorithm matches the parallel spec on every register and every initial
+  state.
+
+### Spec lemmas (`SpecLemmas.lean`) — 14 theorems
+
+`applyParallel_nil`, `applyParallel_single`, `applyParallel_selfCopy`,
+`applySequential_nil`, `applySequential_singleton`,
+`applySequential_append`, `step_dst`, `step_other`, `lift_given`,
+`lift_temp`, `findWriter?_nil`, `findWriter?_singleton`,
+`Pair.appliesTo_*`, `realisesParallel_emptyImpl_on_empty`.
+
+### List-based mirror (`ListSpec.lean`)
+
+`applyParallelL_nil`, `applyParallelLS_nil`, `applyParallelLS_lift`,
+`applySequentialL_nil`, `applySequentialL_cons`,
+`applySequentialL_append`, `applySequentialL_singleton`,
+`applySequential_eq_L`, `applyParallel_eq_L`.
+
+### Phase 1 (tree pruning with source-swap) — `Phase1.lean`
+
+Structural lemmas:
+* `isLeaf_iff`, `isLeaf_cons`, `isLeaf_head`, `isLeaf_no_src`
+* `UniqueDst_nil`, `UniqueDst_cons`
+* `Pair.appliesTo_d_swap`, `Pair.appliesTo_iff`, `Pair.appliesTo_false_iff`
+
+Source-swap soundness:
+* `find?_peelStep_d_aux`, `find?_peelStep_self` — `peelStep` eliminates
+  writes to the peeled destination.
+* `find?_dst_of_mem` — well-formed `find?` returns the right edge.
+* `find?_of_no_writer` — `find?` returns `none` when no edge applies.
+* `mem_peelStep` — precise membership characterisation of `peelStep`.
+* `peelStep_uniqueDst` — `UniqueDst` survives `peelStep`.
+* `peelStep_no_self` — no-self-loops survives `peelStep`.
+* `find?_peelStep_ne` — characterisation of `find?` after `peelStep` for
+  destinations other than the peeled one.
+* **`peelStep_sound_at_d`** — semantic soundness at the peeled destination.
+* **`peelStep_sound`** — *full* source-swap soundness: emitting `(s, d)`
+  and taking `peelStep s d es` as residual is equivalent to the original
+  parallel block. *(The central local correctness lemma of phase 1.)*
+
+Driver soundness:
+* `findLeafEdge_some` — `findLeafEdge` returns an edge whose destination
+  is a leaf.
+* `edgeToCopy`, `applySequentialL_edgeToCopy_append` — register-lifting.
+* **`phase1_sound`** — *full* phase-1 induction: running `phase1 fuel es
+  acc` from a state where the algorithm's invariant holds preserves the
+  invariant.
+
+### Phase 2 (cycle breaking) — `Phase2.lean`
+
+Structural lemmas:
+* `mem_eraseDst`, `eraseDst_subset`, `eraseDst_uniqueDst`,
+  `eraseDst_no_self`
+* `srcOf?_mem`, `srcOf?_eraseDst_self`, `srcOf?_eraseDst_ne`
+* `walkCycle_acc_prefix`, `walkCycle_emits_given`
+
+## What's still open
+
+The phase-2 *semantic* soundness lemma is the next milestone:
+
+  theorem walkCycle_sound : ...
+  theorem breakOneCycle_sound : ...
+  theorem phase2_sound : ...
+
+The walk forms a cycle that returns to its start, and the emitted
+schedule rotates the cycle's values via the temporary register. The
+proof of walkCycle's semantic effect needs a strong invariant tracking
+which registers have been visited and how their values relate to the
+original state — substantial work given the non-local nature of cycle
+structure.
+
+After phase 2, the remaining pieces to assemble the public-API theorem
+`sequenceParallelCopies_correct : Spec.RealisesParallel
+sequenceParallelCopies` are:
+
+* `preprocess` correctness — filtering self-copies and exact duplicates
+  preserves `applyParallel`.
+* The bridge from list-based to Array-based statements at the FFI
+  boundary.
+
+The Phase 1 proof — including `peelStep_sound` (the deep source-swap
+soundness lemma) and `phase1_sound` (full inductive proof) — is the
+hardest local reasoning in the algorithm and is *complete*. What
+remains for the full theorem is significant in volume but established
+in pattern.
 -/
 
 namespace ParallelCopies
 
 open Spec
 
-/-! ## Base cases -/
-
-@[simp] theorem preprocess_nil : preprocess [] = [] := rfl
-
-@[simp] theorem phase1_zero (es : Edges) (acc : List Edge) :
-    phase1 0 es acc = (es, acc) := rfl
-
-@[simp] theorem phase2_zero (tmp : Register) (es : Edges)
-    (acc : List (Register × Register)) :
-    phase2 0 tmp es acc = acc := rfl
-
-@[simp] theorem walkCycle_zero (start curr : UInt32) (es : Edges)
-    (acc : List (Register × Register)) :
-    walkCycle 0 start curr es acc = (curr, es, acc) := rfl
-
-/-! ## `findLeafEdge` on the empty graph -/
-
-@[simp] theorem findLeafEdge_nil : findLeafEdge [] = none := rfl
-
-@[simp] theorem isLeaf_nil (r : UInt32) : isLeaf r [] = true := rfl
-
-@[simp] theorem srcOf?_nil (r : UInt32) : srcOf? r [] = none := rfl
-
-@[simp] theorem eraseDst_nil (r : UInt32) : eraseDst r [] = [] := rfl
-
-@[simp] theorem smallestDst_nil : smallestDst [] = none := rfl
-
-@[simp] theorem peelStep_nil (s d : UInt32) : peelStep s d [] = [] := rfl
-
-/-! ## Empty phase 1 / 2 -/
-
-@[simp] theorem phase1_no_leaf (n : Nat) (es : Edges) (acc : List Edge)
-    (h : findLeafEdge es = none) :
-    phase1 (n + 1) es acc = (es, acc) := by
-  simp [phase1, h]
-
-@[simp] theorem phase1_nil (n : Nat) (acc : List Edge) :
-    phase1 n [] acc = ([], acc) := by
-  cases n
-  · simp
-  · simp [phase1]
-
-@[simp] theorem phase2_nil (n : Nat) (tmp : Register)
-    (acc : List (Register × Register)) :
-    phase2 n tmp [] acc = acc := by
-  cases n
-  · simp
-  · simp [phase2]
-
-/-! ## Top-level on empty input -/
+/-! ## Top-level: empty input -/
 
 @[simp] theorem sequenceParallelCopiesL_nil :
     sequenceParallelCopiesL [] = [] := by
-  simp [sequenceParallelCopiesL]
+  simp [sequenceParallelCopiesL, preprocess, phase1, phase2, smallestDst,
+        findLeafEdge, List.foldl]
 
 @[simp] theorem sequenceParallelCopies_empty :
     sequenceParallelCopies #[] = #[] := by
