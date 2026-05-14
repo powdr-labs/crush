@@ -495,6 +495,81 @@ theorem walkEmits_srcs_eq_walkVisits_tail
         rw [hrest]
         simp
 
+/-! ## Cycle precondition
+
+`CyclePathTo start es path` says `path` is a sequence of `srcOf?`-steps
+ending at `start`: each consecutive pair `(curr, next)` in `path`
+satisfies `srcOf? curr es = some next`, and the last register's
+`srcOf?` returns `start`. This is exactly the walk that `walkCycle`
+performs when it terminates via `source = start`. -/
+
+inductive CyclePathTo (start : UInt32) : Edges → List UInt32 → Prop where
+  | last  : ∀ {es curr}, srcOf? curr es = some start →
+            CyclePathTo start es [curr]
+  | step  : ∀ {es curr next rest}, srcOf? curr es = some next →
+            next ≠ start →
+            CyclePathTo start (eraseDst curr es) (next :: rest) →
+            CyclePathTo start es (curr :: next :: rest)
+
+/-- `start` is on a `srcOf?`-cycle in `es`. -/
+def OnCycle (start : UInt32) (es : Edges) : Prop :=
+  ∃ path, path ≠ [] ∧ path.head? = some start ∧ path.Nodup ∧
+    CyclePathTo start es path
+
+/-! ## walkVisits matches CyclePathTo's path -/
+
+/-- If there is a `CyclePathTo` from `curr`, then `walkVisits` with enough
+    fuel returns exactly that path. -/
+theorem walkVisits_eq_of_cyclePathTo
+    {path : List UInt32} {start : UInt32} {es : Edges}
+    (hpath : CyclePathTo start es path)
+    {fuel : Nat} (h_fuel : path.length ≤ fuel)
+    {curr : UInt32} (h_head : path.head? = some curr) :
+    walkVisits fuel start curr es = path := by
+  induction hpath generalizing fuel curr with
+  | last h_close =>
+    rename_i es' curr_path
+    simp at h_head
+    subst h_head
+    cases fuel with
+    | zero => simp at h_fuel
+    | succ n =>
+      unfold walkVisits
+      rw [h_close]
+      simp
+  | step h_step h_ne_start _ ih =>
+    rename_i es' curr_path next rest _
+    simp at h_head
+    subst h_head
+    cases fuel with
+    | zero => simp at h_fuel
+    | succ n =>
+      have h_fuel' : (next :: rest).length ≤ n := by
+        simp at h_fuel ⊢
+        omega
+      unfold walkVisits
+      rw [h_step]
+      simp [h_ne_start]
+      exact ih h_fuel' rfl
+
+/-- Under `OnCycle`, walkVisits returns the cycle's path. -/
+theorem walkVisits_eq_of_onCycle
+    (start : UInt32) (es : Edges)
+    (hC : OnCycle start es)
+    (fuel : Nat) (h_fuel : hC.choose.length ≤ fuel) :
+    walkVisits fuel start start es = hC.choose := by
+  obtain ⟨h_ne, h_head, h_nodup, h_path⟩ := hC.choose_spec
+  exact walkVisits_eq_of_cyclePathTo h_path h_fuel h_head
+
+/-- `walkVisits` is `Nodup` under `OnCycle`. -/
+theorem walkVisits_nodup_of_onCycle
+    (start : UInt32) (es : Edges)
+    (hC : OnCycle start es)
+    (fuel : Nat) (h_fuel : hC.choose.length ≤ fuel) :
+    (walkVisits fuel start start es).Nodup := by
+  rw [walkVisits_eq_of_onCycle start es hC fuel h_fuel]
+  exact hC.choose_spec.2.2.1
+
 /-! ## Sources of walkEmits are not the start
 
 If `walkCycle` emits `(s, d)`, then `s ≠ start` — because the algorithm
