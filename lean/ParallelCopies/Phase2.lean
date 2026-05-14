@@ -169,6 +169,77 @@ theorem walkCycle_emits_eq
         rw [ih]
         simp
 
+/-! ## Non-clobbering schedule lemma
+
+A schedule is *non-clobbering at `d`* when:
+* the destination `d` is written exactly once (unique-dst), and
+* the source paired with `d` is not the destination of any copy *before*
+  the `(s, d)` copy in the list.
+
+Under these conditions, applying the schedule sequentially to `σ` leaves
+`d` holding `σ s` — the *original* value at `s`, untouched by clobbering. -/
+
+/-- A schedule that never writes to `r` leaves `r` unchanged. -/
+theorem applySequentialL_preserves_non_dst
+    (copies : List (Register × Register)) (σ : SState) (r : Register)
+    (h : ∀ cp ∈ copies, cp.2 ≠ r) :
+    applySequentialL copies σ r = σ r := by
+  induction copies generalizing σ with
+  | nil => simp
+  | cons cp rest ih =>
+    rw [applySequentialL_cons]
+    have h_first : cp.2 ≠ r := h cp List.mem_cons_self
+    have h_rest : ∀ cp' ∈ rest, cp'.2 ≠ r :=
+      fun cp' hcp' => h cp' (List.mem_cons_of_mem _ hcp')
+    rw [ih (step σ cp) h_rest, step_other σ cp (Ne.symm h_first)]
+
+/-- The flagship non-clobbering lemma: when destinations are distinct
+    (`Nodup`) and the source `s` is not the destination of any earlier
+    copy, the final value at `d` is exactly `σ s`. -/
+theorem applySequentialL_at_dst_unique
+    (copies : List (Register × Register)) (σ : SState)
+    (s d : Register)
+    (h_mem : (s, d) ∈ copies)
+    (h_unique : (copies.map Prod.snd).Nodup)
+    (h_src_not_earlier_dst : ∀ pre post,
+        copies = pre ++ (s, d) :: post →
+        ∀ cp' ∈ pre, cp'.2 ≠ s) :
+    applySequentialL copies σ d = σ s := by
+  induction copies generalizing σ with
+  | nil => simp at h_mem
+  | cons cp rest ih =>
+    rcases List.mem_cons.mp h_mem with heq | hmem'
+    · -- cp is the unique writer
+      subst heq
+      rw [applySequentialL_cons]
+      -- Since dsts are Nodup and cp = (s, d), rest has no (_, d).
+      have h_rest_not_d : ∀ cp' ∈ rest, cp'.2 ≠ d := by
+        intro cp' hcp' hdst
+        have h_d_not_in : d ∉ rest.map Prod.snd := by
+          simp only [List.map_cons, List.nodup_cons] at h_unique
+          exact h_unique.1
+        apply h_d_not_in
+        rw [List.mem_map]
+        exact ⟨cp', hcp', hdst⟩
+      rw [applySequentialL_preserves_non_dst rest (step σ (s, d)) d h_rest_not_d]
+      simp [step]
+    · -- (s, d) is in rest. Apply IH.
+      have h_unique' : (rest.map Prod.snd).Nodup := by
+        simp only [List.map_cons, List.nodup_cons] at h_unique
+        exact h_unique.2
+      have h_fresh' : ∀ pre post,
+          rest = pre ++ (s, d) :: post →
+          ∀ cp' ∈ pre, cp'.2 ≠ s := by
+        intro pre post h_split cp' hcp'
+        exact h_src_not_earlier_dst (cp :: pre) post (by rw [h_split]; simp) cp'
+          (List.mem_cons_of_mem _ hcp')
+      have h_cp_not_s : cp.2 ≠ s := by
+        obtain ⟨pre, post, hsplit⟩ := List.append_of_mem hmem'
+        exact h_src_not_earlier_dst (cp :: pre) post
+          (by rw [hsplit]; simp) cp List.mem_cons_self
+      rw [applySequentialL_cons, ih (step σ cp) hmem' h_unique' h_fresh',
+          step_other σ cp (Ne.symm h_cp_not_s)]
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
