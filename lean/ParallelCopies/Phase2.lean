@@ -240,6 +240,35 @@ theorem applySequentialL_at_dst_unique
       rw [applySequentialL_cons, ih (step σ cp) hmem' h_unique' h_fresh',
           step_other σ cp (Ne.symm h_cp_not_s)]
 
+/-! ## walkEmits structural invariants
+
+For walkCycle to produce a correct non-clobbering schedule we need:
+* destinations of `walkEmits` are pairwise distinct (Nodup);
+* the source of each emit is not the destination of any earlier emit. -/
+
+/-- Every destination in `walkEmits` matches the `curr` argument at its
+    emission point — for our entry `walkCycle fuel start start es`, the
+    first destination is `start`. -/
+theorem walkEmits_dsts
+    (fuel : Nat) (start curr : UInt32) (es : Edges) :
+    (walkEmits fuel start curr es).map Prod.snd =
+      match fuel, srcOf? curr es with
+      | 0, _ => []
+      | _, none => []
+      | _, some source =>
+        if source = start then []
+        else curr :: (walkEmits (fuel - 1) start source (eraseDst curr es)).map Prod.snd := by
+  cases fuel with
+  | zero => simp [walkEmits]
+  | succ n =>
+    simp only [walkEmits]
+    cases srcOf? curr es with
+    | none => rfl
+    | some source =>
+      by_cases h : source = start
+      · simp [h]
+      · simp [h]
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
