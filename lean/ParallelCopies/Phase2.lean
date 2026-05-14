@@ -780,6 +780,61 @@ theorem walkEmits_regify_writes
       exact walkEmits_non_clobbering fuel start curr es h_nodup
         l₁ s d l₂_rest h_orig_split cp_orig hcp_orig h_cp_orig_2
 
+/-! ## breakOneCycle correctness on a single cycle
+
+Putting the pieces together: under `OnCycle start es`, the schedule that
+`breakOneCycle` produces writes each cycle register's parallel-cycle
+value into it. -/
+
+/-- Applying `walkEmits.regify` on top of a state where `.temp` holds some
+    value leaves `.temp` unchanged. -/
+theorem applySequentialL_walkEmits_regify_preserves_temp
+    (fuel : Nat) (start curr : UInt32) (es : Edges) (σ : SState) :
+    applySequentialL
+      ((walkEmits fuel start curr es).map
+        (fun e => (Register.given e.1, Register.given e.2))) σ .temp =
+      σ .temp := by
+  apply applySequentialL_preserves_non_dst
+  intro cp hcp
+  rw [List.mem_map] at hcp
+  obtain ⟨e, _, h_eq⟩ := hcp
+  rw [← h_eq]
+  simp
+
+/-- For any register *not* in `walkEmits.dsts`, applying the regified
+    schedule leaves it unchanged. -/
+theorem applySequentialL_walkEmits_regify_preserves_non_dst_given
+    (fuel : Nat) (start curr : UInt32) (es : Edges) (σ : SState)
+    (r : UInt32) (h : r ∉ (walkEmits fuel start curr es).map Prod.snd) :
+    applySequentialL
+      ((walkEmits fuel start curr es).map
+        (fun e => (Register.given e.1, Register.given e.2))) σ (.given r) =
+      σ (.given r) := by
+  apply applySequentialL_preserves_non_dst
+  intro cp hcp
+  rw [List.mem_map] at hcp
+  obtain ⟨e, he, h_eq⟩ := hcp
+  rw [← h_eq]
+  intro hcontra
+  simp only at hcontra
+  apply h
+  rw [List.mem_map]
+  exact ⟨e, he, by injection hcontra⟩
+
+/-! ## breakOneCycle correctness on one cycle -/
+
+/-- Schedule produced by `breakOneCycle` with empty initial acc. -/
+theorem breakOneCycle_schedule_eq
+    (fuel : Nat) (start : UInt32) (es : Edges) :
+    (breakOneCycle fuel .temp start es []).2 =
+      [(.given start, Register.temp)] ++
+      ((walkEmits fuel start start es).map
+        (fun e => (Register.given e.1, Register.given e.2))) ++
+      [(Register.temp, .given (walkCycle fuel start start es
+          [(.given start, Register.temp)]).1)] := by
+  unfold breakOneCycle
+  simp [walkCycle_emits_eq]
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
