@@ -340,6 +340,28 @@ theorem peelStep_sound_at_d
   rw [find?_dst_of_mem s d es hWF h_mem h_ne, find?_peelStep_self s d es hWF h_mem]
   simp [step]
 
+/-! ## `findLeafEdge` characterisation -/
+
+theorem findLeafEdge_some
+    {es : List Edge} {s d : UInt32}
+    (h : findLeafEdge es = some (s, d)) :
+    (s, d) ∈ es ∧ isLeaf d es = true := by
+  have ⟨hpred, as, bs, hsplit, _⟩ := List.find?_eq_some_iff_append.mp h
+  refine ⟨?_, hpred⟩
+  rw [hsplit]; simp
+
+/-! ## Convenience: lifting edge schedules to register schedules -/
+
+/-- Embed a copy on raw registers into the `Register`-tagged form used by
+    `applySequential`. -/
+@[simp] def edgeToCopy (e : Edge) : Register × Register :=
+  (.given e.1, .given e.2)
+
+theorem applySequentialL_edgeToCopy_append
+    (acc : List Edge) (e : Edge) (σ : SState) :
+    applySequentialL ((acc ++ [e]).map edgeToCopy) σ =
+      step (applySequentialL (acc.map edgeToCopy) σ) (edgeToCopy e) := by
+  simp [applySequentialL_append, applySequentialL]
 /-! ## Full `peelStep_sound`: phase-1's local invariant -/
 
 /-- Phase-1's central correctness lemma: emitting `(s, d)` and then taking
@@ -422,5 +444,64 @@ theorem find?_of_no_writer
           | false => List.find? (Pair.appliesTo · r) rest) = none
     rw [hap]
     exact ih h'
+
+
+/-! ## Phase 1 induction invariant -/
+
+/-- Phase 1 preserves the "applying emitted then residual = original" invariant.
+
+    The invariant is parameterised over the *original* edge list because it
+    is preserved through the recursion: every iteration of phase 1 leaves it
+    unchanged. -/
+theorem phase1_sound
+    (fuel : Nat) (es : Edges) (acc : List Edge)
+    (σ : SState) (original : Edges)
+    (h_inv : applyParallelLS original σ =
+             applyParallelLS es (applySequentialL (acc.map edgeToCopy) σ))
+    (hWF : UniqueDst es)
+    (h_no_self : ∀ e ∈ es, e.1 ≠ e.2) :
+    let (es', acc') := phase1 fuel es acc
+    applyParallelLS original σ =
+      applyParallelLS es' (applySequentialL (acc'.map edgeToCopy) σ) := by
+  induction fuel generalizing es acc with
+  | zero =>
+    simp only [phase1]
+    exact h_inv
+  | succ n ih =>
+    simp only [phase1]
+    cases h_find : findLeafEdge es with
+    | none =>
+      simp [h_find]
+      exact h_inv
+    | some pair =>
+      obtain ⟨s, d⟩ := pair
+      simp only
+      have ⟨h_mem, h_leaf⟩ := findLeafEdge_some h_find
+      -- s ≠ d follows from no self-loops + (s, d) ∈ es
+      have h_ne : s ≠ d := by
+        intro h_eq
+        subst h_eq
+        exact h_no_self (s, s) h_mem rfl
+      -- Apply peelStep_sound to advance the invariant by one step.
+      have h_step :
+          applyParallelLS es (applySequentialL (acc.map edgeToCopy) σ) =
+          applyParallelLS (peelStep s d es)
+            (applySequentialL ((acc ++ [(s, d)]).map edgeToCopy) σ) := by
+        rw [applySequentialL_edgeToCopy_append]
+        have h := peelStep_sound s d es hWF h_mem h_ne h_leaf h_no_self
+                    (applySequentialL (acc.map edgeToCopy) σ)
+        exact h
+      -- Build the new invariant for the recursive call.
+      have h_inv' :
+          applyParallelLS original σ =
+          applyParallelLS (peelStep s d es)
+            (applySequentialL ((acc ++ [(s, d)]).map edgeToCopy) σ) := by
+        rw [h_inv, h_step]
+      -- Preserved structural invariants.
+      have hWF' : UniqueDst (peelStep s d es) := peelStep_uniqueDst s d es hWF
+      have h_no_self' : ∀ e ∈ peelStep s d es, e.1 ≠ e.2 :=
+        peelStep_no_self s d es h_no_self
+      exact ih (peelStep s d es) (acc ++ [(s, d)]) h_inv' hWF' h_no_self'
+
 
 end ParallelCopies.Spec
