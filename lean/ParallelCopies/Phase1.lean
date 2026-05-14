@@ -152,6 +152,113 @@ theorem find?_dst_of_mem
         rw [hap_false]
         exact ih hWF' hmem'
 
+/-! ## No-self-loop invariant -/
+
+/-- `peelStep` preserves the "no self-loops" invariant.
+    Source-swap turns `(s, x)` into `(d, x)`; this is a self-loop only if
+    `d = x`, but `peelStep` drops `(s, d)` itself, so the only candidates
+    `(s, x)` with `x ≠ d` remain non-self after swap. -/
+theorem peelStep_no_self
+    (s d : UInt32) (es : List Edge)
+    (h : ∀ e ∈ es, e.1 ≠ e.2) :
+    ∀ e ∈ peelStep s d es, e.1 ≠ e.2 := by
+  induction es with
+  | nil => intros e he; cases he
+  | cons e' rest ih =>
+    have h' : ∀ x ∈ rest, x.1 ≠ x.2 :=
+      fun x hx => h x (List.mem_cons_of_mem _ hx)
+    have h_e' : e'.1 ≠ e'.2 := h e' List.mem_cons_self
+    simp only [peelStep]
+    split
+    · -- e' = (s, d), dropped
+      exact ih h'
+    · split
+      · -- e'.1 = s, swapped to (d, e'.2)
+        rename_i hne_e'_sd hsrc
+        intro x hx
+        rcases List.mem_cons.mp hx with heq | hmem
+        · -- x = (d, e'.2). Need d ≠ e'.2. If e'.2 = d, then (e'.1, e'.2) = (s, d). But hne_e'_sd.
+          subst heq
+          intro hcontra
+          apply hne_e'_sd
+          obtain ⟨a, b⟩ := e'
+          simp only at hsrc
+          subst hsrc
+          simp only at hcontra
+          simp [hcontra]
+        · exact ih h' x hmem
+      · -- e' kept unchanged
+        intro x hx
+        rcases List.mem_cons.mp hx with heq | hmem
+        · subst heq; exact h_e'
+        · exact ih h' x hmem
+
+/-! ## `find?` after `peelStep` for non-peeled destinations -/
+
+/-- For `r' ≠ d` and no self-loops, `find?` after `peelStep` is the
+    source-swap-mapped `find?` of the original. -/
+theorem find?_peelStep_ne
+    (s d : UInt32) (es : List Edge) (r' : UInt32)
+    (h_ne_dst : r' ≠ d) (h_no_self : ∀ e ∈ es, e.1 ≠ e.2) :
+    (peelStep s d es).find? (Pair.appliesTo · r') =
+      (es.find? (Pair.appliesTo · r')).map
+        (fun e => if e.1 = s then (d, e.2) else e) := by
+  induction es with
+  | nil => simp [peelStep]
+  | cons e rest ih =>
+    have h_no_self' : ∀ e' ∈ rest, e'.1 ≠ e'.2 :=
+      fun e' he' => h_no_self e' (List.mem_cons_of_mem _ he')
+    have h_e_no_self : e.1 ≠ e.2 := h_no_self e List.mem_cons_self
+    have ih' := ih h_no_self'
+    simp only [peelStep]
+    split
+    · -- e = (s, d): dropped
+      rename_i heq; subst heq
+      have h_sd_not : Pair.appliesTo (s, d) r' = false := by
+        rw [Pair.appliesTo_false_iff]; exact Or.inl (Ne.symm h_ne_dst)
+      show (peelStep s d rest).find? (Pair.appliesTo · r') =
+           ((match Pair.appliesTo (s, d) r' with
+             | true => some (s, d)
+             | false => List.find? (Pair.appliesTo · r') rest).map _)
+      rw [h_sd_not, ih']
+    · split
+      · -- e ≠ (s, d), e.1 = s: swap to (d, e.2)
+        rename_i hne hsrc
+        show (match Pair.appliesTo (d, e.2) r' with
+              | true => some (d, e.2)
+              | false => List.find? (Pair.appliesTo · r') (peelStep s d rest)) =
+             ((match Pair.appliesTo e r' with
+               | true => some e
+               | false => List.find? (Pair.appliesTo · r') rest).map _)
+        by_cases h_app : e.2 = r'
+        · -- e applies to r'. Need: peelStep's (d, e.2) also applies.
+          have h_e_app : Pair.appliesTo e r' = true := by
+            rw [Pair.appliesTo_iff]; exact ⟨h_app, h_e_no_self⟩
+          have h_d_app : Pair.appliesTo (d, e.2) r' = true := by
+            rw [Pair.appliesTo_iff]
+            refine ⟨h_app, ?_⟩
+            rw [h_app]; exact Ne.symm h_ne_dst
+          rw [h_e_app, h_d_app]
+          simp [hsrc]
+        · have h_e_not : Pair.appliesTo e r' = false := by
+            rw [Pair.appliesTo_false_iff]; exact Or.inl h_app
+          have h_d_not : Pair.appliesTo (d, e.2) r' = false := by
+            rw [Pair.appliesTo_false_iff]; exact Or.inl h_app
+          rw [h_e_not, h_d_not, ih']
+      · -- e ≠ (s, d), e.1 ≠ s: unchanged
+        rename_i hne hsrc
+        show (match Pair.appliesTo e r' with
+              | true => some e
+              | false => List.find? (Pair.appliesTo · r') (peelStep s d rest)) =
+             ((match Pair.appliesTo e r' with
+               | true => some e
+               | false => List.find? (Pair.appliesTo · r') rest).map _)
+        cases h_app : Pair.appliesTo e r' with
+        | true =>
+          -- find? returns some e; map applies if e.1 = s. We have e.1 ≠ s.
+          simp [hsrc]
+        | false => rw [ih']
+
 /-! ## `peelStep_sound` at the peeled destination -/
 
 /-- The key special case of `peelStep_sound` at `r = .given d`: the
@@ -170,6 +277,66 @@ theorem peelStep_sound_at_d
         | none          => step σ (.given s, .given d) (.given d))
   rw [find?_dst_of_mem s d es hWF h_mem h_ne, find?_peelStep_self s d es hWF h_mem]
   simp [step]
+
+/-! ## Full `peelStep_sound`: phase-1's local invariant -/
+
+/-- Phase-1's central correctness lemma: emitting `(s, d)` and then taking
+    the residual `peelStep s d es` as the parallel block on the updated
+    sequential state is equivalent to the original parallel block. -/
+theorem peelStep_sound
+    (s d : UInt32) (es : List Edge)
+    (hWF : UniqueDst es) (h_mem : (s, d) ∈ es) (h_ne : s ≠ d)
+    (h_leaf : isLeaf d es = true)
+    (h_no_self : ∀ e ∈ es, e.1 ≠ e.2)
+    (σ : SState) :
+    applyParallelLS es σ =
+      applyParallelLS (peelStep s d es) (step σ (.given s, .given d)) := by
+  funext r
+  cases r with
+  | temp =>
+    -- temp register: neither side reads it from edges
+    unfold applyParallelLS
+    simp [step]
+  | given r' =>
+    by_cases h_eq : r' = d
+    · rw [h_eq]
+      exact peelStep_sound_at_d s d es hWF h_mem h_ne σ
+    · -- r' ≠ d. Use find?_peelStep_ne.
+      show (match es.find? (Pair.appliesTo · r') with
+            | some (src, _) => σ (.given src)
+            | none          => σ (.given r')) =
+           (match (peelStep s d es).find? (Pair.appliesTo · r') with
+            | some (src, _) => step σ (.given s, .given d) (.given src)
+            | none          => step σ (.given s, .given d) (.given r'))
+      rw [find?_peelStep_ne s d es r' h_eq h_no_self]
+      cases hres : es.find? (Pair.appliesTo · r') with
+      | none =>
+        -- No writer for r'; both sides give σ (.given r')
+        simp only [Option.map_none]
+        -- RHS: step σ ... (.given r') where r' ≠ d
+        have : step σ (.given s, .given d) (.given r') = σ (.given r') := by
+          simp [step, Register.given.injEq, h_eq]
+        rw [this]
+      | some pair =>
+        obtain ⟨s', t⟩ := pair
+        have hfound := List.find?_eq_some_iff_append.mp hres
+        have happ : Pair.appliesTo (s', t) r' = true := hfound.1
+        rw [Pair.appliesTo_iff] at happ
+        have hdst : t = r' := happ.1
+        have hne_st : s' ≠ t := happ.2
+        have h_mem' : (s', t) ∈ es := by
+          obtain ⟨as, bs, hsplit, _⟩ := hfound.2
+          rw [hsplit]; simp
+        by_cases h_src_eq : s' = s
+        · -- source-swap case: e becomes (d, t). step writes σ (.given s) at d.
+          subst h_src_eq
+          subst hdst
+          simp [step]
+        · -- unchanged. step at .given s' is identity (s' ≠ d).
+          have h_s'_ne_d : s' ≠ d :=
+            isLeaf_no_src h_leaf (s', t) h_mem'
+          subst hdst
+          simp [step, h_src_eq, h_s'_ne_d]
 
 /-- The contrapositive form: if no edge in `es` writes to `r`, then
     `find?` returns `none`. -/
