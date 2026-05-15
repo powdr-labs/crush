@@ -153,8 +153,13 @@ def sequenceParallelCopiesL (pairs : List Edge) : List (Register × Register) :=
   let es              := preprocess pairs
   let fuel            := es.length + 1
   let (es, nonCycle)  := phase1 fuel es []
-  phase2 fuel Register.temp es []
-    ++ nonCycle.map fun (s, d) => (Register.given s, Register.given d)
+  -- nonCycle (leaf-pruning) runs first, then phase2 (cycle-breaking).
+  -- Both blocks touch disjoint register sets (see `sequenceParallelCopies_correct`
+  -- for the disjointness argument), so the final state is independent of the
+  -- order; we choose `nonCycle ++ phase2` because it composes directly with
+  -- `phase1_sound` (whose invariant has `nonCycle` applied first).
+  nonCycle.map (fun (s, d) => (Register.given s, Register.given d))
+    ++ phase2 fuel Register.temp es []
 
 /-- Array wrapper: the public entry point used by the FFI. -/
 def sequenceParallelCopies (pairs : Array Edge) : Array (Register × Register) :=
