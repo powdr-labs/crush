@@ -1604,6 +1604,191 @@ theorem cycleOf_closed_under_writer
       subst h_head
       exact List.mem_cons_self
 
+/-! ## Iterated writer chain -/
+
+/-- `n` applications of `srcOf?` starting at `v`. `none` if the chain breaks. -/
+def iterWriter (n : Nat) (v : UInt32) (es : Edges) : Option UInt32 :=
+  match n with
+  | 0     => some v
+  | k + 1 => (iterWriter k v es).bind (fun u => srcOf? u es)
+
+@[simp] theorem iterWriter_zero (v : UInt32) (es : Edges) :
+    iterWriter 0 v es = some v := rfl
+
+theorem iterWriter_succ (n : Nat) (v : UInt32) (es : Edges) :
+    iterWriter (n + 1) v es = (iterWriter n v es).bind (fun u => srcOf? u es) :=
+  rfl
+
+/-- The writer chain from a `cycleOf` node stays in `cycleOf` after any
+    number of iterations (under `UniqueDst`). -/
+theorem cycleOf_closed_under_iterWriter
+    (start : UInt32) (es : Edges) (hC : OnCycle start es)
+    (hWF : UniqueDst es)
+    (n : Nat) (v : UInt32) (h_v : v ∈ cycleOf start es hC) :
+    ∃ u, iterWriter n v es = some u ∧ u ∈ cycleOf start es hC := by
+  induction n with
+  | zero => exact ⟨v, rfl, h_v⟩
+  | succ k ih =>
+    obtain ⟨u, h_iter, h_u⟩ := ih
+    obtain ⟨w, h_src, h_w⟩ := cycleOf_closed_under_writer start es hC hWF u h_u
+    refine ⟨w, ?_, h_w⟩
+    rw [iterWriter_succ, h_iter]
+    simp [h_src]
+
+/-! ## Cycle path's writer chain matches the path -/
+
+/-- The writer of `path.get ⟨i, _⟩` in `es` is `path.get ⟨i+1, _⟩`. -/
+theorem cyclePathTo_writer_step
+    {start : UInt32} {es : Edges} {path : List UInt32}
+    (h_path : CyclePathTo start es path)
+    (hWF : UniqueDst es)
+    (h_head : path.head? = some start)
+    (h_nodup : path.Nodup)
+    (i : Nat) (h_i_succ : i + 1 < path.length) :
+    srcOf? (path.get ⟨i, by omega⟩) es = some (path.get ⟨i + 1, h_i_succ⟩) := by
+  -- Under OnCycle: walkEmits = consPairs path ⊆ es.
+  have hC : OnCycle start es := ⟨path, by
+    constructor
+    · intro h_eq; rw [h_eq] at h_head; simp at h_head
+    refine ⟨h_head, h_nodup, h_path⟩⟩
+  -- We use the same machinery as cycleOf_closed_under_writer, since path
+  -- can be picked from hC. The cleanest way: replicate the argument.
+  have h_walk_eq : walkVisits path.length start start es = path := by
+    apply walkVisits_eq_of_cyclePathTo h_path (Nat.le_refl _) h_head
+  have h_mem_emit :
+      (path.get ⟨i + 1, h_i_succ⟩, path.get ⟨i, by omega⟩) ∈
+        walkEmits path.length start start es := by
+    rw [walkEmits_eq_consPairs_walkVisits, h_walk_eq]
+    exact consPairs_mem_pair path i h_i_succ
+  have h_in_es : (path.get ⟨i + 1, h_i_succ⟩, path.get ⟨i, by omega⟩) ∈ es :=
+    walkEmits_subset_es _ _ _ _ _ h_mem_emit
+  exact srcOf?_eq_some_of_mem es _ _ hWF h_in_es
+
+/-- The writer of `path.getLast!` in `es` is `start`. -/
+theorem cyclePathTo_writer_close
+    {start : UInt32} {es : Edges} {path : List UInt32}
+    (h_path : CyclePathTo start es path)
+    (hWF : UniqueDst es)
+    (h_ne_nil : path ≠ []) :
+    srcOf? path.getLast! es = some start := by
+  have h_in_es : (start, path.getLast!) ∈ es := cyclePathTo_last_edge h_path
+  exact srcOf?_eq_some_of_mem es _ _ hWF h_in_es
+
+/-- Under `CyclePathTo`, walking `i` writer steps from the head lands on `path[i]`. -/
+theorem iterWriter_path_step
+    {start : UInt32} {es : Edges} {path : List UInt32}
+    (h_path : CyclePathTo start es path)
+    (hWF : UniqueDst es)
+    (h_head : path.head? = some start)
+    (h_nodup : path.Nodup)
+    (i : Nat) (h_i : i < path.length) :
+    iterWriter i start es = some (path.get ⟨i, h_i⟩) := by
+  induction i with
+  | zero =>
+    show some start = some (path.get ⟨0, h_i⟩)
+    -- path is non-empty since 0 < path.length
+    match path, h_head with
+    | [], h => simp at h
+    | a :: rest, h =>
+      simp at h
+      subst h
+      rfl
+  | succ k ih =>
+    have h_k : k < path.length := by omega
+    have h_k_lt : k + 1 < path.length := h_i
+    have ih' := ih h_k
+    rw [iterWriter_succ, ih']
+    show (some (path.get ⟨k, h_k⟩)).bind (fun u => srcOf? u es) =
+         some (path.get ⟨k + 1, h_k_lt⟩)
+    simp only [Option.bind_some]
+    exact cyclePathTo_writer_step h_path hWF h_head h_nodup k h_k_lt
+
+/-- Walking `path.length` writer steps from the head lands back on the head
+    (since the cycle closes). -/
+theorem iterWriter_path_close
+    {start : UInt32} {es : Edges} {path : List UInt32}
+    (h_path : CyclePathTo start es path)
+    (hWF : UniqueDst es)
+    (h_head : path.head? = some start)
+    (h_nodup : path.Nodup)
+    (h_ne_nil : path ≠ []) :
+    iterWriter path.length start es = some start := by
+  have h_len_pos : 0 < path.length := List.length_pos_iff.mpr h_ne_nil
+  have h_last : path.length - 1 < path.length := by omega
+  have ih := iterWriter_path_step h_path hWF h_head h_nodup (path.length - 1) h_last
+  rw [show path.length = (path.length - 1) + 1 from by omega]
+  rw [iterWriter_succ, ih]
+  show (some (path.get ⟨path.length - 1, h_last⟩)).bind (fun u => srcOf? u es) =
+       some start
+  simp only [Option.bind_some]
+  have h_getLast : path.get ⟨path.length - 1, h_last⟩ = path.getLast! := by
+    match path, h_ne_nil with
+    | [], h => exact absurd rfl h
+    | a :: rest, _ => simp [List.getLast!, List.getLast_eq_getElem]
+  rw [h_getLast]
+  exact cyclePathTo_writer_close h_path hWF h_ne_nil
+
+/-! ## Cycle disjointness -/
+
+/-- If `r ∉ cycleOf` and `r` is on a cycle in `es`, then `r`'s cycle is
+    disjoint from `cycleOf`. -/
+theorem cycle_disjoint_of_start_not_in
+    (start : UInt32) (es : Edges) (hC : OnCycle start es)
+    (hWF : UniqueDst es)
+    (r : UInt32) (hR : OnCycle r es) (h_disjoint : r ∉ cycleOf start es hC) :
+    ∀ v, v ∈ cycleOf r es hR → v ∉ cycleOf start es hC := by
+  intro v h_v_in_R h_v_in_start
+  obtain ⟨_, h_head_R, h_nodup_R, h_path_R⟩ := hR.choose_spec
+  -- v ∈ cycleOf r es hR means v ∈ hR.choose. Position is some i_v.
+  obtain ⟨n_v, h_get_v⟩ := List.mem_iff_get.mp h_v_in_R
+  let i_v := n_v.val
+  have h_i_v : i_v < hR.choose.length := n_v.isLt
+  -- Walking (length - i_v) writer steps from r in es lands at v.
+  -- Then walking more steps stays in cycleOf (since v ∈ cycleOf).
+  -- After length total steps from r, we're back at r, so r ∈ cycleOf.
+  have h_ne_nil_R : hR.choose ≠ [] := hR.choose_spec.1
+  -- iterWriter (length) r es = some r.
+  have h_close : iterWriter hR.choose.length r es = some r :=
+    iterWriter_path_close h_path_R hWF h_head_R h_nodup_R h_ne_nil_R
+  -- v ∈ cycleOf start es hC.
+  have h_v_eq : hR.choose.get ⟨i_v, h_i_v⟩ = v := h_get_v
+  -- From any step k where iterWriter k r es = some w with w ∈ cycleOf,
+  -- iterWriter (k + j) r es = some w' with w' ∈ cycleOf (for any j).
+  -- We use this at k where iterWriter k r es = some v (some step k ≤ length).
+  -- The step k = length - i_v.
+  -- Let me prove this directly.
+  -- iterWriter k r es for various k:
+  --   k = 0: some r (= path_R.head)
+  --   k = i: some path_R[i]
+  -- At k = i_v: iterWriter i_v r es = some path_R[i_v] = some v.
+  have h_at_v : iterWriter i_v r es = some v := by
+    rw [← h_v_eq]
+    exact iterWriter_path_step h_path_R hWF h_head_R h_nodup_R i_v h_i_v
+  -- Now from v ∈ cycleOf start es hC, iterWriter k v es stays in cycleOf.
+  -- We want iterWriter (length - i_v) v es to land at r (the closing of R's cycle).
+  -- That requires showing the rotation property.
+  -- Alternative: prove "iterWriter (i_v + j) r es = (iterWriter j v es)" via iterWriter composition.
+  have h_compose : ∀ j, iterWriter (i_v + j) r es =
+                  (iterWriter j v es) := by
+    intro j
+    induction j with
+    | zero => simp; exact h_at_v
+    | succ m ih_j =>
+      rw [show i_v + (m + 1) = (i_v + m) + 1 from by omega]
+      rw [iterWriter_succ, iterWriter_succ, ih_j]
+  -- After length - i_v more steps from v, we're at iterWriter length r es = some r.
+  have h_steps : i_v + (hR.choose.length - i_v) = hR.choose.length := by omega
+  have h_combined : iterWriter (hR.choose.length - i_v) v es = some r := by
+    rw [← h_compose, h_steps]; exact h_close
+  -- But v ∈ cycleOf start es hC: walking from v stays in cycleOf.
+  obtain ⟨u, h_iter_u, h_u_in⟩ :=
+    cycleOf_closed_under_iterWriter start es hC hWF (hR.choose.length - i_v) v h_v_in_start
+  rw [h_iter_u] at h_combined
+  -- h_combined : some u = some r → u = r. So r ∈ cycleOf.
+  injection h_combined with h_u_eq_r
+  rw [← h_u_eq_r] at h_disjoint
+  exact h_disjoint h_u_in
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
