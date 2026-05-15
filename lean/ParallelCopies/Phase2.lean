@@ -2762,6 +2762,69 @@ theorem phase1_no_leaves
       have h_new_fuel : (peelStep s d es).length ≤ n := by omega
       exact ih _ _ h_new_fuel
 
+/-! ## walkErased closes properly under our setup
+
+We show that under no-leaves, no-roots, UniqueDst, and `iterForward k v es = some v`,
+the `walkErased` computation closes at step `k - 1` via the closure case, NOT via
+premature termination. -/
+
+/-- `walkErased fuel start curr es` "closes properly" if its computation terminates
+    via the closure case (`source = start`), not via fuel-zero or `srcOf? = none`. -/
+private def walkErasedClosesAt (fuel : Nat) (start curr : UInt32) (es : Edges) : Prop :=
+  match fuel with
+  | 0     => False
+  | n + 1 =>
+    match srcOf? curr es with
+    | none        => False
+    | some source =>
+      if source = start then True
+      else walkErasedClosesAt n start source (eraseDst curr es)
+
+/-- Under closure, walkErased starts with `curr`. -/
+theorem walkErased_head_under_closes :
+    ∀ (fuel : Nat) (start curr : UInt32) (es : Edges),
+      walkErasedClosesAt fuel start curr es →
+      ∃ tail, walkErased fuel start curr es = curr :: tail
+  | 0, _, _, _, h => by simp [walkErasedClosesAt] at h
+  | n + 1, start, curr, es, h => by
+    simp only [walkErasedClosesAt] at h
+    cases hsrc : srcOf? curr es with
+    | none => rw [hsrc] at h; exact absurd h (by simp)
+    | some source =>
+      rw [hsrc] at h
+      simp only at h
+      by_cases h_start : source = start
+      · exact ⟨[], by simp [walkErased, hsrc, h_start]⟩
+      · rw [if_neg h_start] at h
+        refine ⟨walkErased n start source (eraseDst curr es), ?_⟩
+        simp [walkErased, hsrc, h_start]
+
+/-- When walkErased closes properly, the result satisfies `CyclePathTo`. -/
+theorem walkErasedClosesAt_imp_cyclePathTo :
+    ∀ (fuel : Nat) (start curr : UInt32) (es : Edges),
+      walkErasedClosesAt fuel start curr es →
+      CyclePathTo start es (walkErased fuel start curr es)
+  | 0, _, _, _, h => by simp [walkErasedClosesAt] at h
+  | n + 1, start, curr, es, h => by
+    simp only [walkErasedClosesAt] at h
+    cases hsrc : srcOf? curr es with
+    | none => rw [hsrc] at h; exact absurd h (by simp)
+    | some source =>
+      rw [hsrc] at h
+      simp only at h
+      by_cases h_start : source = start
+      · simp only [walkErased, hsrc, h_start, if_true]
+        apply CyclePathTo.last
+        rw [hsrc]; exact congrArg some h_start
+      · rw [if_neg h_start] at h
+        have h_inner :=
+          walkErasedClosesAt_imp_cyclePathTo n start source (eraseDst curr es) h
+        obtain ⟨tail, h_tail⟩ :=
+          walkErased_head_under_closes n start source (eraseDst curr es) h
+        simp only [walkErased, hsrc, h_start, if_false]
+        rw [h_tail] at h_inner ⊢
+        exact CyclePathTo.step hsrc h_start h_inner
+
 /-! ## phase2_sound: phase 2 realizes the parallel block for all-cycle inputs -/
 
 /-- Phase 2's central correctness lemma. For all-cycle `es` (every dst on
