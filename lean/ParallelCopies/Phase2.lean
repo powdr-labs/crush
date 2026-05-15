@@ -628,6 +628,20 @@ theorem walkEmits_eq_consPairs_walkVisits
         rw [hrest]
         simp [consPairs]
 
+/-- consPairs's destinations are all in the input list. -/
+theorem consPairs_dsts_subset (xs : List UInt32) :
+    ∀ p ∈ consPairs xs, p.2 ∈ xs := by
+  match xs with
+  | [] => simp [consPairs]
+  | [_] => simp [consPairs]
+  | a :: b :: rest =>
+    simp only [consPairs]
+    intro p hp
+    rcases List.mem_cons.mp hp with heq | hmem
+    · subst heq; simp
+    · have := consPairs_dsts_subset (b :: rest) p hmem
+      exact List.mem_cons_of_mem _ this
+
 /-- consPairs's sources are exactly the tail of the input list. -/
 theorem consPairs_sources_eq_tail (xs : List UInt32) :
     (consPairs xs).map Prod.fst = xs.tail := by
@@ -2143,12 +2157,9 @@ theorem writer_not_in_cycleOf_of_not_in
     (h_r_dst : r ∈ es.map Prod.snd)
     (s : UInt32) (h_mem : (s, r) ∈ es) :
     s ∉ cycleOf start es hC := by
-  -- r's cycle (from AllOnCycle) is disjoint from cycleOf (by cycle_disjoint).
-  -- s is the writer of r, hence on r's cycle. So s ∉ cycleOf.
   have hR : OnCycle r es := h_all r h_r_dst
   have h_disjoint : ∀ v ∈ cycleOf r es hR, v ∉ cycleOf start es hC :=
     cycle_disjoint_of_start_not_in start es hC hWF r hR h_r_not_in
-  -- s is on r's cycle (predecessor of r).
   have h_s_in_R : s ∈ cycleOf r es hR := by
     have h_r_in_R : r ∈ cycleOf r es hR := cycleOf_contains_start r es hR
     obtain ⟨u, h_src, h_u⟩ := cycleOf_closed_under_writer r es hR hWF r h_r_in_R
@@ -2158,6 +2169,184 @@ theorem writer_not_in_cycleOf_of_not_in
     exact h_eq.symm ▸ h_u
   exact h_disjoint s h_s_in_R
 
+/-! ## Helpers for phase2_sound -/
+
+/-- The last visited node in walkCycle equals cycleOf.getLast! (under OnCycle). -/
+theorem walkCycle_fst_eq_cycleOf_getLast
+    (start : UInt32) (es : Edges) (hC : OnCycle start es)
+    (fuel : Nat) (h_fuel : (cycleOf start es hC).length ≤ fuel) :
+    (walkCycle fuel start start es [(Register.given start, Register.temp)]).1 =
+      (cycleOf start es hC).getLast! := by
+  rw [walkCycle_fst_eq_walkVisits_getLast!]
+  rw [walkVisits_eq_of_onCycle start es hC fuel h_fuel]
+  rfl
+
+/-- For r in cycleOf, r is also the cycle's getLast! or some non-last position;
+    in particular r ∈ cycleOf. -/
+theorem cycleOf_getLast_mem
+    (start : UInt32) (es : Edges) (hC : OnCycle start es) :
+    (cycleOf start es hC).getLast! ∈ cycleOf start es hC := by
+  unfold cycleOf
+  have h_ne_nil : hC.choose ≠ [] := hC.choose_spec.1
+  cases h_p : hC.choose with
+  | nil => exact absurd h_p h_ne_nil
+  | cons a rest =>
+    rw [show (a :: rest).getLast! = (a :: rest).getLast (by simp) from by
+      simp [List.getLast!, List.getLast_eq_getElem]]
+    exact List.getLast_mem _
+
+/-- For p ∈ walkEmits, p.2 ∈ cycleOf (under OnCycle, sufficient fuel). -/
+theorem walkEmits_dst_in_cycleOf
+    (start : UInt32) (es : Edges) (hC : OnCycle start es)
+    (fuel : Nat) (h_fuel : (cycleOf start es hC).length ≤ fuel)
+    (p : UInt32 × UInt32) (h_p : p ∈ walkEmits fuel start start es) :
+    p.2 ∈ cycleOf start es hC := by
+  rw [walkEmits_eq_consPairs_walkVisits] at h_p
+  rw [walkVisits_eq_of_onCycle start es hC fuel h_fuel] at h_p
+  exact consPairs_dsts_subset _ p h_p
+
+/-! ## phase2_sound: phase 2 realizes the parallel block for all-cycle inputs -/
+
+/-- Phase 2's central correctness lemma. For all-cycle `es` (every dst on
+    a cycle in es), the schedule produced by phase 2 implements parallel
+    semantics: applying the schedule sequentially yields the parallel
+    state, register-by-register. -/
+theorem phase2_sound
+    (fuel : Nat) (es : Edges) (acc : List (Register × Register))
+    (σ : SState)
+    (hWF : UniqueDst es)
+    (h_no_self : ∀ e ∈ es, e.1 ≠ e.2)
+    (h_all : AllOnCycle es)
+    (h_fuel : es.length ≤ fuel)
+    (r : UInt32) :
+    applySequentialL (phase2 fuel .temp es acc) σ (.given r) =
+      applyParallelLS es (applySequentialL acc σ) (.given r) := by
+  induction fuel generalizing es acc with
+  | zero =>
+    have h_empty : es = [] := by
+      cases es with
+      | nil => rfl
+      | cons _ _ => simp at h_fuel
+    subst h_empty
+    simp [phase2, applyParallelLS]
+  | succ n ih =>
+    show applySequentialL (phase2 (n+1) Register.temp es acc) σ (.given r) = _
+    unfold phase2
+    cases h_smallest : smallestDst es with
+    | none =>
+      simp only
+      have h_empty : es = [] := (smallestDst_eq_none_iff es).mp h_smallest
+      subst h_empty
+      simp [applyParallelLS]
+    | some start =>
+      simp only
+      have h_start_dst : start ∈ es.map Prod.snd :=
+        smallestDst_some_mem es start h_smallest
+      have hC : OnCycle start es := h_all start h_start_dst
+      have h_cycle_len_le : (cycleOf start es hC).length ≤ es.length :=
+        cycleOf_length_le start es hC
+      have h_cycle_fuel : (cycleOf start es hC).length ≤ n + 1 :=
+        Nat.le_trans h_cycle_len_le h_fuel
+      have h_start_in_cycleOf : start ∈ cycleOf start es hC :=
+        cycleOf_contains_start start es hC
+      let break_out := breakOneCycle (n+1) Register.temp start es acc
+      have h_break_def : break_out = breakOneCycle (n+1) Register.temp start es acc := rfl
+      have h_es' : break_out.1 =
+          es.filter (fun e => decide (e.2 ∉ cycleOf start es hC)) := by
+        show (breakOneCycle (n+1) Register.temp start es acc).1 = _
+        exact breakOneCycle_residual start es hC (n+1) h_cycle_fuel acc
+      have h_acc' : break_out.2 =
+          acc ++ (breakOneCycle (n+1) Register.temp start es []).2 := by
+        show (breakOneCycle (n+1) Register.temp start es acc).2 = _
+        exact breakOneCycle_schedule_acc_decomp (n+1) start es acc
+      have h_recurse_fuel : break_out.1.length ≤ n := by
+        rw [h_es']
+        have h_strict : (es.filter (fun e => decide (e.2 ∉ cycleOf start es hC))).length
+            < es.length := by
+          obtain ⟨s_start, h_writer_start⟩ : ∃ s, srcOf? start es = some s := by
+            obtain ⟨u, h_iter, _⟩ :=
+              cycleOf_closed_under_writer start es hC hWF start h_start_in_cycleOf
+            exact ⟨u, h_iter⟩
+          have h_mem : (s_start, start) ∈ es := srcOf?_mem es _ _ h_writer_start
+          apply List.length_filter_lt_length_iff_exists.mpr
+          exact ⟨_, h_mem, by simp; exact h_start_in_cycleOf⟩
+        omega
+      have hWF' : UniqueDst break_out.1 := by
+        rw [h_es']; exact filter_uniqueDst _ _ hWF
+      have h_no_self' : ∀ e ∈ break_out.1, e.1 ≠ e.2 := by
+        rw [h_es']; exact filter_no_self_loops _ _ h_no_self
+      have h_all' : AllOnCycle break_out.1 := by
+        rw [h_es']
+        have hh := allOnCycle_preserved_by_breakOneCycle start es hC hWF h_all
+          (n+1) h_cycle_fuel acc
+        rw [breakOneCycle_residual start es hC (n+1) h_cycle_fuel acc] at hh
+        exact hh
+      have h_ih :=
+        ih break_out.1 break_out.2 hWF' h_no_self' h_all' h_recurse_fuel
+      rw [h_ih]
+      let σ_acc := applySequentialL acc σ
+      have h_σ_acc : σ_acc = applySequentialL acc σ := rfl
+      have h_σ_acc' : applySequentialL break_out.2 σ =
+          applySequentialL (breakOneCycle (n+1) Register.temp start es []).2 σ_acc := by
+        rw [h_acc']
+        exact applySequentialL_append _ _ _
+      rw [h_σ_acc']
+      let σ_acc' := applySequentialL (breakOneCycle (n+1) Register.temp start es []).2 σ_acc
+      have h_σ_acc'_def : σ_acc' = applySequentialL
+          (breakOneCycle (n+1) Register.temp start es []).2 σ_acc := rfl
+      -- The "preservation outside cycleOf" facts we'll reuse:
+      have h_preserve_non_cycle : ∀ x, x ∉ cycleOf start es hC →
+          applySequentialL (breakOneCycle (n+1) Register.temp start es []).2 σ_acc (.given x)
+            = σ_acc (.given x) := by
+        intro x h_x
+        apply breakOneCycle_preserves_non_cycle_dst (n+1) start es σ_acc x
+        · intro h_eq_last
+          apply h_x
+          rw [h_eq_last, walkCycle_fst_eq_cycleOf_getLast start es hC (n+1) h_cycle_fuel]
+          exact cycleOf_getLast_mem start es hC
+        · intro h_in_dst
+          rw [List.mem_map] at h_in_dst
+          obtain ⟨p, h_p_mem, h_p_eq⟩ := h_in_dst
+          apply h_x
+          rw [← h_p_eq]
+          exact walkEmits_dst_in_cycleOf start es hC (n+1) h_cycle_fuel p h_p_mem
+      by_cases h_r_in : r ∈ cycleOf start es hC
+      · -- r is on the handled cycle
+        rw [h_es']
+        have h_no_writer : ∀ e ∈ es.filter (fun e => decide (e.2 ∉ cycleOf start es hC)),
+            ¬ (e.2 = r ∧ e.1 ≠ e.2) := by
+          intro e he ⟨h_eq, _⟩
+          rw [List.mem_filter] at he
+          obtain ⟨_, h_dec⟩ := he
+          simp at h_dec
+          exact h_dec (h_eq ▸ h_r_in)
+        rw [applyParallelLS_at_no_writer _ _ r h_no_writer]
+        obtain ⟨n_i, h_get⟩ := List.mem_iff_get.mp h_r_in
+        have h_i : n_i.val < hC.choose.length := n_i.isLt
+        have h_get' : hC.choose.get ⟨n_i.val, h_i⟩ = r := h_get
+        rw [← h_get']
+        exact breakOneCycle_sound_at_cycle start es hWF h_no_self hC (n+1) h_cycle_fuel
+          (applySequentialL acc σ) n_i.val h_i
+      · -- r is not on the handled cycle
+        rw [h_es']
+        rw [applyParallelLS_filter_disjoint es _ hWF _ r h_r_in]
+        by_cases h_writer : ∃ s, (s, r) ∈ es ∧ s ≠ r
+        · obtain ⟨s, h_mem, h_ne⟩ := h_writer
+          have h_r_dst : r ∈ es.map Prod.snd := mem_dsts_of_edge_mem h_mem
+          have h_s_not_in : s ∉ cycleOf start es hC :=
+            writer_not_in_cycleOf_of_not_in start es hC hWF h_all r h_r_in h_r_dst s h_mem
+          rw [applyParallelLS_at_writer es _ s r hWF h_mem h_ne]
+          rw [applyParallelLS_at_writer es _ s r hWF h_mem h_ne]
+          exact h_preserve_non_cycle s h_s_not_in
+        · have h_es_no_writer : ∀ e ∈ es, ¬ (e.2 = r ∧ e.1 ≠ e.2) := by
+            intro e he ⟨h_eq, h_ne_e⟩
+            obtain ⟨a, b⟩ := e
+            simp at h_eq
+            subst h_eq
+            exact h_writer ⟨a, he, h_ne_e⟩
+          rw [applyParallelLS_at_no_writer es _ r h_es_no_writer]
+          rw [applyParallelLS_at_no_writer es _ r h_es_no_writer]
+          exact h_preserve_non_cycle r h_r_in
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
     starting at `a` produces a schedule whose sequential application
