@@ -3291,6 +3291,21 @@ theorem onCycle_of_dst
       simp at h_eq
       exact h_iter_ne (by rw [h_eq])
 
+/-! ## Phase 1's residual has AllOnCycle -/
+
+theorem phase1_residual_allOnCycle
+    (fuel : Nat) (es : Edges) (acc : List Edge)
+    (hWF : UniqueDst es)
+    (h_dsts_nodup : (es.map Prod.snd).Nodup)
+    (h_fuel : es.length ≤ fuel) :
+    AllOnCycle (phase1 fuel es acc).1 := by
+  intro d h_d
+  apply onCycle_of_dst
+  · exact phase1_preserves_uniqueDst fuel es acc hWF
+  · exact phase1_preserves_dsts_nodup fuel es acc h_dsts_nodup
+  · exact phase1_no_leaves fuel es acc h_fuel
+  · exact h_d
+
 /-! ## phase2_sound: phase 2 realizes the parallel block for all-cycle inputs -/
 
 /-- Phase 2's central correctness lemma. For all-cycle `es` (every dst on
