@@ -2943,15 +2943,19 @@ theorem iterWriter_eq_iterForward_reverse :
 /-! ## walkErasedClosesAt under iterWriter chain hypotheses -/
 
 /-- The full chain-tracing argument: under iterWriter (n+1) curr es = some start,
-    no-early-return, chain Nodup, and disjoint-from-erased, walkErasedClosesAt
-    holds in the erased-state. -/
+    no-early-return, intermediate-Nodup (`iterWriter` distinct on [0, n]), and
+    disjoint-from-erased, walkErasedClosesAt holds in the erased-state.
+
+    The Nodup over `[0, n]` (intermediate values) suffices — the closing value
+    iterWriter (n+1) = some start may coincide with iterWriter 0 = some curr
+    (when curr = start, our use case). -/
 private theorem walkErasedClosesAt_chain_inductive
     (es_orig : Edges) (hWF_orig : UniqueDst es_orig)
     (start : UInt32) :
     ∀ (n : Nat) (curr : UInt32) (erased : List UInt32),
       iterWriter (n + 1) curr es_orig = some start →
       (∀ j, 0 < j → j ≤ n → iterWriter j curr es_orig ≠ some start) →
-      (∀ i j, i ≤ n + 1 → j ≤ n + 1 → i < j →
+      (∀ i j, i ≤ n → j ≤ n → i < j →
         iterWriter i curr es_orig ≠ iterWriter j curr es_orig) →
       (∀ i, i ≤ n → ∀ e ∈ erased, iterWriter i curr es_orig ≠ some e) →
       walkErasedClosesAt (n + 1) start curr (erased.foldr eraseDst es_orig)
