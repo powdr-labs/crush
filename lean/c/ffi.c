@@ -109,6 +109,12 @@ crush_buf_t crush_seq_parallel_copies(const uint32_t *pairs, size_t num_pairs) {
     pthread_once(&init_once, do_init);
     ensure_thread_init();
 
+    /* Compute `num_pairs * 2 * sizeof(uint32_t)` with overflow checks. The
+     * inputs cross an unsafe FFI boundary; reject anything that would wrap. */
+    if (num_pairs > SIZE_MAX / (2 * sizeof(uint32_t))) {
+        fprintf(stderr, "lean: input size overflows size_t (num_pairs=%zu)\n", num_pairs);
+        abort();
+    }
     const size_t in_bytes = num_pairs * 2 * sizeof(uint32_t);
 
     /* Build a Lean ByteArray and copy the input into it. */
@@ -117,7 +123,9 @@ crush_buf_t crush_seq_parallel_copies(const uint32_t *pairs, size_t num_pairs) {
         memcpy(lean_sarray_cptr(input), pairs, in_bytes);
     }
 
-    /* Call into Lean. Ownership of `input` transfers to Lean. */
+    /* Call into Lean. The generated wrapper for `rust_seq_parallel_copies`
+     * decrements `input`'s RC after consuming it, so we must NOT call
+     * `lean_dec_ref(input)` here — that would be a double-free. */
     lean_object *output = rust_seq_parallel_copies(input);
 
     const size_t out_bytes = lean_sarray_size(output);

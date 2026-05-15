@@ -610,6 +610,14 @@ fn copy_inputs_if_needed<'a, S: Settings<'a>>(
 
 /// Given a set of source-destination register ranges, emits the sequence of copy instructions
 /// such that all copies are performed correctly, even in presence of overlapping ranges.
+///
+/// **Trust boundary**: the schedule returned by `sequence_parallel_copies` is correct under the
+/// Lean theorem `sequenceParallelCopies_correct`, which treats `Register::Temp` as an ADT
+/// variant disjoint from every `Register::Given(r)`. Materialising `Register::Temp` to a
+/// concrete `u32` (below) is *not* covered by that theorem: this function is responsible for
+/// choosing a temp register that does not alias any participant of the parallel-copy, so that
+/// the materialised schedule still realises parallel semantics. See `lean/README.md` ("Trust
+/// boundary") for details.
 fn parallel_copy<'a, S: Settings<'a>>(
     s: &S,
     ctx: &mut Context<'a, '_>,

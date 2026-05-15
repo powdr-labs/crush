@@ -170,6 +170,21 @@ under `UniqueDst es`, no self-loops, `AllOnCycle es`, and enough fuel.
 
 **Why sufficient.** They are pure desugaring / `foldl_append` identities, but without them the array/list mismatch would require ad-hoc juggling at every step.
 
+## Trust boundary — what's verified vs what's trusted
+
+The theorem above is a statement about the **abstract schedule**: a list of `(Register, Register)` copies where `Register = .temp | .given UInt32`. Lean treats `.temp` and every `.given r` as disjoint registers *by ADT construction* — they cannot alias.
+
+When the schedule is executed by `crush` it has to be lowered to concrete machine moves over `u32` register slots. That step happens in Rust, in `src/loader/rwm/flattening/mod.rs::parallel_copy`, and is **outside** the Lean theorem:
+
+* The Rust shim collects every `.given r` appearing as a source or destination in the schedule (the *participant set*).
+* When the materialiser is asked to assign a concrete `u32` to `.temp`, it calls `Context::allocate_tmp_type` and retries until the result is not in the participant set.
+
+This is the right thing to do, but it is **trusted code**: if the participant collection were wrong, or if `allocate_tmp_type` returned a register that was live-and-still-needed in the surrounding compiler state, the verified Lean theorem would not catch it. The earlier bug where wasm-pipeline tests broke was exactly an instance of this — a materialised `.temp` aliasing a parallel-copy destination — and it was found by integration tests, not by Lean.
+
+If you change `parallel_copy`, `allocate_tmp_type`, or the way the participant set is collected, treat those changes as touching the trust boundary and validate them with full pipeline tests.
+
+A future, stronger version of this module could move temp materialisation into the verified algorithm (port the original Rust optimisation of using the first non-cycle destination as the temp), at which point the output type becomes `u32` and the trust boundary collapses. The current code does not do that.
+
 ## How they combine in `Proofs.lean`
 
 The final theorem proof is a single chain of rewrites:

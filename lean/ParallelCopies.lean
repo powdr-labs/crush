@@ -203,8 +203,11 @@ def encodeCopies (copies : Array (Register × Register)) : ByteArray :=
     let (tb, vb) := encodeRegister b
     [ta, va, tb, vb].foldl pushU32LE bs
 
+/-- FFI entry point. The argument is consumed (Lean's RC decrements it
+    inside the generated wrapper after `decodePairs`), so the C bridge
+    must not `lean_dec_ref` it explicitly. -/
 @[export rust_seq_parallel_copies]
-def rustSeqParallelCopies (input : @& ByteArray) : ByteArray :=
+def rustSeqParallelCopies (input : ByteArray) : ByteArray :=
   encodeCopies (sequenceParallelCopies (decodePairs input))
 
 end ParallelCopies

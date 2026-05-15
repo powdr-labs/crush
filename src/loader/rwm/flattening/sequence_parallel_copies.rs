@@ -40,8 +40,10 @@ pub enum Register {
 /// Returns a sequence of (source, destination) register pairs that can be executed in order to achieve
 /// the same effect as the original parallel copies.
 ///
-/// Pre-conditions:
-///  * every destination register must be only written to once.
+/// Pre-condition: each non-self destination may be written by at most one *distinct* source.
+/// Self-copies (`src == dst`) and exact-duplicate edges (`(s, d)` appearing more than once with the
+/// same `s`) are allowed — they are silently filtered out. Only conflicting writes — two pairs
+/// `(s₁, d)` and `(s₂, d)` with `s₁ ≠ s₂` and neither being a self-copy — panic.
 pub fn sequence_parallel_copies(
     parallel_copies: impl IntoIterator<Item = (u32, u32)>,
 ) -> impl Iterator<Item = (Register, Register)> {
@@ -66,13 +68,25 @@ pub fn sequence_parallel_copies(
         }
     }
 
-    // Encode pairs as little-endian u32s and hand them to Lean.
-    let mut input: Vec<u32> = Vec::with_capacity(pairs.len() * 2);
+    // Encode pairs as little-endian u32s and hand them to Lean. Use checked
+    // arithmetic at the FFI boundary so a pathologically large input is
+    // rejected before we wrap and under-allocate.
+    let input_len = pairs
+        .len()
+        .checked_mul(2)
+        .expect("sequence_parallel_copies: input too large (overflow in length)");
+    let mut input: Vec<u32> = Vec::with_capacity(input_len);
     for &(src, dst) in &pairs {
         input.push(src);
         input.push(dst);
     }
 
+    // NOTE: a debug-mode runtime check that this schedule (and especially its
+    // *materialised* form, after `parallel_copy` resolves `Register::Temp` to a
+    // concrete u32) realises parallel-copy semantics would be a useful belt-
+    // and-braces guard against future regressions in `parallel_copy`. The
+    // present module's 47 unit tests already cover the Lean schedule; the
+    // missing piece is a check at the materialisation layer. Left as a follow-up.
     unsafe { call_lean(&input) }
 }
 

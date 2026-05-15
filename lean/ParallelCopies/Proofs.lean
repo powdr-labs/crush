@@ -1,122 +1,42 @@
 import ParallelCopies.Phase2
 
 /-!
-# Algorithm-level proofs — current state
+# Algorithm-level proofs — final theorem
 
-This module re-exports the proofs from `Phase1` and `Phase2` and tracks
-progress toward the full `sequenceParallelCopies_correct` theorem.
+The full correctness statement, `sequenceParallelCopies_correct :
+RealisesParallel sequenceParallelCopies`, lives at the bottom of this
+file. It is axiom-clean: it depends only on `propext`, `Classical.choice`,
+and `Quot.sound` — Lean's three foundational axioms. No `sorry`, no
+`nativeDecide`, no native-code escape hatches.
 
-All committed theorems are axiom-clean (depend only on `propext`,
-`Classical.choice`, `Quot.sound` — Lean's three foundational axioms;
-no `sorry`, no `nativeDecide`).
+## How the proof composes
 
-## Theorems proved
+The final proof rewrites the statement through six lemmas, each from a
+single source module, in this order:
 
-### Empty-input correctness (full algorithm)
+1. `applyParallel_eq_L`, `applySequential_eq_L` (`ListSpec.lean`) —
+   translate Array-based spec to List-based mirror.
+2. `sequenceParallelCopiesL_eq_explicit` (this file) — expose the
+   `nonCycle ++ phase2` decomposition.
+3. `applySequentialL_append` (`ListSpec.lean`) — split the sequential
+   application along the `++`.
+4. `phase2_sound` (`Phase2.lean`) with `acc = []` — phase 2's schedule on
+   the post-nonCycle state matches the parallel block of the residual
+   cycles.
+5. `phase1_sound` (`Phase1.lean`) — phase 1's residual + emitted copies
+   give the parallel block of the preprocessed input.
+6. `applyParallelLS_preprocess_eq` (`Phase2.lean`) — preprocessing
+   (drop self-copies and exact duplicates) preserves the parallel block.
 
-* `sequenceParallelCopies_correct_on_empty` — for `pairs = #[]`, the
-  algorithm matches the parallel spec on every register and every
-  initial state.
+The structural side-conditions (`UniqueDst`, no self-loops, `AllOnCycle`
+for the residual) are supplied by `phase1_preserves_uniqueDst`,
+`phase1_preserves_no_self`, `phase1_residual_allOnCycle`, and the
+analogous preprocess lemmas.
 
-### Spec lemmas (`SpecLemmas.lean`)
-
-14 theorems: `applyParallel_*`, `applySequential_*`, `step_*`, `lift_*`,
-`findWriter?_*`, `Pair.appliesTo_*`, `realisesParallel_emptyImpl_on_empty`.
-
-### List-based mirror (`ListSpec.lean`)
-
-9 theorems: `applyParallelL_*`, `applyParallelLS_*`, `applySequentialL_*`,
-plus the Array↔List bridges (`applySequential_eq_L`, `applyParallel_eq_L`).
-
-### Phase 1 (tree pruning with source-swap) — `Phase1.lean`
-
-* Leaf / `UniqueDst` / `Pair.appliesTo` structural lemmas.
-* `find?_peelStep_self`, `find?_dst_of_mem`, `find?_of_no_writer`.
-* `mem_peelStep`, `peelStep_uniqueDst`, `peelStep_no_self`.
-* `find?_peelStep_ne` — characterisation of `find?` on `peelStep` for
-  non-peeled destinations.
-* **`peelStep_sound`** — full source-swap soundness (central Phase 1 lemma).
-* **`phase1_sound`** — full Phase 1 induction invariant.
-
-### Phase 2 (cycle breaking) — `Phase2.lean`
-
-Structural / cycle-tracking lemmas:
-
-* `mem_eraseDst`, `eraseDst_uniqueDst`, `eraseDst_no_self`.
-* `srcOf?_mem`, `srcOf?_eq_some_of_mem`, `srcOf?_eraseDst_self`,
-  `srcOf?_eraseDst_ne`.
-* `walkCycle_acc_prefix`, `walkCycle_acc_indep_last/_es/_schedule` —
-  accumulator-independence of walkCycle's outputs.
-* `walkVisits_eq_of_onCycle`, `walkErased_eq_of_onCycle` — the walk
-  matches the cycle path under `OnCycle`.
-* `walkEmits_subset_es`, `walkEmits_dsts_nodup` — walkEmits's pairs
-  are in es and have distinct dsts.
-* `consPairs_*` lemmas — pair-up-consecutive structural identities.
-
-Single-cycle correctness:
-
-* `applySequentialL_at_dst_unique` — non-clobbering schedule.
-* `breakOneCycle_writes_last/_non_last/_preserves_non_cycle_dst` —
-  per-position correctness.
-* **`breakOneCycle_sound_at_cycle`** — unified single-cycle correctness:
-  at every cycle node, the schedule writes the parallel value.
-
-Cycle disjointness machinery (for the multi-cycle induction):
-
-* `iterWriter`, `cycleOf_closed_under_iterWriter` — writer chain stays
-  in cycleOf.
-* `iterWriter_path_step/_close` — the writer chain from path[0] visits
-  path[i] after i steps and closes after path.length steps.
-* **`cycle_disjoint_of_start_not_in`** — if r's cycle's start is not in
-  cycleOf, all of r's cycle nodes are disjoint from cycleOf.
-
-AllOnCycle preservation:
-
-* `srcOf?_filter_ne_removed`, `eraseDst_filter_swap`,
-  `cyclePathTo_lift_disjoint` — supporting filter calculations.
-* **`allOnCycle_preserved_by_breakOneCycle`** — after handling one
-  cycle, the residual still has every dst on a cycle.
-
-Multi-cycle correctness:
-
-* `smallestDst_eq_none_iff`, `smallestDst_some_mem`,
-  `applyParallelLS_eraseDst_ne`, `cycleOf_length_le`,
-  `breakOneCycle_residual`, `breakOneCycle_schedule_acc_decomp`,
-  `applyParallelLS_filter_disjoint`, `cycleOf_contains_start`,
-  `writer_not_in_cycleOf_of_not_in`.
-* **`phase2_sound`** — the multi-cycle theorem:
-
-      applySequentialL (phase2 fuel .temp es acc) σ (.given r) =
-        applyParallelLS es (applySequentialL acc σ) (.given r)
-
-  under `UniqueDst es`, `no_self_loops es`, `AllOnCycle es`, and
-  `es.length ≤ fuel`. Axiom-clean.
-
-Concrete sanity checks: `breakOneCycle_swap_correct` (2-cycle),
-`breakOneCycle_3cycle_correct`, `breakOneCycle_4cycle_correct`.
-
-## What's still open
-
-For full general-case correctness:
-
-1. **`onCycle_of_dst`** — phase 1's residual satisfies `AllOnCycle`.
-   Requires: after phase 1, srcs = dsts (no leaves, no roots) + pigeon-
-   hole on the writer chain.
-
-2. **`preprocess` correctness** — filtering self-copies and exact
-   duplicates preserves `applyParallel`.
-
-3. **Array↔List bridge for `sequenceParallelCopies`** — connecting the
-   public `sequenceParallelCopies pairs` with the verified
-   `sequenceParallelCopiesL pairs.toList`.
-
-4. **Disjoint-register commutation** — phase 2 and the nonCycle leaves
-   touch disjoint register sets (nonCycle.dsts ∩ cycleOf nodes = ∅,
-   nonCycle.sources ∩ cycleOf nodes = ∅), so the
-   `phase2 ++ nonCycle` order is equivalent to `nonCycle ++ phase2`.
-
-5. **`sequenceParallelCopies_correct`** — assembly of phase 1 + phase 2
-   into `RealisesParallel sequenceParallelCopies`.
+For the catalogue of intermediate lemmas (cycle-walk machinery,
+`cycleOf` disjointness, accumulator independence, etc.) see the per-file
+docstrings in `Phase1.lean` and `Phase2.lean`; this file deliberately
+stays short and only chains the top-level ingredients.
 -/
 
 namespace ParallelCopies
