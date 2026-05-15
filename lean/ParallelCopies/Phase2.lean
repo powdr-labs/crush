@@ -3306,6 +3306,75 @@ theorem phase1_residual_allOnCycle
   · exact phase1_no_leaves fuel es acc h_fuel
   · exact h_d
 
+/-! ## preprocess structural properties -/
+
+/-- preprocess output is a subset of input (as elements). -/
+theorem preprocess_subset :
+    ∀ (pairs : List Edge) (e : Edge), e ∈ preprocess pairs → e ∈ pairs
+  | [], e, h => by simp [preprocess] at h
+  | (s, d) :: rest, e, h => by
+    simp only [preprocess] at h
+    by_cases h_self : s = d
+    · rw [if_pos h_self] at h
+      exact List.mem_cons_of_mem _ (preprocess_subset rest e h)
+    · rw [if_neg h_self] at h
+      by_cases h_dup : (preprocess rest).contains (s, d)
+      · rw [if_pos h_dup] at h
+        exact List.mem_cons_of_mem _ (preprocess_subset rest e h)
+      · rw [if_neg h_dup] at h
+        rcases List.mem_cons.mp h with heq | hmem
+        · rw [heq]; exact List.mem_cons_self
+        · exact List.mem_cons_of_mem _ (preprocess_subset rest e hmem)
+
+/-- preprocess output has no self-loops. -/
+theorem preprocess_no_self :
+    ∀ (pairs : List Edge) (e : Edge), e ∈ preprocess pairs → e.1 ≠ e.2
+  | [], e, h => by simp [preprocess] at h
+  | (s, d) :: rest, e, h => by
+    simp only [preprocess] at h
+    by_cases h_self : s = d
+    · rw [if_pos h_self] at h
+      exact preprocess_no_self rest e h
+    · rw [if_neg h_self] at h
+      by_cases h_dup : (preprocess rest).contains (s, d)
+      · rw [if_pos h_dup] at h
+        exact preprocess_no_self rest e h
+      · rw [if_neg h_dup] at h
+        rcases List.mem_cons.mp h with heq | hmem
+        · rw [heq]; exact h_self
+        · exact preprocess_no_self rest e hmem
+
+/-! ## WellFormed (list version) -/
+
+/-- WellFormed for List input. -/
+def WellFormedL (pairs : List Edge) : Prop :=
+  ∀ s₁ s₂ d : UInt32,
+    s₁ ≠ d → s₂ ≠ d →
+    (s₁, d) ∈ pairs → (s₂, d) ∈ pairs → s₁ = s₂
+
+theorem wellFormedL_cons {p : Edge} {rest : List Edge}
+    (h : WellFormedL (p :: rest)) : WellFormedL rest := by
+  intro s₁ s₂ d h_ne1 h_ne2 h_mem1 h_mem2
+  exact h s₁ s₂ d h_ne1 h_ne2 (List.mem_cons_of_mem _ h_mem1)
+    (List.mem_cons_of_mem _ h_mem2)
+
+/-- preprocess preserves WellFormedL. -/
+theorem preprocess_wellFormedL
+    (pairs : List Edge) (h : WellFormedL pairs) :
+    WellFormedL (preprocess pairs) := by
+  intro s₁ s₂ d h_ne1 h_ne2 h_mem1 h_mem2
+  exact h s₁ s₂ d h_ne1 h_ne2
+    (preprocess_subset pairs _ h_mem1) (preprocess_subset pairs _ h_mem2)
+
+/-- preprocess output has UniqueDst under WellFormedL. -/
+theorem preprocess_uniqueDst
+    (pairs : List Edge) (h : WellFormedL pairs) :
+    UniqueDst (preprocess pairs) := by
+  intro s₁ s₂ d h_m1 h_m2
+  have h_ne1 : s₁ ≠ d := preprocess_no_self pairs (s₁, d) h_m1
+  have h_ne2 : s₂ ≠ d := preprocess_no_self pairs (s₂, d) h_m2
+  exact (preprocess_wellFormedL pairs h) s₁ s₂ d h_ne1 h_ne2 h_m1 h_m2
+
 /-! ## phase2_sound: phase 2 realizes the parallel block for all-cycle inputs -/
 
 /-- Phase 2's central correctness lemma. For all-cycle `es` (every dst on
