@@ -2205,6 +2205,115 @@ theorem walkEmits_dst_in_cycleOf
   rw [walkVisits_eq_of_onCycle start es hC fuel h_fuel] at h_p
   exact consPairs_dsts_subset _ p h_p
 
+/-! ## peelStep length bounds -/
+
+/-- Peeling never grows the list: each step either drops the edge or
+    rewrites it (length-preserving). -/
+theorem peelStep_length_le (s d : UInt32) (es : List Edge) :
+    (peelStep s d es).length ≤ es.length := by
+  induction es with
+  | nil => simp [peelStep]
+  | cons e rest ih =>
+    unfold peelStep
+    by_cases h_e_eq : e = (s, d)
+    · simp [h_e_eq, List.length_cons]; omega
+    · simp only [h_e_eq, if_false]
+      by_cases h_s : e.1 = s
+      · simp [h_s, List.length_cons]; omega
+      · simp [h_s, List.length_cons]; omega
+
+/-- With `(s, d) ∈ es`, peeling strictly shrinks the list. -/
+theorem peelStep_length_lt
+    (s d : UInt32) (es : List Edge) (h_mem : (s, d) ∈ es) :
+    (peelStep s d es).length < es.length := by
+  induction es with
+  | nil => simp at h_mem
+  | cons e rest ih =>
+    rcases List.mem_cons.mp h_mem with heq | hmem'
+    · subst heq
+      unfold peelStep
+      simp
+      have := peelStep_length_le s d rest
+      simp [List.length_cons]; omega
+    · have h_ih := ih hmem'
+      unfold peelStep
+      by_cases h_e_eq : e = (s, d)
+      · simp [h_e_eq]
+        have := peelStep_length_le s d rest
+        simp [List.length_cons]; omega
+      · simp only [h_e_eq, if_false]
+        by_cases h_s : e.1 = s
+        · simp [h_s, List.length_cons]; omega
+        · simp [h_s, List.length_cons]; omega
+
+/-! ## phase1 preserves structural invariants -/
+
+/-- Phase 1 preserves `UniqueDst`. -/
+theorem phase1_preserves_uniqueDst :
+    ∀ (fuel : Nat) (es : Edges) (acc : List Edge) (_ : UniqueDst es),
+      UniqueDst (phase1 fuel es acc).1
+  | 0,      es, acc, hWF => by simp [phase1]; exact hWF
+  | n + 1,  es, acc, hWF => by
+    unfold phase1
+    cases h_find : findLeafEdge es with
+    | none => simp; exact hWF
+    | some pair =>
+      obtain ⟨s, d⟩ := pair
+      simp only
+      exact phase1_preserves_uniqueDst n (peelStep s d es) (acc ++ [(s, d)])
+        (peelStep_uniqueDst s d es hWF)
+
+/-- Phase 1 preserves no-self-loops. -/
+theorem phase1_preserves_no_self :
+    ∀ (fuel : Nat) (es : Edges) (acc : List Edge)
+      (_ : ∀ e ∈ es, e.1 ≠ e.2),
+      ∀ e ∈ (phase1 fuel es acc).1, e.1 ≠ e.2
+  | 0,      es, acc, h => by
+    show ∀ e ∈ (phase1 0 es acc).1, e.1 ≠ e.2
+    intro e he
+    apply h
+    simpa [phase1] using he
+  | n + 1,  es, acc, h => by
+    unfold phase1
+    cases h_find : findLeafEdge es with
+    | none =>
+      intro e he
+      apply h
+      simpa using he
+    | some pair =>
+      obtain ⟨s, d⟩ := pair
+      simp only
+      exact phase1_preserves_no_self n (peelStep s d es) (acc ++ [(s, d)])
+        (peelStep_no_self s d es h)
+
+/-! ## phase1 fixpoint: no leaves remain -/
+
+/-- With sufficient fuel, phase 1 reaches a state where no leaves remain. -/
+theorem phase1_no_leaves
+    (fuel : Nat) (es : Edges) (acc : List Edge) (h_fuel : es.length ≤ fuel) :
+    findLeafEdge (phase1 fuel es acc).1 = none := by
+  induction fuel generalizing es acc with
+  | zero =>
+    -- es.length = 0, so es = [], findLeafEdge [] = none
+    have h_empty : es = [] := by
+      cases es with
+      | nil => rfl
+      | cons _ _ => simp at h_fuel
+    subst h_empty
+    simp [phase1, findLeafEdge, List.find?]
+  | succ n ih =>
+    unfold phase1
+    cases h_find : findLeafEdge es with
+    | none => simpa
+    | some pair =>
+      obtain ⟨s, d⟩ := pair
+      simp only
+      have ⟨h_mem, _⟩ := findLeafEdge_some h_find
+      have h_lt : (peelStep s d es).length < es.length :=
+        peelStep_length_lt s d es h_mem
+      have h_new_fuel : (peelStep s d es).length ≤ n := by omega
+      exact ih _ _ h_new_fuel
+
 /-! ## phase2_sound: phase 2 realizes the parallel block for all-cycle inputs -/
 
 /-- Phase 2's central correctness lemma. For all-cycle `es` (every dst on
