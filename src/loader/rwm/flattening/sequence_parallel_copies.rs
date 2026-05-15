@@ -73,8 +73,7 @@ pub fn sequence_parallel_copies(
         input.push(dst);
     }
 
-    let out = unsafe { call_lean(&input) };
-    out.into_iter()
+    unsafe { call_lean(&input) }
 }
 
 unsafe fn call_lean(input: &[u32]) -> std::vec::IntoIter<(Register, Register)> {

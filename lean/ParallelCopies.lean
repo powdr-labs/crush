@@ -154,10 +154,14 @@ def sequenceParallelCopiesL (pairs : List Edge) : List (Register × Register) :=
   let fuel            := es.length + 1
   let (es, nonCycle)  := phase1 fuel es []
   -- nonCycle (leaf-pruning) runs first, then phase2 (cycle-breaking).
-  -- Both blocks touch disjoint register sets (see `sequenceParallelCopies_correct`
-  -- for the disjointness argument), so the final state is independent of the
-  -- order; we choose `nonCycle ++ phase2` because it composes directly with
-  -- `phase1_sound` (whose invariant has `nonCycle` applied first).
+  -- The two blocks act on disjoint Lean-level register sets — phase2 only
+  -- writes `.temp` and `.given d` for cycle dsts `d`; nonCycle only touches
+  -- `.given` regs outside the cycle — so this order is sound at the spec
+  -- level. Composes directly with `phase1_sound` (whose invariant has
+  -- `nonCycle` applied first). NOTE: consumers that materialise `.temp` to a
+  -- concrete register must ensure it doesn't alias a nonCycle destination, or
+  -- the order-dependence shows up at the implementation level (see
+  -- `src/loader/rwm/flattening/mod.rs::parallel_copy`).
   nonCycle.map (fun (s, d) => (Register.given s, Register.given d))
     ++ phase2 fuel Register.temp es []
 
