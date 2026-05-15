@@ -2418,6 +2418,119 @@ theorem srcs_subset_dsts_of_no_leaves
     rw [h_dsts_len, h_srcs_len]
   exact nodup_subset_same_length_eq _ _ h_dsts_nodup h_dsts_sub_srcs h_eq_len s h_s
 
+/-! ## Forward chain via the first outgoing edge -/
+
+/-- A deterministic forward step: pick the dst of the first outgoing edge. -/
+def forwardStep (v : UInt32) (es : Edges) : Option UInt32 :=
+  (es.find? (fun e => e.1 = v)).map Prod.snd
+
+/-- `n`-step forward iteration. -/
+def iterForward (n : Nat) (v : UInt32) (es : Edges) : Option UInt32 :=
+  match n with
+  | 0     => some v
+  | k + 1 => (iterForward k v es).bind (fun u => forwardStep u es)
+
+@[simp] theorem iterForward_zero (v : UInt32) (es : Edges) :
+    iterForward 0 v es = some v := rfl
+
+theorem iterForward_succ (n : Nat) (v : UInt32) (es : Edges) :
+    iterForward (n + 1) v es = (iterForward n v es).bind (fun u => forwardStep u es) :=
+  rfl
+
+/-- If `forwardStep v es = some w`, then `(v, w) ∈ es`. -/
+theorem forwardStep_mem (v w : UInt32) (es : Edges)
+    (h : forwardStep v es = some w) : (v, w) ∈ es := by
+  unfold forwardStep at h
+  cases hf : es.find? (fun e => e.1 = v) with
+  | none => rw [hf] at h; simp at h
+  | some e =>
+    rw [hf] at h; simp at h
+    have ⟨hpred, as, bs, hsplit, _⟩ := List.find?_eq_some_iff_append.mp hf
+    simp at hpred
+    obtain ⟨a, b⟩ := e
+    simp only at hpred h
+    subst hpred
+    subst h
+    rw [hsplit]; simp
+
+/-- If `v` is a src in `es`, `forwardStep` succeeds. -/
+theorem forwardStep_of_mem_srcs
+    (v : UInt32) (es : Edges) (h : v ∈ es.map Prod.fst) :
+    ∃ w, forwardStep v es = some w := by
+  unfold forwardStep
+  cases hf : es.find? (fun e => e.1 = v) with
+  | none =>
+    exfalso
+    rw [List.find?_eq_none] at hf
+    rw [List.mem_map] at h
+    obtain ⟨e, h_e_mem, h_e_eq⟩ := h
+    have := hf e h_e_mem
+    simp at this
+    exact this h_e_eq
+  | some e => exact ⟨e.2, by simp⟩
+
+/-- Forward step gives a dst (target of an edge). -/
+theorem forwardStep_mem_dsts (v w : UInt32) (es : Edges)
+    (h : forwardStep v es = some w) : w ∈ es.map Prod.snd := by
+  have h_mem := forwardStep_mem v w es h
+  rw [List.mem_map]
+  exact ⟨(v, w), h_mem, rfl⟩
+
+/-! ## Forward chain stays in dsts under no-leaves + no-roots -/
+
+theorem iterForward_in_dsts
+    (es : Edges) (h_no_leaves : findLeafEdge es = none)
+    (v : UInt32) (h_v : v ∈ es.map Prod.snd) (n : Nat) :
+    ∃ w, iterForward n v es = some w ∧ w ∈ es.map Prod.snd := by
+  induction n with
+  | zero => exact ⟨v, rfl, h_v⟩
+  | succ k ih =>
+    obtain ⟨u, h_iter, h_u⟩ := ih
+    have h_no_leaves_iff := (findLeafEdge_eq_none_iff es).mp h_no_leaves
+    have h_u_src : u ∈ es.map Prod.fst := h_no_leaves_iff u h_u
+    obtain ⟨w, h_step⟩ := forwardStep_of_mem_srcs u es h_u_src
+    refine ⟨w, ?_, ?_⟩
+    · rw [iterForward_succ, h_iter]; simp [h_step]
+    · exact forwardStep_mem_dsts u w es h_step
+
+/-! ## UniqueDst propagates equality backward in iterForward -/
+
+/-- If two iterForward positions land on the same node, their predecessors
+    are also equal (UniqueDst). -/
+theorem iterForward_eq_backward
+    (es : Edges) (hWF : UniqueDst es)
+    (v : UInt32) (a b : Nat)
+    (h_a_pos : 0 < a) (h_b_pos : 0 < b)
+    (out : UInt32)
+    (h_a : iterForward a v es = some out)
+    (h_b : iterForward b v es = some out) :
+    iterForward (a - 1) v es = iterForward (b - 1) v es := by
+  have h_a_step : iterForward a v es =
+      (iterForward (a - 1) v es).bind (fun u => forwardStep u es) := by
+    rw [show a = (a - 1) + 1 from by omega]
+    exact iterForward_succ _ _ _
+  have h_b_step : iterForward b v es =
+      (iterForward (b - 1) v es).bind (fun u => forwardStep u es) := by
+    rw [show b = (b - 1) + 1 from by omega]
+    exact iterForward_succ _ _ _
+  rw [h_a_step] at h_a
+  rw [h_b_step] at h_b
+  cases h_a_prev : iterForward (a - 1) v es with
+  | none => rw [h_a_prev] at h_a; simp at h_a
+  | some u =>
+    rw [h_a_prev] at h_a
+    simp at h_a
+    -- h_a : forwardStep u es = some out, so (u, out) ∈ es.
+    have h_mem_u : (u, out) ∈ es := forwardStep_mem u out es h_a
+    cases h_b_prev : iterForward (b - 1) v es with
+    | none => rw [h_b_prev] at h_b; simp at h_b
+    | some w =>
+      rw [h_b_prev] at h_b
+      simp at h_b
+      have h_mem_w : (w, out) ∈ es := forwardStep_mem w out es h_b
+      have h_eq_uw : u = w := hWF u w out h_mem_u h_mem_w
+      rw [h_eq_uw]
+
 /-! ## phase1 fixpoint: no leaves remain -/
 
 /-- With sufficient fuel, phase 1 reaches a state where no leaves remain. -/
