@@ -3482,6 +3482,48 @@ theorem applyParallelLS_preprocess_eq
     rw [find?_eq_none_no_writer pairs r h_writer]
     rw [find?_eq_none_no_writer (preprocess pairs) r h_no_writer_pre]
 
+/-! ## preprocess output is Nodup as a list -/
+
+theorem preprocess_nodup :
+    ∀ (pairs : List Edge), (preprocess pairs).Nodup
+  | [] => by simp [preprocess]
+  | (s, d) :: rest => by
+    simp only [preprocess]
+    by_cases h_self : s = d
+    · rw [if_pos h_self]
+      exact preprocess_nodup rest
+    · rw [if_neg h_self]
+      by_cases h_dup : (preprocess rest).contains (s, d) = true
+      · rw [if_pos h_dup]
+        exact preprocess_nodup rest
+      · rw [if_neg h_dup]
+        rw [List.nodup_cons]
+        refine ⟨?_, preprocess_nodup rest⟩
+        intro h
+        apply h_dup
+        rw [List.contains_iff_mem]
+        exact h
+
+/-- Under WellFormedL, preprocess output has Nodup destinations. -/
+theorem preprocess_dsts_nodup
+    (pairs : List Edge) (h_wf : WellFormedL pairs) :
+    ((preprocess pairs).map Prod.snd).Nodup := by
+  rw [List.Nodup, List.pairwise_map]
+  apply (preprocess_nodup pairs).imp_of_mem
+  intro e1 e2 h_e1_mem h_e2_mem h_e1_ne_e2 h_snd_eq
+  -- e1, e2 ∈ preprocess pairs, e1 ≠ e2, e1.snd = e2.snd. Contradicts UniqueDst.
+  obtain ⟨s1, d1⟩ := e1
+  obtain ⟨s2, d2⟩ := e2
+  simp only at h_snd_eq
+  have h_d_eq : d1 = d2 := h_snd_eq
+  subst h_d_eq
+  have h_pre_wf : WellFormedL (preprocess pairs) := preprocess_wellFormedL pairs h_wf
+  have h_ne1 : s1 ≠ d1 := preprocess_no_self pairs (s1, d1) h_e1_mem
+  have h_ne2 : s2 ≠ d1 := preprocess_no_self pairs (s2, d1) h_e2_mem
+  have h_s_eq : s1 = s2 := h_pre_wf s1 s2 d1 h_ne1 h_ne2 h_e1_mem h_e2_mem
+  apply h_e1_ne_e2
+  rw [h_s_eq]
+
 /-! ## phase2_sound: phase 2 realizes the parallel block for all-cycle inputs -/
 
 /-- Phase 2's central correctness lemma. For all-cycle `es` (every dst on
