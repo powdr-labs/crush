@@ -157,28 +157,76 @@ private theorem phase1_length_le :
           ≤ (peelStep s d es).length := phase1_length_le n _ _
         _ ≤ es.length := peelStep_length_le s d es
 
-/-! ## Final theorem (assembly remains for future work)
+/-! ## Final theorem -/
 
-The pieces needed to assemble `RealisesParallel sequenceParallelCopies` are
-all in place — see Phase2.lean and the documentation block above for the
-catalog. The final assembly is a routine composition:
+/-- Auxiliary form of `sequenceParallelCopiesL` that exposes the phase1 split. -/
+private theorem sequenceParallelCopiesL_eq_explicit (pairs : List Edge) :
+    sequenceParallelCopiesL pairs =
+    (phase1 ((preprocess pairs).length + 1) (preprocess pairs) []).2.map
+        (fun (s, d) => (Register.given s, Register.given d)) ++
+      phase2 ((preprocess pairs).length + 1) Register.temp
+        (phase1 ((preprocess pairs).length + 1) (preprocess pairs) []).1 [] := by
+  unfold sequenceParallelCopiesL
+  rfl
 
-```
-applySequentialL (sequenceParallelCopiesL pairs.toList) (lift s) (.given r)
-  = applySequentialL (phase2 ...) (applySequentialL nonCycle_mapped (lift s)) (.given r)
-                                              [foldl_append]
-  = applyParallelLS es_residual (applySequentialL nonCycle_mapped (lift s)) (.given r)
-                                              [phase2_sound, with AllOnCycle via
-                                               phase1_residual_allOnCycle]
-  = applyParallelLS preprocess(pairs.toList) (lift s) (.given r)
-                                              [phase1_sound]
-  = applyParallelLS pairs.toList (lift s) (.given r)
-                                              [applyParallelLS_preprocess_eq]
-  = applyParallelL pairs.toList s r              [lift unfolding]
-```
-
-The remaining mechanical work is threading the `let` bindings of
-`sequenceParallelCopiesL` through Lean's `generalize`/`obtain` tactics
-without losing pattern matches against the lemmas. -/
+/-- The full correctness theorem. -/
+theorem sequenceParallelCopies_correct :
+    RealisesParallel sequenceParallelCopies := by
+  intro pairs h_wf s r
+  rw [applySequential_eq_L, applyParallel_eq_L]
+  have h_arr_to_list : (sequenceParallelCopies pairs).toList =
+      sequenceParallelCopiesL pairs.toList := by simp [sequenceParallelCopies]
+  rw [h_arr_to_list, sequenceParallelCopiesL_eq_explicit]
+  have h_wfL : WellFormedL pairs.toList :=
+    fun s₁ s₂ d h_ne1 h_ne2 h_m1 h_m2 => h_wf s₁ s₂ d h_ne1 h_ne2 h_m1 h_m2
+  have h_wf_pre : WellFormedL (preprocess pairs.toList) := preprocess_wellFormedL _ h_wfL
+  have h_pre_uniq : UniqueDst (preprocess pairs.toList) := preprocess_uniqueDst _ h_wfL
+  have h_pre_no_self : ∀ e ∈ preprocess pairs.toList, e.1 ≠ e.2 := preprocess_no_self _
+  have h_pre_dsts_nodup : ((preprocess pairs.toList).map Prod.snd).Nodup :=
+    preprocess_dsts_nodup _ h_wfL
+  have h_es_uniq : UniqueDst (phase1 ((preprocess pairs.toList).length + 1)
+                                (preprocess pairs.toList) []).1 :=
+    phase1_preserves_uniqueDst _ _ _ h_pre_uniq
+  have h_es_no_self : ∀ e ∈ (phase1 ((preprocess pairs.toList).length + 1)
+                              (preprocess pairs.toList) []).1, e.1 ≠ e.2 :=
+    phase1_preserves_no_self _ _ _ h_pre_no_self
+  have h_es_fuel : (phase1 ((preprocess pairs.toList).length + 1)
+                     (preprocess pairs.toList) []).1.length ≤
+                   (preprocess pairs.toList).length + 1 := by
+    have := phase1_length_le ((preprocess pairs.toList).length + 1)
+      (preprocess pairs.toList) []
+    omega
+  have h_es_allOnCycle : AllOnCycle (phase1 ((preprocess pairs.toList).length + 1)
+                                      (preprocess pairs.toList) []).1 :=
+    phase1_residual_allOnCycle _ _ _ h_pre_uniq h_pre_dsts_nodup (by omega)
+  -- Rewrite the lambda map to use edgeToCopy.
+  have h_map_eq :
+      (phase1 ((preprocess pairs.toList).length + 1)
+        (preprocess pairs.toList) []).2.map
+        (fun (x : Edge) => match x with | (s, d) => (Register.given s, Register.given d)) =
+      (phase1 ((preprocess pairs.toList).length + 1)
+        (preprocess pairs.toList) []).2.map edgeToCopy := by
+    apply List.map_congr_left
+    intro e _; obtain ⟨_, _⟩ := e; rfl
+  rw [h_map_eq, applySequentialL_append]
+  rw [phase2_sound _ _ [] _ h_es_uniq h_es_no_self h_es_allOnCycle h_es_fuel r]
+  rw [applySequentialL_nil]
+  -- Apply phase1_sound.
+  have h_phase1_inv :
+      applyParallelLS (preprocess pairs.toList) (lift s) =
+      applyParallelLS (preprocess pairs.toList)
+        (applySequentialL (([] : List Edge).map edgeToCopy) (lift s)) := by
+    simp [applySequentialL]
+  have h_phase1 :
+      applyParallelLS (preprocess pairs.toList) (lift s) =
+      applyParallelLS (phase1 ((preprocess pairs.toList).length + 1)
+                        (preprocess pairs.toList) []).1
+        (applySequentialL ((phase1 ((preprocess pairs.toList).length + 1)
+                              (preprocess pairs.toList) []).2.map edgeToCopy) (lift s)) :=
+    phase1_sound ((preprocess pairs.toList).length + 1) (preprocess pairs.toList) []
+      (lift s) (preprocess pairs.toList) h_phase1_inv h_pre_uniq h_pre_no_self
+  rw [← h_phase1]
+  rw [applyParallelLS_preprocess_eq pairs.toList h_wfL (lift s) r]
+  rfl
 
 end ParallelCopies
