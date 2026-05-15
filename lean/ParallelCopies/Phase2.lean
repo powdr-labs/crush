@@ -2089,6 +2089,75 @@ theorem filter_no_self_loops
     ∀ e ∈ es.filter p, e.1 ≠ e.2 :=
   fun e he => h e (List.mem_filter.mp he).1
 
+/-! ## applyParallelLS through filter (disjoint case) -/
+
+/-- For `r ∉ removed`, filtering edges by `dst ∉ removed` doesn't change
+    the parallel effect at `.given r`. -/
+theorem applyParallelLS_filter_disjoint
+    (es : Edges) (removed : List UInt32) (hWF : UniqueDst es)
+    (σ : SState) (r : UInt32) (h_r : r ∉ removed) :
+    applyParallelLS (es.filter (fun e => decide (e.2 ∉ removed))) σ (.given r) =
+      applyParallelLS es σ (.given r) := by
+  by_cases h_writer : ∃ s, (s, r) ∈ es ∧ s ≠ r
+  · obtain ⟨s, h_mem, h_ne⟩ := h_writer
+    have h_mem' : (s, r) ∈ es.filter (fun e => decide (e.2 ∉ removed)) := by
+      rw [List.mem_filter]
+      refine ⟨h_mem, ?_⟩
+      simp [h_r]
+    have hWF' : UniqueDst (es.filter (fun e => decide (e.2 ∉ removed))) :=
+      filter_uniqueDst es _ hWF
+    rw [applyParallelLS_at_writer _ _ s r hWF' h_mem' h_ne]
+    rw [applyParallelLS_at_writer _ _ s r hWF h_mem h_ne]
+  · have h_es : ∀ e ∈ es, ¬ (e.2 = r ∧ e.1 ≠ e.2) := by
+      intro e he ⟨h_eq, h_ne_e⟩
+      obtain ⟨s, t⟩ := e
+      simp at h_eq
+      subst h_eq
+      exact h_writer ⟨s, he, h_ne_e⟩
+    have h_es' : ∀ e ∈ es.filter (fun e => decide (e.2 ∉ removed)),
+        ¬ (e.2 = r ∧ e.1 ≠ e.2) :=
+      fun e he => h_es e (List.mem_filter.mp he).1
+    rw [applyParallelLS_at_no_writer _ _ r h_es']
+    rw [applyParallelLS_at_no_writer es σ r h_es]
+
+/-! ## Cycle structure: start, predecessor membership -/
+
+theorem cycleOf_contains_start
+    (start : UInt32) (es : Edges) (hC : OnCycle start es) :
+    start ∈ cycleOf start es hC := by
+  unfold cycleOf
+  obtain ⟨h_ne_nil, h_head, _, _⟩ := hC.choose_spec
+  cases h_choose : hC.choose with
+  | nil => exact absurd h_choose h_ne_nil
+  | cons a rest =>
+    rw [h_choose] at h_head
+    simp at h_head
+    subst h_head
+    exact List.mem_cons_self
+
+/-- For r ∉ cycleOf with OnCycle r es, the writer of r is also ∉ cycleOf. -/
+theorem writer_not_in_cycleOf_of_not_in
+    (start : UInt32) (es : Edges) (hC : OnCycle start es)
+    (hWF : UniqueDst es) (h_all : AllOnCycle es)
+    (r : UInt32) (h_r_not_in : r ∉ cycleOf start es hC)
+    (h_r_dst : r ∈ es.map Prod.snd)
+    (s : UInt32) (h_mem : (s, r) ∈ es) :
+    s ∉ cycleOf start es hC := by
+  -- r's cycle (from AllOnCycle) is disjoint from cycleOf (by cycle_disjoint).
+  -- s is the writer of r, hence on r's cycle. So s ∉ cycleOf.
+  have hR : OnCycle r es := h_all r h_r_dst
+  have h_disjoint : ∀ v ∈ cycleOf r es hR, v ∉ cycleOf start es hC :=
+    cycle_disjoint_of_start_not_in start es hC hWF r hR h_r_not_in
+  -- s is on r's cycle (predecessor of r).
+  have h_s_in_R : s ∈ cycleOf r es hR := by
+    have h_r_in_R : r ∈ cycleOf r es hR := cycleOf_contains_start r es hR
+    obtain ⟨u, h_src, h_u⟩ := cycleOf_closed_under_writer r es hR hWF r h_r_in_R
+    have h_src_eq : srcOf? r es = some s := srcOf?_eq_some_of_mem es _ _ hWF h_mem
+    rw [h_src_eq] at h_src
+    have h_eq : s = u := Option.some.inj h_src
+    exact h_eq.symm ▸ h_u
+  exact h_disjoint s h_s_in_R
+
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
     starting at `a` produces a schedule whose sequential application
