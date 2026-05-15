@@ -1367,6 +1367,165 @@ theorem applyParallelLS_eraseDst_ne
     rw [applyParallelLS_at_no_writer (eraseDst d es) σ r h_es']
     rw [applyParallelLS_at_no_writer es σ r h_es]
 
+/-! ## walkCycle residual = filter not-in-erased dsts -/
+
+/-- The dsts that walkCycle actually erases (i.e., excluding the "premature
+    termination" cases). When the walk closes properly, this equals
+    `walkVisits`. -/
+def walkErased (fuel : Nat) (start curr : UInt32) (es : Edges) : List UInt32 :=
+  match fuel with
+  | 0 => []
+  | n+1 =>
+    match srcOf? curr es with
+    | none => []
+    | some source =>
+      if source = start then [curr]
+      else curr :: walkErased n start source (eraseDst curr es)
+
+/-- The edges remaining after `walkCycle` are exactly those whose destination
+    is not in the actually-erased set. -/
+theorem walkCycle_residual_eq
+    (fuel : Nat) (start curr : UInt32) (es : Edges)
+    (acc : List (Register × Register)) :
+    (walkCycle fuel start curr es acc).2.1 =
+      es.filter (fun e => decide (e.2 ∉ walkErased fuel start curr es)) := by
+  induction fuel generalizing curr es acc with
+  | zero =>
+    simp only [walkCycle, walkErased]
+    rw [List.filter_eq_self.mpr]
+    intro a _; simp
+  | succ n ih =>
+    cases hsrc : srcOf? curr es with
+    | none =>
+      simp only [walkCycle, walkErased, hsrc]
+      rw [List.filter_eq_self.mpr]
+      intro a _; simp
+    | some source =>
+      by_cases h_start : source = start
+      · simp only [walkCycle, walkErased, hsrc, h_start, if_true]
+        show eraseDst curr es =
+          es.filter (fun e => decide (e.2 ∉ [curr]))
+        unfold eraseDst
+        apply List.filter_congr
+        intro e _
+        simp only [List.mem_singleton]
+        by_cases h : e.2 = curr
+        · simp [h]
+        · simp [h]
+      · simp only [walkCycle, walkErased, hsrc, h_start, if_false]
+        rw [ih]
+        show (eraseDst curr es).filter
+              (fun e => decide (e.2 ∉ walkErased n start source (eraseDst curr es))) =
+             es.filter (fun e => decide
+              (e.2 ∉ curr :: walkErased n start source (eraseDst curr es)))
+        rw [show eraseDst curr es =
+            es.filter (fun e => decide (e.2 ≠ curr)) from by
+          unfold eraseDst
+          apply List.filter_congr
+          intro e _
+          by_cases h : e.2 = curr
+          · simp [h]
+          · simp [h]]
+        rw [List.filter_filter]
+        apply List.filter_congr
+        intro e _
+        by_cases h1 : e.2 = curr
+        · simp [h1]
+        · by_cases h2 : e.2 ∈ walkErased n start source (eraseDst curr es)
+          · simp [h1, h2]
+          · simp [h1, h2, List.mem_cons]
+
+/-- Under `CyclePathTo`, `walkErased` returns the same path as walkVisits.
+    The proof is by induction on the cyclepath. -/
+theorem walkErased_eq_of_cyclePathTo
+    {path : List UInt32} {start : UInt32} {es : Edges}
+    (hpath : CyclePathTo start es path)
+    {fuel : Nat} (h_fuel : path.length ≤ fuel)
+    {curr : UInt32} (h_head : path.head? = some curr) :
+    walkErased fuel start curr es = path := by
+  induction hpath generalizing fuel curr with
+  | last h_close =>
+    rename_i es' curr_path
+    simp at h_head
+    subst h_head
+    cases fuel with
+    | zero => simp at h_fuel
+    | succ n =>
+      simp only [walkErased]
+      rw [h_close]
+      simp
+  | step h_step h_ne_start _ ih =>
+    rename_i es' curr_path next rest _
+    simp at h_head
+    subst h_head
+    cases fuel with
+    | zero => simp at h_fuel
+    | succ n =>
+      have h_fuel' : (next :: rest).length ≤ n := by
+        simp at h_fuel ⊢
+        omega
+      simp only [walkErased]
+      rw [h_step]
+      simp [h_ne_start]
+      exact ih h_fuel' rfl
+
+/-- Under `OnCycle`, `walkErased` returns the cycle's path. -/
+theorem walkErased_eq_of_onCycle
+    (start : UInt32) (es : Edges)
+    (hC : OnCycle start es)
+    (fuel : Nat) (h_fuel : hC.choose.length ≤ fuel) :
+    walkErased fuel start start es = hC.choose := by
+  obtain ⟨_, h_head, _, h_path⟩ := hC.choose_spec
+  exact walkErased_eq_of_cyclePathTo h_path h_fuel h_head
+
+/-! ## Cycle nodes characterization -/
+
+/-- The cycle starting at `start` (when `OnCycle start es` holds). -/
+noncomputable def cycleOf (start : UInt32) (es : Edges) (hC : OnCycle start es) :
+    List UInt32 := hC.choose
+
+/-- The residual after breakOneCycle is `es` minus edges whose dsts are in the
+    cycle starting at `start`. -/
+theorem breakOneCycle_residual
+    (start : UInt32) (es : Edges) (hC : OnCycle start es)
+    (fuel : Nat) (h_fuel : (cycleOf start es hC).length ≤ fuel)
+    (acc : List (Register × Register)) :
+    (breakOneCycle fuel .temp start es acc).1 =
+      es.filter (fun e => decide (e.2 ∉ cycleOf start es hC)) := by
+  unfold breakOneCycle
+  simp only
+  rw [walkCycle_residual_eq]
+  rw [walkErased_eq_of_onCycle start es hC fuel h_fuel]
+  rfl
+
+/-! ## Cycle disjointness via UniqueDst
+
+If two cycles share any node, they're the same cycle. We use this to show
+that the residual still satisfies AllOnCycle. -/
+
+/-- Following `srcOf?` from `curr` for `n` steps (returning the visited
+    sequence in reverse-walk order). Used to phrase deterministic chains. -/
+private def writerChain (n : Nat) (curr : UInt32) (es : Edges) : List UInt32 :=
+  match n with
+  | 0     => [curr]
+  | n + 1 => match srcOf? curr es with
+            | none      => [curr]
+            | some next => curr :: writerChain n next es
+
+/-! ## Phase 2 ready property and its preservation -/
+
+/-- A list of edges where every destination is on a (forward) cycle. -/
+def AllOnCycle (es : Edges) : Prop :=
+  ∀ d, d ∈ es.map Prod.snd → OnCycle d es
+
+/-- Helper: if `(s, r) ∈ es` and `r ∈ es.map Prod.snd`, this is the same
+    membership statement (mapping respects). -/
+private theorem mem_dsts_of_edge_mem
+    {es : Edges} {s r : UInt32} (h : (s, r) ∈ es) :
+    r ∈ es.map Prod.snd := by
+  rw [List.mem_map]
+  exact ⟨(s, r), h, rfl⟩
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
