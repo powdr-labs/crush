@@ -2882,6 +2882,64 @@ theorem walkErasedClosesAt_imp_cyclePathTo :
         rw [h_tail] at h_inner ⊢
         exact CyclePathTo.step hsrc h_start h_inner
 
+/-! ## iterForward ↔ iterWriter under cycle closure -/
+
+/-- Under forward-chain closure `iterForward k v es = some v`, the writer
+    chain matches the forward chain in reverse: `iterWriter i v es =
+    iterForward (k - i) v es` for `i ≤ k`. -/
+theorem iterWriter_eq_iterForward_reverse :
+    ∀ (es : Edges) (_ : UniqueDst es)
+      (v : UInt32) (k : Nat)
+      (_ : iterForward k v es = some v)
+      (i : Nat), i ≤ k →
+      iterWriter i v es = iterForward (k - i) v es
+  | _, _, v, k, h_iter, 0, _ => by
+    rw [show k - 0 = k from rfl, iterWriter_zero]
+    exact h_iter.symm
+  | es, hWF, v, k, h_iter, i + 1, h_i_le => by
+    have h_i_le' : i ≤ k := by omega
+    have ih := iterWriter_eq_iterForward_reverse es hWF v k h_iter i h_i_le'
+    have h_k_pos : k - i > 0 := by omega
+    rw [iterWriter_succ, ih]
+    -- iterForward (k - i) v es = some w'' where (k - i - 1)-th step gives w' and forwardStep w' = some w''.
+    -- We want this .bind srcOf? = iterForward (k - i - 1) v es = iterForward (k - (i + 1)) v es.
+    have h_k_i : k - i = (k - i - 1) + 1 := by omega
+    rw [h_k_i]
+    rw [iterForward_succ]
+    cases h_prev : iterForward (k - i - 1) v es with
+    | none => simp
+    | some w' =>
+      simp only [Option.bind_some]
+      cases h_step : forwardStep w' es with
+      | none =>
+        -- forwardStep w' es = none ⟹ iterForward (k - i) v es = none.
+        -- But the chain from (k - i) to k must give some v. Contradicts.
+        exfalso
+        have h_iter_ki_none : iterForward (k - i) v es = none := by
+          rw [h_k_i, iterForward_succ, h_prev]
+          simp [h_step]
+        -- iterForward k v es is none too (bind on none stays none).
+        have h_iter_k_none : iterForward k v es = none := by
+          have h_diff : k - (k - i) = i := by omega
+          -- Each step from (k - i) to k adds 1 fuel, but the value stays none.
+          have aux : ∀ d, iterForward ((k - i) + d) v es = none := by
+            intro d
+            induction d with
+            | zero => simpa using h_iter_ki_none
+            | succ m ih =>
+              show iterForward ((k - i) + m + 1) v es = none
+              rw [iterForward_succ, ih]; simp
+          have h_k_eq : k = (k - i) + i := by omega
+          rw [h_k_eq]
+          exact aux i
+        rw [h_iter_k_none] at h_iter
+        simp at h_iter
+      | some w'' =>
+        simp only [Option.bind_some]
+        have h_mem : (w', w'') ∈ es := forwardStep_mem w' w'' es h_step
+        have h_src : srcOf? w'' es = some w' := srcOf?_eq_some_of_mem es w' w'' hWF h_mem
+        rw [h_src]
+
 /-! ## walkErasedClosesAt under iterWriter chain hypotheses -/
 
 /-- The full chain-tracing argument: under iterWriter (n+1) curr es = some start,
