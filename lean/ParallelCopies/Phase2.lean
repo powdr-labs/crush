@@ -1789,6 +1789,115 @@ theorem cycle_disjoint_of_start_not_in
   rw [← h_u_eq_r] at h_disjoint
   exact h_disjoint h_u_in
 
+/-! ## CyclePathTo lifts to subsets disjoint from path -/
+
+/-- `srcOf?` is unchanged by filtering, for nodes outside the removed set. -/
+theorem srcOf?_filter_ne_removed
+    (es : Edges) (removed : List UInt32) (v : UInt32) (h_v : v ∉ removed) :
+    srcOf? v (es.filter (fun e => decide (e.2 ∉ removed))) = srcOf? v es := by
+  unfold srcOf?
+  congr 1
+  induction es with
+  | nil => simp
+  | cons e rest ih =>
+    by_cases h_keep : e.2 ∈ removed
+    · -- e is filtered out
+      have h_e_ne_v : e.2 ≠ v := by intro heq; rw [heq] at h_keep; exact h_v h_keep
+      have h_keep_dec : decide (e.2 ∉ removed) = false := by simp [h_keep]
+      rw [List.filter_cons, h_keep_dec]
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      rw [List.find?_cons]
+      have : decide (e.2 = v) = false := by simp [h_e_ne_v]
+      rw [this]
+      exact ih
+    · -- e is kept by the filter
+      have h_keep_dec : decide (e.2 ∉ removed) = true := by simp [h_keep]
+      rw [List.filter_cons, h_keep_dec]
+      simp only [↓reduceIte]
+      rw [List.find?_cons, List.find?_cons]
+      by_cases h_e_v : e.2 = v
+      · have : decide (e.2 = v) = true := by simp [h_e_v]
+        rw [this]
+      · have : decide (e.2 = v) = false := by simp [h_e_v]
+        rw [this]
+        exact ih
+
+/-- `eraseDst d (filter es) = filter (eraseDst d es)`. -/
+theorem eraseDst_filter_swap
+    (es : Edges) (removed : List UInt32) (d : UInt32) :
+    eraseDst d (es.filter (fun e => decide (e.2 ∉ removed))) =
+      (eraseDst d es).filter (fun e => decide (e.2 ∉ removed)) := by
+  unfold eraseDst
+  rw [List.filter_filter, List.filter_filter]
+  apply List.filter_congr
+  intro e _
+  -- (decide ¬e.2 ∈ removed) && (e.2 != d) = (e.2 != d) && (decide ¬e.2 ∈ removed)
+  exact Bool.and_comm _ _
+
+/-- A `CyclePathTo` lifts to any filter that doesn't remove its dsts. -/
+theorem cyclePathTo_lift_disjoint
+    {start : UInt32} {es : Edges} {path : List UInt32}
+    (h_path : CyclePathTo start es path)
+    (removed : List UInt32)
+    (h_disjoint : ∀ v ∈ path, v ∉ removed) :
+    CyclePathTo start (es.filter (fun e => decide (e.2 ∉ removed))) path := by
+  induction h_path with
+  | last h_close =>
+    rename_i es_inner curr_path
+    apply CyclePathTo.last
+    rw [srcOf?_filter_ne_removed]
+    · exact h_close
+    · exact h_disjoint curr_path (by simp)
+  | step h_step h_ne_start _ ih =>
+    rename_i es_inner curr_path next rest _
+    apply CyclePathTo.step
+    · rw [srcOf?_filter_ne_removed]
+      · exact h_step
+      · exact h_disjoint curr_path (by simp)
+    · exact h_ne_start
+    · rw [eraseDst_filter_swap]
+      apply ih
+      intro v hv
+      apply h_disjoint
+      simp [hv]
+
+/-! ## AllOnCycle preservation under breakOneCycle's residual -/
+
+/-- After breakOneCycle removes a cycle, the residual still has all dsts on
+    cycles (in the residual). -/
+theorem allOnCycle_preserved_by_breakOneCycle
+    (start : UInt32) (es : Edges) (hC : OnCycle start es)
+    (hWF : UniqueDst es)
+    (h_all : AllOnCycle es)
+    (fuel : Nat) (h_fuel : (cycleOf start es hC).length ≤ fuel)
+    (acc : List (Register × Register)) :
+    AllOnCycle (breakOneCycle fuel .temp start es acc).1 := by
+  rw [breakOneCycle_residual start es hC fuel h_fuel acc]
+  intro d h_d
+  -- d ∈ filter.map Prod.snd
+  rw [List.mem_map] at h_d
+  obtain ⟨e, h_e_mem, h_e_eq⟩ := h_d
+  rw [List.mem_filter] at h_e_mem
+  obtain ⟨h_in_es, h_dst_notin⟩ := h_e_mem
+  simp at h_dst_notin
+  -- d = e.2, d ∉ cycleOf
+  have h_d_in_es : d ∈ es.map Prod.snd := by
+    rw [List.mem_map]
+    exact ⟨e, h_in_es, h_e_eq⟩
+  have h_d_notin_cycle : d ∉ cycleOf start es hC := h_e_eq ▸ h_dst_notin
+  -- By AllOnCycle es, OnCycle d es with some path P_d.
+  have hD : OnCycle d es := h_all d h_d_in_es
+  obtain ⟨_, h_head_D, h_nodup_D, h_path_D⟩ := hD.choose_spec
+  have h_disjoint : ∀ v, v ∈ cycleOf d es hD → v ∉ cycleOf start es hC :=
+    cycle_disjoint_of_start_not_in start es hC hWF d hD h_d_notin_cycle
+  -- Lift CyclePathTo from es to es.filter.
+  have h_path_lifted : CyclePathTo d (es.filter
+      (fun e => decide (e.2 ∉ cycleOf start es hC))) hD.choose := by
+    apply cyclePathTo_lift_disjoint h_path_D
+    intro v hv
+    exact h_disjoint v hv
+  exact ⟨hD.choose, hD.choose_spec.1, h_head_D, h_nodup_D, h_path_lifted⟩
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
