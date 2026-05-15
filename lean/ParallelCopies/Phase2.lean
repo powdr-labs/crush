@@ -821,6 +821,29 @@ theorem applySequentialL_walkEmits_regify_preserves_non_dst_given
   rw [List.mem_map]
   exact ⟨e, he, by injection hcontra⟩
 
+/-! ## consPairs membership: each consecutive pair is in the result -/
+
+/-- For `i < cycle.length - 1`, `(cycle[i+1], cycle[i])` is in `consPairs cycle`. -/
+theorem consPairs_mem_pair
+    (cycle : List UInt32) (i : Nat) (h : i + 1 < cycle.length) :
+    (cycle.get ⟨i + 1, h⟩, cycle.get ⟨i, by omega⟩) ∈ consPairs cycle := by
+  induction cycle generalizing i with
+  | nil => simp at h
+  | cons a rest ih =>
+    cases rest with
+    | nil => simp at h
+    | cons b rest' =>
+      simp only [consPairs]
+      cases i with
+      | zero =>
+        simp [List.mem_cons]
+      | succ k =>
+        right
+        have h' : k + 1 < (b :: rest').length := by
+          simp at h ⊢
+          omega
+        exact ih k h'
+
 /-! ## breakOneCycle correctness on one cycle -/
 
 /-- Schedule produced by `breakOneCycle` with empty initial acc. -/
@@ -918,6 +941,431 @@ theorem breakOneCycle_writes_non_last
   rw [step_other _ _ (fun h => h_ne_last (by injection h))]
   rw [walkEmits_regify_writes fuel start start es h_nodup _ s d h_mem]
   simp [step]
+
+/-! ## breakOneCycle_sound — single cycle correctness
+
+For each position `i` in the cycle, `breakOneCycle`'s schedule writes
+the right value into `.given (cycle[i])`:
+
+* `i < cycle.length - 1` → writes `σ(.given cycle[i+1])` (the next visit).
+* `i = cycle.length - 1` → writes `σ(.given start)` (the cycle closure).
+-/
+
+/-- `getLast!` of a cons whose tail is non-empty equals `getLast!` of the tail. -/
+private theorem getLast!_cons_cons
+    {α : Type u} [Inhabited α] (a b : α) (rest : List α) :
+    (a :: b :: rest).getLast! = (b :: rest).getLast! := by
+  simp [List.getLast!]
+
+/-- For a `Nodup` non-empty list, `get i` equals `getLast!` iff `i = length - 1`.
+    Proven by induction on the list. -/
+theorem nodup_get_eq_getLast!_iff :
+    ∀ (xs : List UInt32) (_ : xs.Nodup) (_ : xs ≠ [])
+      (i : Nat) (h_i : i < xs.length),
+      xs.get ⟨i, h_i⟩ = xs.getLast! ↔ i = xs.length - 1
+  | [],          _,         h_ne_nil, _,   _   => by simp at h_ne_nil
+  | [a],         _,         _,        0,   _   => by simp [List.getLast!]
+  | [_],         _,         _,        k+1, h_i => by simp at h_i
+  | a :: b :: rest, h_nodup, _,        0,   _   => by
+    rw [List.nodup_cons] at h_nodup
+    obtain ⟨ha_notin, _⟩ := h_nodup
+    rw [getLast!_cons_cons]
+    show a = (b :: rest).getLast! ↔ 0 = (a :: b :: rest).length - 1
+    constructor
+    · intro h_eq
+      have h_last_in : (b :: rest).getLast (by simp) ∈ b :: rest :=
+        List.getLast_mem _
+      have hL : (b :: rest).getLast! = (b :: rest).getLast (by simp) := by
+        simp [List.getLast!, List.getLast_eq_getElem]
+      rw [hL] at h_eq
+      rw [← h_eq] at h_last_in
+      exact absurd h_last_in ha_notin
+    · intro h_eq
+      simp at h_eq
+  | a :: b :: rest, h_nodup, _,        k+1, h_i => by
+    rw [List.nodup_cons] at h_nodup
+    have h_rest_nodup : (b :: rest).Nodup := h_nodup.2
+    have h_rest_ne_nil : (b :: rest) ≠ [] := by simp
+    have h_k_lt : k < (b :: rest).length := by
+      have : (a :: b :: rest).length = (b :: rest).length + 1 := by simp
+      omega
+    have ih := nodup_get_eq_getLast!_iff (b :: rest) h_rest_nodup h_rest_ne_nil k h_k_lt
+    rw [getLast!_cons_cons]
+    show (b :: rest).get ⟨k, h_k_lt⟩ = (b :: rest).getLast! ↔
+         k + 1 = (a :: b :: rest).length - 1
+    rw [ih]
+    have : (a :: b :: rest).length = (b :: rest).length + 1 := by simp
+    omega
+
+/-- Combined breakOneCycle correctness for cycle registers. -/
+theorem breakOneCycle_sound_at_cycle_idx
+    (fuel : Nat) (start : UInt32) (es : Edges)
+    (hC : OnCycle start es) (h_fuel : hC.choose.length ≤ fuel)
+    (σ : SState) (i : Nat) (h_i : i < hC.choose.length) :
+    applySequentialL (breakOneCycle fuel .temp start es []).2 σ
+      (.given (hC.choose.get ⟨i, h_i⟩)) =
+      σ (.given (if h : i + 1 < hC.choose.length
+                  then hC.choose.get ⟨i + 1, h⟩
+                  else start)) := by
+  obtain ⟨h_ne_nil, h_head, h_nodup, h_path⟩ := hC.choose_spec
+  have h_visits_eq : walkVisits fuel start start es = hC.choose :=
+    walkVisits_eq_of_onCycle start es hC fuel h_fuel
+  have h_nodup_visits : (walkVisits fuel start start es).Nodup := by
+    rw [h_visits_eq]; exact h_nodup
+  have h_last_eq :
+      (walkCycle fuel start start es
+        [(Register.given start, Register.temp)]).1 = hC.choose.getLast! := by
+    rw [walkCycle_fst_eq_walkVisits_getLast!, h_visits_eq]
+  by_cases h_last_pos : i + 1 < hC.choose.length
+  · rw [dif_pos h_last_pos]
+    have h_ne_last : hC.choose.get ⟨i, h_i⟩ ≠ hC.choose.getLast! := by
+      intro hcontra
+      rw [nodup_get_eq_getLast!_iff hC.choose h_nodup h_ne_nil i h_i] at hcontra
+      omega
+    have h_mem :
+        (hC.choose.get ⟨i + 1, h_last_pos⟩, hC.choose.get ⟨i, h_i⟩) ∈
+          walkEmits fuel start start es := by
+      rw [walkEmits_eq_consPairs_walkVisits, h_visits_eq]
+      exact consPairs_mem_pair hC.choose i h_last_pos
+    exact breakOneCycle_writes_non_last fuel start es h_nodup_visits σ _ _ h_mem
+      (h_last_eq ▸ h_ne_last)
+  · rw [dif_neg h_last_pos]
+    have h_i_eq : i = hC.choose.length - 1 := by omega
+    have h_get_eq_last : hC.choose.get ⟨i, h_i⟩ = hC.choose.getLast! :=
+      (nodup_get_eq_getLast!_iff hC.choose h_nodup h_ne_nil i h_i).mpr h_i_eq
+    rw [h_get_eq_last, ← h_last_eq]
+    exact breakOneCycle_writes_last fuel start es σ
+
+/-! ## walkEmits ⊆ es -/
+
+/-- Every pair emitted by `walkEmits` is an edge of the original `es`.
+    walkCycle reads source via `srcOf?` on a (possibly eraseDst-shrunk)
+    subset of `es`; both `srcOf?_mem` and `eraseDst_subset` push us back
+    to `es`. -/
+theorem walkEmits_subset_es
+    (fuel : Nat) (start curr : UInt32) (es : Edges) :
+    ∀ p ∈ walkEmits fuel start curr es, p ∈ es := by
+  induction fuel generalizing curr es with
+  | zero => simp [walkEmits]
+  | succ n ih =>
+    simp only [walkEmits]
+    cases hsrc : srcOf? curr es with
+    | none => simp
+    | some source =>
+      by_cases h_start : source = start
+      · simp [h_start]
+      · simp only [h_start, if_false]
+        intro p hp
+        rcases List.mem_cons.mp hp with heq | hmem
+        · subst heq; exact srcOf?_mem es curr source hsrc
+        · exact eraseDst_subset curr es _ (ih source (eraseDst curr es) p hmem)
+
+/-! ## applyParallelLS reading lemmas -/
+
+/-- When `(s, r) ∈ es` with `s ≠ r` and the graph has unique dsts,
+    `applyParallelLS` at `.given r` returns `σ (.given s)`. -/
+theorem applyParallelLS_at_writer
+    (es : Edges) (σ : SState) (s r : UInt32)
+    (hWF : UniqueDst es) (h_mem : (s, r) ∈ es) (h_ne : s ≠ r) :
+    applyParallelLS es σ (.given r) = σ (.given s) := by
+  show (match es.find? (Pair.appliesTo · r) with
+        | some (src, _) => σ (.given src)
+        | none          => σ (.given r)) = σ (.given s)
+  rw [find?_dst_of_mem s r es hWF h_mem h_ne]
+
+/-- When no non-self edge in `es` writes to `r`, `applyParallelLS` is identity. -/
+theorem applyParallelLS_at_no_writer
+    (es : Edges) (σ : SState) (r : UInt32)
+    (h : ∀ e ∈ es, ¬ (e.2 = r ∧ e.1 ≠ e.2)) :
+    applyParallelLS es σ (.given r) = σ (.given r) := by
+  show (match es.find? (Pair.appliesTo · r) with
+        | some (src, _) => σ (.given src)
+        | none          => σ (.given r)) = σ (.given r)
+  rw [find?_of_no_writer es r h]
+
+/-! ## CyclePathTo encodes cycle edges -/
+
+/-- The closing edge of a cycle: `(start, last_visit) ∈ es`. -/
+theorem cyclePathTo_last_edge
+    {start : UInt32} {es : Edges} {path : List UInt32}
+    (h_path : CyclePathTo start es path) :
+    (start, path.getLast!) ∈ es := by
+  induction h_path with
+  | last h_close =>
+    rename_i es' curr_path
+    have h_close' : (start, curr_path) ∈ es' := srcOf?_mem _ _ _ h_close
+    show (start, [curr_path].getLast!) ∈ es'
+    simp [List.getLast!]
+    exact h_close'
+  | step h_step h_ne_start _ ih =>
+    rename_i es' curr_path next rest _
+    have h_eq_last :
+        (curr_path :: next :: rest).getLast! = (next :: rest).getLast! := by
+      simp [List.getLast!]
+    rw [h_eq_last]
+    exact eraseDst_subset curr_path es' _ ih
+
+/-! ## Nodup index injectivity -/
+
+/-- For a `Nodup` list, `get` at distinct indices yields distinct elements. -/
+private theorem nodup_get_inj :
+    ∀ (xs : List UInt32) (_ : xs.Nodup) (i j : Nat)
+      (hi : i < xs.length) (hj : j < xs.length),
+      xs.get ⟨i, hi⟩ = xs.get ⟨j, hj⟩ → i = j
+  | [],          _, _,   _,   hi, _,  _   => by simp at hi
+  | _ :: _,      _, 0,   0,   _,  _,  _   => rfl
+  | x :: rest,   h, 0,   j+1, _,  hj, heq => by
+    rw [List.nodup_cons] at h
+    have h_x_notin : x ∉ rest := h.1
+    have hj' : j < rest.length := by simp at hj; omega
+    have h_mem : rest.get ⟨j, hj'⟩ ∈ rest := List.get_mem rest ⟨j, hj'⟩
+    have h_lhs : (x :: rest).get ⟨0, by simp⟩ = x := rfl
+    have h_rhs : (x :: rest).get ⟨j+1, by simp at hj ⊢; omega⟩ =
+                 rest.get ⟨j, hj'⟩ := rfl
+    rw [h_lhs, h_rhs] at heq
+    exact absurd (heq ▸ h_mem) h_x_notin
+  | x :: rest,   h, i+1, 0,   hi, _,  heq => by
+    rw [List.nodup_cons] at h
+    have h_x_notin : x ∉ rest := h.1
+    have hi' : i < rest.length := by simp at hi; omega
+    have h_mem : rest.get ⟨i, hi'⟩ ∈ rest := List.get_mem rest ⟨i, hi'⟩
+    have h_lhs : (x :: rest).get ⟨i+1, by simp at hi ⊢; omega⟩ =
+                 rest.get ⟨i, hi'⟩ := rfl
+    have h_rhs : (x :: rest).get ⟨0, by simp⟩ = x := rfl
+    rw [h_lhs, h_rhs] at heq
+    exact absurd (heq.symm ▸ h_mem) h_x_notin
+  | x :: rest,   h, i+1, j+1, hi, hj, heq => by
+    rw [List.nodup_cons] at h
+    have h_rest_nodup : rest.Nodup := h.2
+    have hi' : i < rest.length := by simp at hi; omega
+    have hj' : j < rest.length := by simp at hj; omega
+    have h_lhs : (x :: rest).get ⟨i+1, by simp at hi ⊢; omega⟩ =
+                 rest.get ⟨i, hi'⟩ := rfl
+    have h_rhs : (x :: rest).get ⟨j+1, by simp at hj ⊢; omega⟩ =
+                 rest.get ⟨j, hj'⟩ := rfl
+    have heq' : rest.get ⟨i, hi'⟩ = rest.get ⟨j, hj'⟩ := by
+      rw [← h_lhs, ← h_rhs]; exact heq
+    have ih := nodup_get_inj rest h_rest_nodup i j hi' hj' heq'
+    omega
+
+/-- Cycle elements at distinct indices are distinct. -/
+private theorem cycle_elem_ne_of_idx_ne
+    {xs : List UInt32} (h_nodup : xs.Nodup)
+    {i j : Nat} (hi : i < xs.length) (hj : j < xs.length)
+    (h : i ≠ j) :
+    xs.get ⟨i, hi⟩ ≠ xs.get ⟨j, hj⟩ :=
+  fun heq => h (nodup_get_inj xs h_nodup i j hi hj heq)
+
+/-! ## applyParallelLS at cycle positions -/
+
+/-- For a cycle position `i < length - 1`, the parallel writer is `cycle[i+1]`. -/
+theorem applyParallelLS_at_cycle_dst_non_last
+    (start : UInt32) (es : Edges)
+    (hWF : UniqueDst es)
+    (hC : OnCycle start es)
+    (fuel : Nat) (h_fuel : hC.choose.length ≤ fuel)
+    (σ : SState)
+    (i : Nat) (h_i_succ : i + 1 < hC.choose.length) :
+    applyParallelLS es σ (.given (hC.choose.get ⟨i, by omega⟩)) =
+      σ (.given (hC.choose.get ⟨i + 1, h_i_succ⟩)) := by
+  obtain ⟨_, _, h_nodup, _⟩ := hC.choose_spec
+  have h_visits_eq : walkVisits fuel start start es = hC.choose :=
+    walkVisits_eq_of_onCycle start es hC fuel h_fuel
+  have h_i : i < hC.choose.length := by omega
+  have h_mem_emit :
+      (hC.choose.get ⟨i + 1, h_i_succ⟩, hC.choose.get ⟨i, h_i⟩) ∈
+        walkEmits fuel start start es := by
+    rw [walkEmits_eq_consPairs_walkVisits, h_visits_eq]
+    exact consPairs_mem_pair hC.choose i h_i_succ
+  have h_mem : (hC.choose.get ⟨i + 1, h_i_succ⟩, hC.choose.get ⟨i, h_i⟩) ∈ es :=
+    walkEmits_subset_es fuel start start es _ h_mem_emit
+  have h_ne : hC.choose.get ⟨i + 1, h_i_succ⟩ ≠ hC.choose.get ⟨i, h_i⟩ :=
+    cycle_elem_ne_of_idx_ne h_nodup h_i_succ h_i (by omega)
+  exact applyParallelLS_at_writer es σ _ _ hWF h_mem h_ne
+
+/-- For the last cycle position, the parallel writer is `start`. -/
+theorem applyParallelLS_at_cycle_dst_last
+    (start : UInt32) (es : Edges)
+    (hWF : UniqueDst es)
+    (h_no_self : ∀ e ∈ es, e.1 ≠ e.2)
+    (hC : OnCycle start es)
+    (σ : SState) :
+    applyParallelLS es σ (.given hC.choose.getLast!) = σ (.given start) := by
+  obtain ⟨h_ne_nil, h_head, h_nodup, h_path⟩ := hC.choose_spec
+  have h_mem : (start, hC.choose.getLast!) ∈ es := cyclePathTo_last_edge h_path
+  have h_ne : start ≠ hC.choose.getLast! := by
+    cases h_len : hC.choose with
+    | nil => exact absurd h_len h_ne_nil
+    | cons a rest =>
+      rw [h_len] at h_head
+      simp at h_head
+      rw [h_len] at h_nodup h_path
+      subst h_head
+      cases rest with
+      | nil =>
+        cases h_path with
+        | last h_close =>
+          have h_self : (a, a) ∈ es := srcOf?_mem _ _ _ h_close
+          exact absurd (h_no_self _ h_self) (by simp)
+      | cons b rest' =>
+        rw [List.nodup_cons] at h_nodup
+        have h_start_notin : a ∉ (b :: rest') := h_nodup.1
+        have h_last_in : (b :: rest').getLast! ∈ (b :: rest') := by
+          rw [show (b :: rest').getLast! = (b :: rest').getLast (by simp) from by
+            simp [List.getLast!, List.getLast_eq_getElem]]
+          exact List.getLast_mem _
+        have h_last_eq : (a :: b :: rest').getLast! = (b :: rest').getLast! := by
+          simp [List.getLast!]
+        intro heq
+        rw [h_last_eq] at heq
+        rw [← heq] at h_last_in
+        exact h_start_notin h_last_in
+  exact applyParallelLS_at_writer es σ _ _ hWF h_mem h_ne
+
+/-! ## breakOneCycle realises one cycle's parallel effect -/
+
+/-- The unified breakOneCycle correctness: at every cycle node, the schedule
+    writes `applyParallelLS es σ` for that node. -/
+theorem breakOneCycle_sound_at_cycle
+    (start : UInt32) (es : Edges)
+    (hWF : UniqueDst es)
+    (h_no_self : ∀ e ∈ es, e.1 ≠ e.2)
+    (hC : OnCycle start es)
+    (fuel : Nat) (h_fuel : hC.choose.length ≤ fuel)
+    (σ : SState)
+    (i : Nat) (h_i : i < hC.choose.length) :
+    applySequentialL (breakOneCycle fuel .temp start es []).2 σ
+      (.given (hC.choose.get ⟨i, h_i⟩)) =
+      applyParallelLS es σ (.given (hC.choose.get ⟨i, h_i⟩)) := by
+  by_cases h_last_pos : i + 1 < hC.choose.length
+  · -- non-last: cycle[i+1] is the writer
+    rw [breakOneCycle_sound_at_cycle_idx fuel start es hC h_fuel σ i h_i]
+    rw [dif_pos h_last_pos]
+    rw [applyParallelLS_at_cycle_dst_non_last start es hWF hC fuel h_fuel σ i h_last_pos]
+  · -- last: start is the writer
+    rw [breakOneCycle_sound_at_cycle_idx fuel start es hC h_fuel σ i h_i]
+    rw [dif_neg h_last_pos]
+    obtain ⟨_, _, h_nodup, _⟩ := hC.choose_spec
+    have h_ne_nil : hC.choose ≠ [] := hC.choose_spec.1
+    have h_i_eq : i = hC.choose.length - 1 := by omega
+    have h_get_eq_last : hC.choose.get ⟨i, h_i⟩ = hC.choose.getLast! :=
+      (nodup_get_eq_getLast!_iff hC.choose h_nodup h_ne_nil i h_i).mpr h_i_eq
+    rw [h_get_eq_last]
+    rw [applyParallelLS_at_cycle_dst_last start es hWF h_no_self hC σ]
+
+/-! ## smallestDst lemmas -/
+
+/-- Once the fold's accumulator becomes `some _`, it stays `some _`. -/
+private theorem smallestDst_fold_some_persists
+    (acc : UInt32) (es : Edges) :
+    ∃ x, es.foldl (init := some acc)
+            (fun best e => some <| best.elim e.2
+              (Nat.min e.2.toNat ·.toNat |>.toUInt32)) = some x := by
+  induction es generalizing acc with
+  | nil => exact ⟨acc, by simp⟩
+  | cons e rest ih =>
+    simp only [List.foldl_cons]
+    exact ih _
+
+/-- `smallestDst` returns `none` exactly when the list is empty. -/
+theorem smallestDst_eq_none_iff (es : Edges) :
+    smallestDst es = none ↔ es = [] := by
+  constructor
+  · intro h
+    cases es with
+    | nil => rfl
+    | cons e rest =>
+      simp only [smallestDst, List.foldl_cons, Option.elim_none] at h
+      obtain ⟨x, hx⟩ := smallestDst_fold_some_persists e.2 rest
+      rw [hx] at h
+      exact absurd h (by simp)
+  · intro h; subst h; rfl
+
+/-- Auxiliary: `(Nat.min n m).toUInt32 ∈ {n.toUInt32, m.toUInt32}` for any `n, m`. -/
+private theorem nat_min_toUInt32_eq_or
+    (n m : Nat) :
+    (Nat.min n m).toUInt32 = n.toUInt32 ∨ (Nat.min n m).toUInt32 = m.toUInt32 := by
+  by_cases h : n ≤ m
+  · left
+    have : Nat.min n m = n := Nat.min_eq_left h
+    rw [this]
+  · right
+    have h' : m ≤ n := Nat.le_of_lt (Nat.lt_of_not_le h)
+    have : Nat.min n m = m := Nat.min_eq_right h'
+    rw [this]
+
+/-- The fold accumulator value is in `acc ∪ dsts es` when non-empty. -/
+private theorem smallestDst_fold_mem
+    (acc : UInt32) (es : Edges) :
+    ∀ x, es.foldl (init := some acc)
+            (fun best e => some <| best.elim e.2
+              (Nat.min e.2.toNat ·.toNat |>.toUInt32)) = some x →
+         x = acc ∨ x ∈ es.map Prod.snd := by
+  induction es generalizing acc with
+  | nil =>
+    intro x hx; simp at hx; left; exact hx.symm
+  | cons e rest ih =>
+    intro x hx
+    simp only [List.foldl_cons, Option.elim_some] at hx
+    have ih' := ih _ x hx
+    rcases ih' with h_eq | h_mem
+    · -- new acc = (Nat.min e.2.toNat acc.toNat).toUInt32, equal to e.2 or acc
+      have hor := nat_min_toUInt32_eq_or e.2.toNat acc.toNat
+      have h_e2 : e.2.toNat.toUInt32 = e.2 := UInt32.ofNat_toNat
+      have h_acc : acc.toNat.toUInt32 = acc := UInt32.ofNat_toNat
+      rw [h_e2, h_acc] at hor
+      rcases hor with h_e | h_acc'
+      · right
+        have hx : x = e.2 := h_eq.trans h_e
+        rw [hx, List.map_cons]
+        exact List.mem_cons_self
+      · left
+        exact h_eq.trans h_acc'
+    · right
+      rw [List.map_cons]
+      exact List.mem_cons_of_mem _ h_mem
+
+/-- If `smallestDst es = some d`, then `d` is a dst in `es`. -/
+theorem smallestDst_some_mem
+    (es : Edges) (d : UInt32) (h : smallestDst es = some d) :
+    d ∈ es.map Prod.snd := by
+  cases es with
+  | nil => simp [smallestDst] at h
+  | cons e rest =>
+    simp only [smallestDst, List.foldl_cons, Option.elim_none] at h
+    have := smallestDst_fold_mem e.2 rest d h
+    rcases this with h_eq | h_mem
+    · subst h_eq
+      rw [List.map_cons]
+      exact List.mem_cons_self
+    · rw [List.map_cons]
+      exact List.mem_cons_of_mem _ h_mem
+
+/-! ## applyParallelLS interactions -/
+
+/-- `eraseDst` on a `UniqueDst` graph: at any `r ≠ d`, the parallel effect
+    is unchanged. -/
+theorem applyParallelLS_eraseDst_ne
+    (d : UInt32) (es : Edges) (hWF : UniqueDst es)
+    (σ : SState) (r : UInt32) (h_ne : r ≠ d) :
+    applyParallelLS (eraseDst d es) σ (.given r) = applyParallelLS es σ (.given r) := by
+  by_cases h_writer : ∃ s, (s, r) ∈ es ∧ s ≠ r
+  · obtain ⟨s, h_mem, h_ne_s⟩ := h_writer
+    have h_mem' : (s, r) ∈ eraseDst d es := by
+      rw [mem_eraseDst]; exact ⟨h_mem, h_ne⟩
+    have hWF' : UniqueDst (eraseDst d es) := eraseDst_uniqueDst d es hWF
+    rw [applyParallelLS_at_writer (eraseDst d es) σ s r hWF' h_mem' h_ne_s]
+    rw [applyParallelLS_at_writer es σ s r hWF h_mem h_ne_s]
+  · have h_es : ∀ e ∈ es, ¬ (e.2 = r ∧ e.1 ≠ e.2) := by
+      intro e he ⟨h_eq, h_ne_e⟩
+      obtain ⟨s, t⟩ := e
+      simp at h_eq
+      subst h_eq
+      exact h_writer ⟨s, he, h_ne_e⟩
+    have h_es' : ∀ e ∈ eraseDst d es, ¬ (e.2 = r ∧ e.1 ≠ e.2) :=
+      fun e he => h_es e (eraseDst_subset _ _ _ he)
+    rw [applyParallelLS_at_no_writer (eraseDst d es) σ r h_es']
+    rw [applyParallelLS_at_no_writer es σ r h_es]
 
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
