@@ -2762,6 +2762,48 @@ theorem phase1_no_leaves
       have h_new_fuel : (peelStep s d es).length ≤ n := by omega
       exact ih _ _ h_new_fuel
 
+/-! ## iterWriter shift lemma -/
+
+/-- One-step shift: iterWriter (n+1) curr = iterWriter n next, when srcOf? curr = some next. -/
+theorem iterWriter_one_then :
+    ∀ (n : Nat) (curr w : UInt32) (es : Edges),
+      srcOf? curr es = some w →
+      iterWriter (n + 1) curr es = iterWriter n w es
+  | 0,     curr, w, es, h => by
+    rw [iterWriter_succ]; simp; exact h
+  | n + 1, curr, w, es, h => by
+    rw [iterWriter_succ]
+    rw [iterWriter_one_then n curr w es h]
+    rw [iterWriter_succ]
+
+/-! ## iterForward → iterWriter bridge -/
+
+/-- If forward chain k steps from v ends at w, then writer chain k steps from w ends at v. -/
+theorem iterWriter_of_iterForward :
+    ∀ (es : Edges) (hWF : UniqueDst es)
+      (v w : UInt32) (k : Nat),
+      iterForward k v es = some w → iterWriter k w es = some v
+  | _, _, v, w, 0, h => by
+    rw [iterForward_zero] at h
+    injection h with h
+    rw [← h]
+    rfl
+  | es, hWF, v, w, k + 1, h => by
+    rw [iterForward_succ] at h
+    cases h_k : iterForward k v es with
+    | none => rw [h_k] at h; simp at h
+    | some w' =>
+      rw [h_k] at h
+      simp at h
+      -- forwardStep w' es = some w, so (w', w) ∈ es.
+      have h_mem : (w', w) ∈ es := forwardStep_mem w' w es h
+      -- srcOf? w es = some w' (UniqueDst).
+      have h_src : srcOf? w es = some w' := srcOf?_eq_some_of_mem es w' w hWF h_mem
+      -- iterWriter (k+1) w es = iterWriter k w' es (by iterWriter_one_then).
+      rw [iterWriter_one_then k w w' es h_src]
+      -- iterWriter k w' es = some v by IH.
+      exact iterWriter_of_iterForward es hWF v w' k h_k
+
 /-! ## walkErased closes properly under our setup
 
 We show that under no-leaves, no-roots, UniqueDst, and `iterForward k v es = some v`,
