@@ -1971,6 +1971,110 @@ theorem cycleOf_length_le
   rw [List.length_map] at h_bound
   exact h_bound
 
+/-! ## walkCycle's outputs are acc-independent (apart from prefix) -/
+
+theorem walkCycle_acc_indep_last
+    (fuel : Nat) (start curr : UInt32) (es : Edges)
+    (acc : List (Register × Register)) :
+    (walkCycle fuel start curr es acc).1 =
+      (walkCycle fuel start curr es []).1 := by
+  induction fuel generalizing curr es acc with
+  | zero => rfl
+  | succ n ih =>
+    unfold walkCycle
+    cases hsrc : srcOf? curr es with
+    | none => rfl
+    | some source =>
+      by_cases h : source = start
+      · simp [h]
+      · simp [h]
+        have h1 := ih source (eraseDst curr es)
+            (acc ++ [(Register.given source, Register.given curr)])
+        have h2 := ih source (eraseDst curr es)
+            [(Register.given source, Register.given curr)]
+        exact h1.trans h2.symm
+
+theorem walkCycle_acc_indep_es
+    (fuel : Nat) (start curr : UInt32) (es : Edges)
+    (acc : List (Register × Register)) :
+    (walkCycle fuel start curr es acc).2.1 =
+      (walkCycle fuel start curr es []).2.1 := by
+  induction fuel generalizing curr es acc with
+  | zero => rfl
+  | succ n ih =>
+    unfold walkCycle
+    cases hsrc : srcOf? curr es with
+    | none => rfl
+    | some source =>
+      by_cases h : source = start
+      · simp [h]
+      · simp [h]
+        have h1 := ih source (eraseDst curr es)
+            (acc ++ [(Register.given source, Register.given curr)])
+        have h2 := ih source (eraseDst curr es)
+            [(Register.given source, Register.given curr)]
+        exact h1.trans h2.symm
+
+theorem walkCycle_acc_indep_schedule
+    (fuel : Nat) (start curr : UInt32) (es : Edges)
+    (acc : List (Register × Register)) :
+    (walkCycle fuel start curr es acc).2.2 =
+      acc ++ (walkCycle fuel start curr es []).2.2 := by
+  induction fuel generalizing curr es acc with
+  | zero => simp [walkCycle]
+  | succ n ih =>
+    unfold walkCycle
+    split
+    · simp
+    next source hsrc =>
+      split
+      · simp [hsrc]
+      · -- recurse
+        simp only [List.nil_append]
+        have hL := ih source (eraseDst curr es)
+            (acc ++ [(Register.given source, Register.given curr)])
+        have hR := ih source (eraseDst curr es)
+            [(Register.given source, Register.given curr)]
+        rw [hL, hR]
+        simp
+
+/-- `breakOneCycle` with a non-empty acc prepends acc to the schedule produced
+    with empty acc. -/
+theorem breakOneCycle_schedule_acc_decomp
+    (fuel : Nat) (start : UInt32) (es : Edges)
+    (acc : List (Register × Register)) :
+    (breakOneCycle fuel .temp start es acc).2 =
+      acc ++ (breakOneCycle fuel .temp start es []).2 := by
+  unfold breakOneCycle
+  simp only [List.nil_append]
+  have hSched_acc :=
+    walkCycle_acc_indep_schedule fuel start start es
+      (acc ++ [(Register.given start, Register.temp)])
+  have hSched_empty :=
+    walkCycle_acc_indep_schedule fuel start start es
+      ([(Register.given start, Register.temp)])
+  have hLast_acc :=
+    walkCycle_acc_indep_last fuel start start es
+      (acc ++ [(Register.given start, Register.temp)])
+  have hLast_empty :=
+    walkCycle_acc_indep_last fuel start start es
+      ([(Register.given start, Register.temp)])
+  rw [hSched_acc, hSched_empty, hLast_acc, hLast_empty]
+  simp [List.append_assoc]
+
+theorem breakOneCycle_residual_acc_indep
+    (fuel : Nat) (start : UInt32) (es : Edges)
+    (acc : List (Register × Register)) :
+    (breakOneCycle fuel .temp start es acc).1 =
+      (breakOneCycle fuel .temp start es []).1 := by
+  unfold breakOneCycle
+  simp only [List.nil_append]
+  have h1 := walkCycle_acc_indep_es fuel start start es
+      (acc ++ [(Register.given start, Register.temp)])
+  have h2 := walkCycle_acc_indep_es fuel start start es
+      ([(Register.given start, Register.temp)])
+  exact h1.trans h2.symm
+
 /-! ## Filter preserves structural invariants -/
 
 theorem filter_uniqueDst
