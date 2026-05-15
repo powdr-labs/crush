@@ -3056,6 +3056,131 @@ private theorem walkErasedClosesAt_chain_inductive
         · -- e ∈ erased. iterWriter (i+1) curr ≠ some e from h_disjoint.
           exact h_disjoint (i + 1) (by omega) e h_e_rest h_eq
 
+/-! ## Direct CyclePathTo construction from iterWriter chain -/
+
+/-- Direct construction: given iterWriter chain closes at `n+1` with no early
+    return, chain Nodup, and disjoint from erased, we get a CyclePathTo on
+    the iterWriter-map path. -/
+private theorem cyclePathTo_construct_from_iter
+    (es_orig : Edges) (hWF_orig : UniqueDst es_orig)
+    (start : UInt32) :
+    ∀ (n : Nat) (curr : UInt32) (erased : List UInt32),
+      iterWriter (n + 1) curr es_orig = some start →
+      (∀ j, 0 < j → j ≤ n → iterWriter j curr es_orig ≠ some start) →
+      (∀ i j, i ≤ n → j ≤ n → i < j →
+        iterWriter i curr es_orig ≠ iterWriter j curr es_orig) →
+      (∀ i, i ≤ n → ∀ e ∈ erased, iterWriter i curr es_orig ≠ some e) →
+      CyclePathTo start (erased.foldr eraseDst es_orig)
+        ((List.range (n + 1)).map (fun i => (iterWriter i curr es_orig).getD 0))
+  | 0, curr, erased, h_iter, _, _, h_disjoint => by
+    -- Path = [(iterWriter 0 curr).getD 0] = [curr]. Apply CyclePathTo.last.
+    rw [iterWriter_succ] at h_iter
+    simp at h_iter
+    have h_src_orig : srcOf? curr es_orig = some start := h_iter
+    have h_curr_notin : curr ∉ erased := by
+      intro h_e
+      have := h_disjoint 0 (Nat.le_refl _) curr h_e
+      apply this; rfl
+    have h_src_shrunk : srcOf? curr (erased.foldr eraseDst es_orig) = some start :=
+      (srcOf?_foldr_eraseDst_ne es_orig erased curr h_curr_notin).trans h_src_orig
+    show CyclePathTo start (erased.foldr eraseDst es_orig) [curr]
+    apply CyclePathTo.last
+    exact h_src_shrunk
+  | n + 1, curr, erased, h_iter, h_no_early, h_nodup, h_disjoint => by
+    -- Path = [iterWriter 0 curr, iterWriter 1 curr, ..., iterWriter (n+1) curr] (n+2 elements).
+    -- Apply CyclePathTo.step with srcOf? curr = some next, recurse.
+    have h_iter_1 : iterWriter 1 curr es_orig ≠ some start :=
+      h_no_early 1 (by omega) (by omega)
+    rw [iterWriter_succ] at h_iter_1
+    simp at h_iter_1
+    cases h_src_orig : srcOf? curr es_orig with
+    | none =>
+      -- Contradicts h_iter (chain dies).
+      exfalso
+      have h_iter_1_none : iterWriter 1 curr es_orig = none := by
+        rw [iterWriter_succ]; simp [h_src_orig]
+      have h_iter_succ_none : ∀ k, iterWriter (k + 1) curr es_orig = none := by
+        intro k
+        induction k with
+        | zero => exact h_iter_1_none
+        | succ m ih => rw [iterWriter_succ, ih]; simp
+      have := h_iter_succ_none (n + 1)
+      rw [this] at h_iter; simp at h_iter
+    | some next =>
+      have h_next_ne_start : next ≠ start := by
+        intro heq; rw [heq] at h_src_orig; rw [h_src_orig] at h_iter_1; exact h_iter_1 rfl
+      have h_curr_notin : curr ∉ erased := by
+        intro h_e
+        have := h_disjoint 0 (by omega) curr h_e; apply this; rfl
+      have h_src_shrunk :
+          srcOf? curr (erased.foldr eraseDst es_orig) = some next :=
+        (srcOf?_foldr_eraseDst_ne es_orig erased curr h_curr_notin).trans h_src_orig
+      -- Build the path representation: head curr, tail is map of range (n+1).
+      have h_path_split :
+          (List.range (n + 1 + 1)).map (fun i => (iterWriter i curr es_orig).getD 0) =
+          curr :: (List.range (n + 1)).map (fun i => (iterWriter (i + 1) curr es_orig).getD 0) := by
+        rw [List.range_succ_eq_map]
+        simp [List.map_map]
+      rw [h_path_split]
+      have h_tail_eq :
+          (List.range (n + 1)).map (fun i => (iterWriter (i + 1) curr es_orig).getD 0) =
+          (List.range (n + 1)).map (fun i => (iterWriter i next es_orig).getD 0) := by
+        apply List.map_congr_left
+        intro i _
+        congr 1
+        exact iterWriter_one_then i curr next es_orig h_src_orig
+      rw [h_tail_eq]
+      have h_split2 :
+          (List.range (n + 1)).map (fun i => (iterWriter i next es_orig).getD 0) =
+          next :: (List.range n).map (fun i => (iterWriter (i + 1) next es_orig).getD 0) := by
+        rw [List.range_succ_eq_map]
+        simp [List.map_map]
+      rw [h_split2]
+      apply CyclePathTo.step h_src_shrunk h_next_ne_start
+      have h_eraseDst_eq :
+          eraseDst curr (erased.foldr eraseDst es_orig) =
+          (curr :: erased).foldr eraseDst es_orig := by
+        simp [List.foldr_cons]
+      rw [h_eraseDst_eq]
+      have h_recombine :
+          next :: (List.range n).map (fun i => (iterWriter (i + 1) next es_orig).getD 0) =
+          (List.range (n + 1)).map (fun i => (iterWriter i next es_orig).getD 0) := by
+        rw [List.range_succ_eq_map]
+        simp [List.map_map]
+      rw [h_recombine]
+      -- Apply IH with curr := next, erased := curr :: erased.
+      apply cyclePathTo_construct_from_iter es_orig hWF_orig start n next (curr :: erased)
+      · -- iterWriter (n+1) next es_orig = some start.
+        have := iterWriter_one_then (n + 1) curr next es_orig h_src_orig
+        rw [show n + 1 + 1 = n + 2 from rfl] at h_iter
+        rw [← this]; exact h_iter
+      · -- no-early for next's chain.
+        intro j h_j_pos h_j_le h_eq
+        have h_shift : iterWriter j next es_orig = iterWriter (j + 1) curr es_orig :=
+          (iterWriter_one_then j curr next es_orig h_src_orig).symm
+        rw [h_shift] at h_eq
+        exact h_no_early (j + 1) (by omega) (by omega) h_eq
+      · -- Nodup for next's chain.
+        intro i j h_i h_j h_lt h_eq
+        have h_shift_i : iterWriter i next es_orig = iterWriter (i + 1) curr es_orig :=
+          (iterWriter_one_then i curr next es_orig h_src_orig).symm
+        have h_shift_j : iterWriter j next es_orig = iterWriter (j + 1) curr es_orig :=
+          (iterWriter_one_then j curr next es_orig h_src_orig).symm
+        rw [h_shift_i, h_shift_j] at h_eq
+        exact h_nodup (i + 1) (j + 1) (by omega) (by omega) (by omega) h_eq
+      · -- Disjointness for next's chain.
+        intro i h_i e h_e h_eq
+        have h_shift : iterWriter i next es_orig = iterWriter (i + 1) curr es_orig :=
+          (iterWriter_one_then i curr next es_orig h_src_orig).symm
+        rw [h_shift] at h_eq
+        rcases List.mem_cons.mp h_e with h_e_curr | h_e_rest
+        · rw [h_e_curr] at h_eq
+          have h_iter0 : iterWriter 0 curr es_orig = some curr := rfl
+          have h_nodup_i := h_nodup 0 (i + 1) (by omega) (by omega) (by omega)
+          rw [h_iter0] at h_nodup_i
+          exact h_nodup_i h_eq.symm
+        · exact h_disjoint (i + 1) (by omega) e h_e_rest h_eq
+
 /-! ## phase2_sound: phase 2 realizes the parallel block for all-cycle inputs -/
 
 /-- Phase 2's central correctness lemma. For all-cycle `es` (every dst on
