@@ -3181,6 +3181,116 @@ private theorem cyclePathTo_construct_from_iter
           exact h_nodup_i h_eq.symm
         · exact h_disjoint (i + 1) (by omega) e h_e_rest h_eq
 
+/-! ## OnCycle of every dst in a no-leaves graph -/
+
+/-- The main bridge: every dst in a graph with no leaves is on a cycle. -/
+theorem onCycle_of_dst
+    (es : Edges) (hWF : UniqueDst es)
+    (h_dsts_nodup : (es.map Prod.snd).Nodup)
+    (h_no_leaves : findLeafEdge es = none)
+    (v : UInt32) (h_v : v ∈ es.map Prod.snd) :
+    OnCycle v es := by
+  -- 1. Forward chain returns.
+  obtain ⟨k, h_k_pos, _, h_iter⟩ :=
+    iterForward_returns_to_v es hWF h_no_leaves h_dsts_nodup v h_v
+  -- 2. Minimal k_min.
+  obtain ⟨k_min, h_k_min_pos, _, h_k_min_iter, h_k_min_min⟩ :=
+    iterForward_min_return es v k h_k_pos h_iter
+  -- 3. iterForward Nodup on [0, k_min).
+  have h_fwd_nodup := iterForward_nodup_until_return es hWF h_no_leaves h_dsts_nodup v h_v
+    k_min h_k_min_pos h_k_min_iter h_k_min_min
+  -- 4. iterWriter k_min v es = some v (from the reverse bridge).
+  have h_iter_writer : iterWriter k_min v es = some v := by
+    have := iterWriter_eq_iterForward_reverse es hWF v k_min h_k_min_iter k_min (Nat.le_refl _)
+    rw [this, show k_min - k_min = 0 from by omega]; rfl
+  -- 5. iterWriter no-early-return on [1, k_min - 1].
+  have h_writer_no_early : ∀ j, 0 < j → j ≤ k_min - 1 →
+      iterWriter j v es ≠ some v := by
+    intro j h_j_pos h_j_le h_eq
+    have h_j_le_k : j ≤ k_min := by omega
+    rw [iterWriter_eq_iterForward_reverse es hWF v k_min h_k_min_iter j h_j_le_k] at h_eq
+    exact h_k_min_min (k_min - j) (by omega) (by omega) h_eq
+  -- 6. iterWriter Nodup on [0, k_min - 1].
+  have h_writer_nodup : ∀ a b, a ≤ k_min - 1 → b ≤ k_min - 1 → a < b →
+      iterWriter a v es ≠ iterWriter b v es := by
+    intro a b h_a_le h_b_le h_lt h_eq
+    have h_a_le_k : a ≤ k_min := by omega
+    have h_b_le_k : b ≤ k_min := by omega
+    rw [iterWriter_eq_iterForward_reverse es hWF v k_min h_k_min_iter a h_a_le_k,
+        iterWriter_eq_iterForward_reverse es hWF v k_min h_k_min_iter b h_b_le_k] at h_eq
+    by_cases h_a_pos : 0 < a
+    · exact h_fwd_nodup (k_min - b) (k_min - a) (by omega) (by omega) (by omega) h_eq.symm
+    · have h_a_eq : a = 0 := by omega
+      subst h_a_eq
+      rw [show k_min - 0 = k_min from by omega] at h_eq
+      rw [h_k_min_iter] at h_eq
+      exact h_k_min_min (k_min - b) (by omega) (by omega) h_eq.symm
+  -- 7. Apply cyclePathTo_construct_from_iter with parameter n = k_min - 1.
+  have h_n_succ_eq : (k_min - 1) + 1 = k_min := by omega
+  have h_iter_writer' : iterWriter ((k_min - 1) + 1) v es = some v := by
+    rw [h_n_succ_eq]; exact h_iter_writer
+  have h_cyclePath_raw : CyclePathTo v ([].foldr eraseDst es)
+      ((List.range ((k_min - 1) + 1)).map (fun i => (iterWriter i v es).getD 0)) :=
+    cyclePathTo_construct_from_iter es hWF v (k_min - 1) v []
+      h_iter_writer' h_writer_no_early h_writer_nodup
+      (fun _ _ _ h => absurd h (by simp))
+  simp only [List.foldr_nil] at h_cyclePath_raw
+  -- 8. Construct OnCycle.
+  let path : List UInt32 :=
+    (List.range ((k_min - 1) + 1)).map (fun i => (iterWriter i v es).getD 0)
+  have h_path_def : path = (List.range ((k_min - 1) + 1)).map
+      (fun i => (iterWriter i v es).getD 0) := rfl
+  refine ⟨path, ?_, ?_, ?_, h_cyclePath_raw⟩
+  · -- path ≠ []
+    rw [h_path_def]
+    intro h
+    have h_len : ((List.range ((k_min - 1) + 1)).map
+        (fun i => (iterWriter i v es).getD 0)).length = 0 := by rw [h]; simp
+    simp at h_len
+  · -- path.head? = some v
+    rw [h_path_def]
+    rw [List.range_succ_eq_map]
+    simp [List.map_map]
+  · -- path.Nodup via pairwise_map.
+    rw [h_path_def]
+    rw [List.Nodup, List.pairwise_map]
+    apply List.nodup_range.imp_of_mem
+    intro a b h_a_mem h_b_mem h_ne
+    rw [List.mem_range] at h_a_mem h_b_mem
+    -- h_a_mem : a < (k_min - 1) + 1; same for b.
+    have h_a_le : a ≤ k_min - 1 := by omega
+    have h_b_le : b ≤ k_min - 1 := by omega
+    -- WLOG a < b. h_ne gives a ≠ b; case-split on which.
+    by_cases h_a_lt_b : a < b
+    · have h_iter_ne := h_writer_nodup a b h_a_le h_b_le h_a_lt_b
+      -- Both iterWriter values are some.
+      have h_a_iter := iterWriter_eq_iterForward_reverse es hWF v k_min h_k_min_iter a
+        (by omega)
+      have h_b_iter := iterWriter_eq_iterForward_reverse es hWF v k_min h_k_min_iter b
+        (by omega)
+      obtain ⟨w_a, h_a_some, _⟩ := iterForward_in_dsts es h_no_leaves v h_v (k_min - a)
+      obtain ⟨w_b, h_b_some, _⟩ := iterForward_in_dsts es h_no_leaves v h_v (k_min - b)
+      have h_wa : iterWriter a v es = some w_a := by rw [h_a_iter]; exact h_a_some
+      have h_wb : iterWriter b v es = some w_b := by rw [h_b_iter]; exact h_b_some
+      rw [h_wa, h_wb] at h_iter_ne ⊢
+      intro h_eq
+      simp at h_eq
+      exact h_iter_ne (by rw [h_eq])
+    · have h_b_lt_a : b < a := by omega
+      have h_iter_ne := h_writer_nodup b a h_b_le h_a_le h_b_lt_a
+      have h_a_iter := iterWriter_eq_iterForward_reverse es hWF v k_min h_k_min_iter a
+        (by omega)
+      have h_b_iter := iterWriter_eq_iterForward_reverse es hWF v k_min h_k_min_iter b
+        (by omega)
+      obtain ⟨w_a, h_a_some, _⟩ := iterForward_in_dsts es h_no_leaves v h_v (k_min - a)
+      obtain ⟨w_b, h_b_some, _⟩ := iterForward_in_dsts es h_no_leaves v h_v (k_min - b)
+      have h_wa : iterWriter a v es = some w_a := by rw [h_a_iter]; exact h_a_some
+      have h_wb : iterWriter b v es = some w_b := by rw [h_b_iter]; exact h_b_some
+      rw [h_wa, h_wb] at h_iter_ne ⊢
+      intro h_eq
+      simp at h_eq
+      exact h_iter_ne (by rw [h_eq])
+
 /-! ## phase2_sound: phase 2 realizes the parallel block for all-cycle inputs -/
 
 /-- Phase 2's central correctness lemma. For all-cycle `es` (every dst on
