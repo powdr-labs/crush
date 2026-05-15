@@ -141,13 +141,13 @@ fn process_node<'a, 'b, S: Settings<'a>>(
 
     //// DEBUG ////
     /*if func_idx == 4 {
-        let newly_live_values = BTreeSet::from_iter(newly_live_values.iter().copied());
+        let newly_live_values = BTreeSet::from_iter(reg_changes.newly_live.iter().copied());
         let new_ranges = occupation_tracker
             .active()
             .filter(|range| newly_live_values.contains(&range.regs.start))
             .collect_vec();
         println!(
-            "## {node_idx} ## {operation:?}, new regs: {}, dying regs: {dying_regs:?}",
+            "## {node_idx} ## {operation:?}, new regs: {}, dying regs: {:?}",
             new_ranges
                 .into_iter()
                 .map(|range| {
@@ -157,7 +157,8 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                     )
                 })
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            reg_changes.dying
         );
     }*/
 
@@ -288,6 +289,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
         Operation::Br(break_target) => {
             assert!(reg_changes.newly_live.is_empty());
             assert!(reg_changes.ephemeral.is_empty());
+
             let jump_directives = emit_jump(
                 s,
                 &mut ctx,
@@ -964,7 +966,8 @@ fn drop_regs_and_copy_inputs<'a, S: Settings<'a>>(
 ///
 /// This function emits the copy instructions for the inputs that are not
 /// already at the expected locations, and the drops for the inputs are
-/// no longer used after the copy.
+/// no longer used after the copy. It also cleans the dying regs of registers
+/// that can't be dropped because they are expected in that place as input.
 ///
 /// Dying registers that are not related to the copy are left in `dying_regs`.
 fn copy_inputs_if_needed<'a, S: Settings<'a>>(
@@ -978,16 +981,14 @@ fn copy_inputs_if_needed<'a, S: Settings<'a>>(
         .iter()
         .zip_eq(expected_locations)
         .filter_map(|(input, destiny)| {
-            let source = input.as_register().unwrap().clone();
-            if source != destiny {
-                Some((source, destiny))
-            } else {
-                // If the input is already at the expected location, it can't be dropped.
-                for reg in destiny {
-                    dying_regs.remove(&reg);
-                }
-                None
+            // Any register that is in the destiny range can't be dropped after
+            // the copy is complete.
+            for reg in destiny.clone() {
+                dying_regs.remove(&reg);
             }
+
+            let source = input.as_register().unwrap().clone();
+            (source != destiny).then_some((source, destiny))
         })
         .collect_vec();
 
@@ -1002,16 +1003,12 @@ fn copy_inputs_if_needed<'a, S: Settings<'a>>(
     // post_drops is defined as (dying_regs ∩ source regs) - destination regs.
     // I.e. everything that is read that isn't colocated with the output set.
     let mut post_drops = BTreeSet::new();
-    for (input, _) in &copy_set {
-        for reg in input.clone() {
+    for (source, _) in &copy_set {
+        for reg in source.clone() {
+            // Set a dying register to be dropped.
             if dying_regs.remove(&reg) {
                 post_drops.insert(reg);
             }
-        }
-    }
-    for (_, dest) in &copy_set {
-        for reg in dest.clone() {
-            post_drops.remove(&reg);
         }
     }
 

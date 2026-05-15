@@ -145,6 +145,7 @@ pub struct PerNodeOccupation {
     active_allocs: BinaryHeap<RangeReg>,
 }
 
+#[derive(Debug)]
 pub struct NodeRegChanges {
     pub node_index: usize,
     pub dying: BTreeSet<u32>,
