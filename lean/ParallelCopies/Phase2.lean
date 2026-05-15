@@ -2531,6 +2531,136 @@ theorem iterForward_eq_backward
       have h_eq_uw : u = w := hWF u w out h_mem_u h_mem_w
       rw [h_eq_uw]
 
+/-! ## Pigeonhole helper -/
+
+/-- A non-Nodup list has a duplicate at two distinct positions. -/
+private theorem not_nodup_has_duplicate :
+    ∀ (L : List UInt32), ¬ L.Nodup →
+      ∃ (i j : Nat), i < j ∧ j < L.length ∧
+        ∃ (h_i : i < L.length) (h_j : j < L.length),
+          L.get ⟨i, h_i⟩ = L.get ⟨j, h_j⟩
+  | [], h => absurd List.nodup_nil h
+  | a :: rest, h => by
+    rw [List.nodup_cons] at h
+    match Classical.em (a ∈ rest) with
+    | Or.inl h_a_mem =>
+      obtain ⟨k, h_k⟩ := List.mem_iff_get.mp h_a_mem
+      have h_k_lt : k.val < rest.length := k.isLt
+      have h_len : (a :: rest).length = rest.length + 1 := by simp
+      refine ⟨0, k.val + 1, Nat.zero_lt_succ _, ?_, ?_, ?_, ?_⟩
+      · rw [h_len]; omega
+      · rw [h_len]; omega
+      · rw [h_len]; omega
+      · show a = rest.get ⟨k.val, h_k_lt⟩
+        exact h_k.symm
+    | Or.inr h_a_notin =>
+      have h_rest_not_nodup : ¬ rest.Nodup := by
+        intro hN; exact h ⟨h_a_notin, hN⟩
+      obtain ⟨i, j, h_lt, h_j_lt, h_i_lt, h_j_lt', h_eq⟩ :=
+        not_nodup_has_duplicate rest h_rest_not_nodup
+      refine ⟨i + 1, j + 1, by omega, by simp; omega,
+              by simp; omega, by simp; omega, ?_⟩
+      simp
+      exact h_eq
+
+/-- If a function `f : Nat → UInt32` produces `n+1` values all in a Nodup
+    list of length `≤ n`, then two of those values are equal. -/
+private theorem nat_func_pigeonhole
+    (n : Nat) (f : Nat → UInt32) (S : List UInt32) (h_S_nodup : S.Nodup)
+    (h_S_len : S.length ≤ n) (h_in : ∀ i ≤ n, f i ∈ S) :
+    ∃ i j : Nat, i < j ∧ j ≤ n ∧ f i = f j := by
+  have h_L_in_S : ∀ a ∈ (List.range (n + 1)).map f, a ∈ S := by
+    intro a h_a
+    rw [List.mem_map] at h_a
+    obtain ⟨i, h_i_range, h_i_eq⟩ := h_a
+    rw [List.mem_range] at h_i_range
+    rw [← h_i_eq]
+    exact h_in i (by omega)
+  have h_L_len : ((List.range (n + 1)).map f).length = n + 1 := by simp
+  have h_L_not_nodup : ¬ ((List.range (n + 1)).map f).Nodup := by
+    intro h_nodup
+    have h_le : ((List.range (n + 1)).map f).length ≤ S.length :=
+      nodup_subset_length_le _ _ h_nodup h_L_in_S
+    omega
+  obtain ⟨i, j, h_lt, h_j_lt, h_i_h, h_j_h, h_eq⟩ :=
+    not_nodup_has_duplicate _ h_L_not_nodup
+  refine ⟨i, j, h_lt, ?_, ?_⟩
+  · -- j ≤ n from j < n + 1
+    simp at h_j_lt
+    omega
+  · -- ((List.range (n+1)).map f).get ⟨i, _⟩ = f i
+    have h_get_i : ((List.range (n + 1)).map f).get ⟨i, h_i_h⟩ = f i := by
+      have : ((List.range (n + 1)).map f).get ⟨i, h_i_h⟩ =
+              f ((List.range (n + 1)).get ⟨i, by simp at h_i_h ⊢; exact h_i_h⟩) := by
+        simp
+      rw [this]
+      congr 1
+      simp
+    have h_get_j : ((List.range (n + 1)).map f).get ⟨j, h_j_h⟩ = f j := by
+      have : ((List.range (n + 1)).map f).get ⟨j, h_j_h⟩ =
+              f ((List.range (n + 1)).get ⟨j, by simp at h_j_h ⊢; exact h_j_h⟩) := by
+        simp
+      rw [this]
+      congr 1
+      simp
+    rw [h_get_i, h_get_j] at h_eq
+    exact h_eq
+
+/-! ## iterForward returns to v -/
+
+theorem iterForward_returns_to_v
+    (es : Edges) (hWF : UniqueDst es)
+    (h_no_leaves : findLeafEdge es = none)
+    (h_dsts_nodup : (es.map Prod.snd).Nodup)
+    (v : UInt32) (h_v : v ∈ es.map Prod.snd) :
+    ∃ k : Nat, 0 < k ∧ k ≤ es.length ∧ iterForward k v es = some v := by
+  -- f i = (iterForward i v es).get! (the underlying UInt32 value).
+  have h_all_some : ∀ i : Nat, ∃ w, iterForward i v es = some w ∧
+      w ∈ es.map Prod.snd := fun i =>
+    iterForward_in_dsts es h_no_leaves v h_v i
+  let f : Nat → UInt32 := fun i => (h_all_some i).choose
+  have h_f : ∀ i, iterForward i v es = some (f i) ∧
+      f i ∈ es.map Prod.snd := fun i => (h_all_some i).choose_spec
+  -- Apply pigeonhole: f produces es.length + 1 values, all in es.map snd (Nodup, len = es.length).
+  have h_dsts_len : (es.map Prod.snd).length = es.length := List.length_map _
+  have h_pigeon :=
+    nat_func_pigeonhole es.length f (es.map Prod.snd) h_dsts_nodup
+      (by omega) (fun i _ => (h_f i).2)
+  obtain ⟨a, b, h_a_lt_b, h_b_le, h_eq⟩ := h_pigeon
+  -- iterForward a = some (f a) = some (f b) = iterForward b
+  have h_iter_eq : iterForward a v es = iterForward b v es := by
+    rw [(h_f a).1, (h_f b).1]
+    rw [h_eq]
+  -- Use iterForward_eq_backward iteratively.
+  -- After (a) backward applications, iterForward 0 v es = iterForward (b - a) v es.
+  -- iterForward 0 v es = some v, so iterForward (b - a) v es = some v.
+  have h_collapse : ∀ k : Nat, k ≤ a →
+      iterForward (a - k) v es = iterForward (b - k) v es := by
+    intro k h_k
+    induction k with
+    | zero => simpa using h_iter_eq
+    | succ m ih =>
+      have h_m_le : m ≤ a := by omega
+      have ih' := ih h_m_le
+      have h_a_pos : 0 < a - m := by omega
+      have h_b_pos : 0 < b - m := by omega
+      have ⟨w, h_a_some⟩ : ∃ w, iterForward (a - m) v es = some w := by
+        obtain ⟨w, h, _⟩ := h_all_some (a - m)
+        exact ⟨w, h⟩
+      have h_b_some : iterForward (b - m) v es = some w := by
+        rw [← ih']; exact h_a_some
+      have h_prev_eq :=
+        iterForward_eq_backward es hWF v (a - m) (b - m) h_a_pos h_b_pos w
+          h_a_some h_b_some
+      have h_eq1 : a - m - 1 = a - (m + 1) := by omega
+      have h_eq2 : b - m - 1 = b - (m + 1) := by omega
+      rw [← h_eq1, ← h_eq2]; exact h_prev_eq
+  have h_at_0 := h_collapse a (Nat.le_refl _)
+  rw [show a - a = 0 from by omega] at h_at_0
+  rw [iterForward_zero] at h_at_0
+  refine ⟨b - a, by omega, ?_, h_at_0.symm⟩
+  · omega
+
 /-! ## phase1 fixpoint: no leaves remain -/
 
 /-- With sufficient fuel, phase 1 reaches a state where no leaves remain. -/
