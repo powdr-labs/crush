@@ -2286,6 +2286,138 @@ theorem phase1_preserves_no_self :
       exact phase1_preserves_no_self n (peelStep s d es) (acc ++ [(s, d)])
         (peelStep_no_self s d es h)
 
+/-! ## peelStep preserves no-duplicate destinations -/
+
+/-- The destinations of `peelStep s d es` are a sublist of those of `es`
+    (peeling only drops or rewrites edges; it doesn't change which dsts
+    appear, except for dropping `d`'s entry when `(s, d) ∈ es`). -/
+theorem peelStep_dsts_sublist (s d : UInt32) (es : List Edge) :
+    List.Sublist ((peelStep s d es).map Prod.snd) (es.map Prod.snd) := by
+  induction es with
+  | nil => simp [peelStep]
+  | cons e rest ih =>
+    unfold peelStep
+    by_cases h_e_eq : e = (s, d)
+    · simp [h_e_eq]
+      exact List.Sublist.cons _ ih
+    · simp only [h_e_eq, if_false]
+      by_cases h_s : e.1 = s
+      · simp only [h_s, if_true, List.map_cons]
+        exact List.Sublist.cons₂ _ ih
+      · simp only [h_s, if_false, List.map_cons]
+        exact List.Sublist.cons₂ _ ih
+
+/-- `(peelStep s d es).map Prod.snd` inherits Nodup from `es.map Prod.snd`. -/
+theorem peelStep_dsts_nodup
+    (s d : UInt32) (es : List Edge) (h_nodup : (es.map Prod.snd).Nodup) :
+    ((peelStep s d es).map Prod.snd).Nodup :=
+  h_nodup.sublist (peelStep_dsts_sublist s d es)
+
+/-- Phase 1 preserves Nodup-on-dsts. -/
+theorem phase1_preserves_dsts_nodup :
+    ∀ (fuel : Nat) (es : Edges) (acc : List Edge)
+      (_ : (es.map Prod.snd).Nodup),
+      ((phase1 fuel es acc).1.map Prod.snd).Nodup
+  | 0,     es, acc, h => by simpa [phase1]
+  | n + 1, es, acc, h => by
+    unfold phase1
+    cases h_find : findLeafEdge es with
+    | none => simpa
+    | some pair =>
+      obtain ⟨s, d⟩ := pair
+      simp only
+      exact phase1_preserves_dsts_nodup n (peelStep s d es) (acc ++ [(s, d)])
+        (peelStep_dsts_nodup s d es h)
+
+/-! ## Counting: Nodup A ⊆ B with |A| = |B| implies B ⊆ A -/
+
+/-- A Nodup list whose elements are all in another list of equal length spans
+    the other list. -/
+private theorem nodup_subset_same_length_eq
+    (A B : List UInt32) (hA : A.Nodup)
+    (h_sub : ∀ a ∈ A, a ∈ B)
+    (h_len : A.length = B.length) :
+    ∀ b ∈ B, b ∈ A := by
+  intro b h_b
+  match Classical.em (b ∈ A) with
+  | Or.inl h => exact h
+  | Or.inr h_notin =>
+    exfalso
+    have h_sub' : ∀ a ∈ A, a ∈ B.erase b := by
+      intro a h_a
+      have h_a_in_B : a ∈ B := h_sub a h_a
+      have h_a_ne_b : a ≠ b := by
+        intro heq; rw [heq] at h_a; exact h_notin h_a
+      rw [List.mem_erase_of_ne h_a_ne_b]
+      exact h_a_in_B
+    have h_le : A.length ≤ (B.erase b).length :=
+      nodup_subset_length_le _ _ hA h_sub'
+    have h_erase_len : (B.erase b).length = B.length - 1 := by
+      rw [List.length_erase]; simp [h_b]
+    have h_B_pos : 0 < B.length := by
+      cases B with
+      | nil => simp at h_b
+      | cons => simp
+    omega
+
+/-! ## Phase 1 fixpoint: srcs ⊆ dsts (no roots) -/
+
+/-- `findLeafEdge es = none` iff every dst is also a src in es. -/
+theorem findLeafEdge_eq_none_iff (es : Edges) :
+    findLeafEdge es = none ↔ ∀ d ∈ es.map Prod.snd, d ∈ es.map Prod.fst := by
+  unfold findLeafEdge
+  rw [List.find?_eq_none]
+  constructor
+  · -- forward: ∀ e, ¬ isLeaf e.2 es  →  every dst is also a src
+    intro h d h_d
+    rw [List.mem_map] at h_d
+    obtain ⟨e, h_e_mem, h_e_eq⟩ := h_d
+    have h_e_decide := h e h_e_mem
+    have h_e_not_leaf : ¬ isLeaf e.2 es = true := by
+      intro hcontra
+      exact h_e_decide (by simp [hcontra])
+    rw [isLeaf_iff] at h_e_not_leaf
+    -- h_e_not_leaf says ¬ ∀ e' ∈ es, e'.1 ≠ e.2
+    -- So ∃ e' ∈ es, e'.1 = e.2 (some edge has e.2 as source)
+    have h_exists : ∃ e' ∈ es, e'.1 = e.2 := by
+      match Classical.em (∃ e' ∈ es, e'.1 = e.2) with
+      | Or.inl h => exact h
+      | Or.inr h_nex =>
+        exfalso
+        apply h_e_not_leaf
+        intro e' h_e' h_src_eq
+        apply h_nex
+        exact ⟨e', h_e', h_src_eq⟩
+    obtain ⟨e_src, h_e_src_mem, h_e_src_eq⟩ := h_exists
+    rw [← h_e_eq]
+    rw [List.mem_map]
+    exact ⟨e_src, h_e_src_mem, h_e_src_eq⟩
+  · -- backward: every dst is also a src  →  ¬ isLeaf e.2 es for all e ∈ es
+    intro h e h_e
+    intro h_leaf_eq_true
+    rw [isLeaf_iff] at h_leaf_eq_true
+    have h_e2_dst : e.2 ∈ es.map Prod.snd :=
+      List.mem_map.mpr ⟨e, h_e, rfl⟩
+    have h_e2_src : e.2 ∈ es.map Prod.fst := h e.2 h_e2_dst
+    rw [List.mem_map] at h_e2_src
+    obtain ⟨e', h_e'_mem, h_e'_eq⟩ := h_e2_src
+    exact h_leaf_eq_true e' h_e'_mem h_e'_eq
+
+/-- At phase 1's fixpoint (no leaves), every src is also a dst. -/
+theorem srcs_subset_dsts_of_no_leaves
+    (es : Edges) (hWF : UniqueDst es)
+    (h_dsts_nodup : (es.map Prod.snd).Nodup)
+    (h_no_leaves : findLeafEdge es = none) :
+    ∀ s ∈ es.map Prod.fst, s ∈ es.map Prod.snd := by
+  intro s h_s
+  have h_dsts_sub_srcs : ∀ d ∈ es.map Prod.snd, d ∈ es.map Prod.fst :=
+    (findLeafEdge_eq_none_iff es).mp h_no_leaves
+  have h_dsts_len : (es.map Prod.snd).length = es.length := List.length_map _
+  have h_srcs_len : (es.map Prod.fst).length = es.length := List.length_map _
+  have h_eq_len : (es.map Prod.snd).length = (es.map Prod.fst).length := by
+    rw [h_dsts_len, h_srcs_len]
+  exact nodup_subset_same_length_eq _ _ h_dsts_nodup h_dsts_sub_srcs h_eq_len s h_s
+
 /-! ## phase1 fixpoint: no leaves remain -/
 
 /-- With sufficient fuel, phase 1 reaches a state where no leaves remain. -/
