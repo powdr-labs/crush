@@ -3375,6 +3375,113 @@ theorem preprocess_uniqueDst
   have h_ne2 : s₂ ≠ d := preprocess_no_self pairs (s₂, d) h_m2
   exact (preprocess_wellFormedL pairs h) s₁ s₂ d h_ne1 h_ne2 h_m1 h_m2
 
+/-! ## preprocess applies same parallel semantics -/
+
+/-- Every non-self-loop edge of pairs is in `preprocess pairs`.
+    (preprocess keeps the first occurrence of each (s, d) with s ≠ d.) -/
+theorem mem_preprocess_of_mem :
+    ∀ (pairs : List Edge) (s r : UInt32),
+      (s, r) ∈ pairs → s ≠ r → (s, r) ∈ preprocess pairs
+  | [], _, _, h, _ => by simp at h
+  | (s', d') :: rest, s, r, h, h_ne => by
+    simp only [preprocess]
+    rcases List.mem_cons.mp h with heq | hmem
+    · -- e = (s', d') = (s, r). So s' = s, d' = r.
+      injection heq with h1 h2
+      subst h1; subst h2
+      -- We have s ≠ r.
+      by_cases h_self : s = r
+      · exact absurd h_self h_ne
+      · rw [if_neg h_self]
+        by_cases h_dup : (preprocess rest).contains (s, r) = true
+        · rw [if_pos h_dup]
+          rw [List.contains_iff_mem] at h_dup
+          exact h_dup
+        · rw [if_neg h_dup]
+          exact List.mem_cons_self
+    · -- (s, r) ∈ rest. By IH, (s, r) ∈ preprocess rest.
+      have h_ih := mem_preprocess_of_mem rest s r hmem h_ne
+      by_cases h_self : s' = d'
+      · rw [if_pos h_self]; exact h_ih
+      · rw [if_neg h_self]
+        by_cases h_dup : (preprocess rest).contains (s', d') = true
+        · rw [if_pos h_dup]; exact h_ih
+        · rw [if_neg h_dup]
+          exact List.mem_cons_of_mem _ h_ih
+
+/-- find? on a list under WellFormedL returns the unique writer (if it exists). -/
+private theorem find?_eq_some_under_wfl
+    (pairs : List Edge) (h_wf : WellFormedL pairs)
+    (r s : UInt32) (h_mem : (s, r) ∈ pairs) (h_ne : s ≠ r) :
+    pairs.find? (Pair.appliesTo · r) = some (s, r) := by
+  induction pairs with
+  | nil => simp at h_mem
+  | cons p rest ih =>
+    have h_wf_rest : WellFormedL rest := wellFormedL_cons h_wf
+    obtain ⟨s', d'⟩ := p
+    rw [List.find?_cons]
+    by_cases h_app : Pair.appliesTo (s', d') r = true
+    · rw [h_app]
+      rw [Pair.appliesTo_iff] at h_app
+      obtain ⟨h_d, h_s⟩ := h_app
+      have h_d_eq : d' = r := h_d
+      -- After subst: d' is replaced by r everywhere.
+      cases h_d_eq
+      -- Now h_s : s' ≠ r, p = (s', r).
+      have h_head : (s', r) ∈ (s', r) :: rest := List.mem_cons_self
+      have h_eq : s' = s := h_wf s' s r h_s h_ne h_head h_mem
+      rw [h_eq]
+    · have h_app_false : Pair.appliesTo (s', d') r = false := by
+        cases h_eq : Pair.appliesTo (s', d') r with
+        | true  => exact absurd h_eq h_app
+        | false => rfl
+      rw [h_app_false]
+      rcases List.mem_cons.mp h_mem with heq | hmem
+      · exfalso
+        injection heq with h1 h2
+        subst h1; subst h2
+        apply h_app
+        simp [Pair.appliesTo, h_ne]
+      · exact ih h_wf_rest hmem
+
+/-- find? on a list with no non-self writer returns none. -/
+private theorem find?_eq_none_no_writer
+    (pairs : List Edge) (r : UInt32)
+    (h : ¬ ∃ s, (s, r) ∈ pairs ∧ s ≠ r) :
+    pairs.find? (Pair.appliesTo · r) = none := by
+  rw [List.find?_eq_none]
+  intro e h_e_mem h_app
+  obtain ⟨s, d⟩ := e
+  rw [Pair.appliesTo_iff] at h_app
+  obtain ⟨h_d_eq, h_s_ne⟩ := h_app
+  simp only at h_d_eq h_s_ne
+  have h_d_eq_r : d = r := h_d_eq
+  subst h_d_eq_r
+  exact h ⟨s, h_e_mem, h_s_ne⟩
+
+/-- The "writer at r" is the same in pairs and preprocess (under WellFormedL). -/
+theorem applyParallelLS_preprocess_eq
+    (pairs : List Edge) (h_wf : WellFormedL pairs) (σ : SState) (r : UInt32) :
+    applyParallelLS (preprocess pairs) σ (.given r) =
+      applyParallelLS pairs σ (.given r) := by
+  show (match (preprocess pairs).find? (Pair.appliesTo · r) with
+        | some (src, _) => σ (.given src)
+        | none          => σ (.given r)) =
+       (match pairs.find? (Pair.appliesTo · r) with
+        | some (src, _) => σ (.given src)
+        | none          => σ (.given r))
+  by_cases h_writer : ∃ s, (s, r) ∈ pairs ∧ s ≠ r
+  · obtain ⟨s, h_mem, h_ne⟩ := h_writer
+    have h_mem_pre : (s, r) ∈ preprocess pairs := mem_preprocess_of_mem pairs s r h_mem h_ne
+    have h_wf_pre : WellFormedL (preprocess pairs) := preprocess_wellFormedL pairs h_wf
+    rw [find?_eq_some_under_wfl pairs h_wf r s h_mem h_ne]
+    rw [find?_eq_some_under_wfl (preprocess pairs) h_wf_pre r s h_mem_pre h_ne]
+  · have h_no_writer_pre : ¬ ∃ s, (s, r) ∈ preprocess pairs ∧ s ≠ r := by
+      intro ⟨s, h_s, h_ne⟩
+      exact h_writer ⟨s, preprocess_subset pairs (s, r) h_s, h_ne⟩
+    rw [find?_eq_none_no_writer pairs r h_writer]
+    rw [find?_eq_none_no_writer (preprocess pairs) r h_no_writer_pre]
+
 /-! ## phase2_sound: phase 2 realizes the parallel block for all-cycle inputs -/
 
 /-- Phase 2's central correctness lemma. For all-cycle `es` (every dst on
