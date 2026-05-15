@@ -1526,6 +1526,84 @@ private theorem mem_dsts_of_edge_mem
   rw [List.mem_map]
   exact ⟨(s, r), h, rfl⟩
 
+/-! ## Cycle uniqueness via writer chain determinism
+
+The writer chain `srcOf?` is deterministic, so cycles sharing any node must
+be the same cycle (as sets). We use this to prove that the residual after
+breakOneCycle still satisfies `AllOnCycle`. -/
+
+/-- `srcOf?` is the unique writer (under `UniqueDst`). -/
+theorem srcOf?_eq_some_of_mem
+    (es : Edges) (s r : UInt32) (hWF : UniqueDst es) (h_mem : (s, r) ∈ es) :
+    srcOf? r es = some s := by
+  unfold srcOf?
+  have h_find : es.find? (fun e => e.2 = r) = some (s, r) := by
+    induction es with
+    | nil => simp at h_mem
+    | cons e rest ih =>
+      have hWF' : UniqueDst rest := UniqueDst_cons hWF
+      rcases List.mem_cons.mp h_mem with heq | hmem'
+      · subst heq; simp [List.find?_cons]
+      · obtain ⟨a, b⟩ := e
+        by_cases h_e_r : b = r
+        · -- (a, b) and (s, r) both have dst b = r. By UniqueDst, a = s.
+          subst h_e_r
+          have hh := hWF a s b List.mem_cons_self (List.mem_cons_of_mem _ hmem')
+          subst hh
+          simp [List.find?_cons]
+        · simp only [List.find?_cons, h_e_r, ↓reduceIte]
+          exact ih hWF' hmem'
+  rw [h_find]; rfl
+
+/-- The writer of any `cycleOf` node is also in `cycleOf` (under UniqueDst). -/
+theorem cycleOf_closed_under_writer
+    (start : UInt32) (es : Edges) (hC : OnCycle start es)
+    (hWF : UniqueDst es)
+    (v : UInt32) (h_v : v ∈ cycleOf start es hC) :
+    ∃ u, srcOf? v es = some u ∧ u ∈ cycleOf start es hC := by
+  unfold cycleOf at h_v ⊢
+  obtain ⟨_, h_head, _, h_path⟩ := hC.choose_spec
+  -- v is at some index i in cycleOf. The writer is the (i+1)-th element
+  -- if i < length-1, else `start`.
+  obtain ⟨n, h_get⟩ := List.mem_iff_get.mp h_v
+  let i := n.val
+  have hi : i < hC.choose.length := n.isLt
+  have h_get' : hC.choose.get ⟨i, hi⟩ = v := h_get
+  by_cases h_last : i + 1 < hC.choose.length
+  · -- non-last: writer is cycleOf[i+1]
+    have h_walk_eq : walkVisits hC.choose.length start start es = hC.choose :=
+      walkVisits_eq_of_onCycle start es hC hC.choose.length (Nat.le_refl _)
+    have h_mem_emit :
+        (hC.choose.get ⟨i + 1, h_last⟩, hC.choose.get ⟨i, hi⟩) ∈
+          walkEmits hC.choose.length start start es := by
+      rw [walkEmits_eq_consPairs_walkVisits, h_walk_eq]
+      exact consPairs_mem_pair hC.choose i h_last
+    have h_in_es : (hC.choose.get ⟨i + 1, h_last⟩, hC.choose.get ⟨i, hi⟩) ∈ es :=
+      walkEmits_subset_es _ _ _ _ _ h_mem_emit
+    rw [h_get'] at h_in_es
+    refine ⟨hC.choose.get ⟨i + 1, h_last⟩, ?_, List.get_mem _ _⟩
+    exact srcOf?_eq_some_of_mem es _ _ hWF h_in_es
+  · -- last position: writer is start
+    have h_i_eq : i = hC.choose.length - 1 := by
+      have : i < hC.choose.length := hi
+      omega
+    have h_ne_nil : hC.choose ≠ [] := hC.choose_spec.1
+    obtain ⟨_, _, h_nodup, _⟩ := hC.choose_spec
+    have h_get_eq_last : hC.choose.get ⟨i, hi⟩ = hC.choose.getLast! :=
+      (nodup_get_eq_getLast!_iff hC.choose h_nodup h_ne_nil i hi).mpr h_i_eq
+    have h_last_in_es : (start, hC.choose.getLast!) ∈ es :=
+      cyclePathTo_last_edge h_path
+    rw [← h_get', h_get_eq_last]
+    refine ⟨start, srcOf?_eq_some_of_mem es _ _ hWF h_last_in_es, ?_⟩
+    -- start is in cycleOf (it's the head)
+    cases h_choose : hC.choose with
+    | nil => exact absurd h_choose h_ne_nil
+    | cons a rest =>
+      rw [h_choose] at h_head
+      simp at h_head
+      subst h_head
+      exact List.mem_cons_self
+
 /-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
