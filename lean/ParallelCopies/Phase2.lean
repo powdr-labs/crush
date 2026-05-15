@@ -1898,6 +1898,79 @@ theorem allOnCycle_preserved_by_breakOneCycle
     exact h_disjoint v hv
   exact ⟨hD.choose, hD.choose_spec.1, h_head_D, h_nodup_D, h_path_lifted⟩
 
+/-! ## Cycle length is bounded by es.length -/
+
+/-- A Nodup list whose elements are all in another list is at most as long. -/
+private theorem nodup_subset_length_le
+    (A B : List UInt32) (h_nodup : A.Nodup) (h_sub : ∀ a ∈ A, a ∈ B) :
+    A.length ≤ B.length := by
+  induction A generalizing B with
+  | nil => exact Nat.zero_le _
+  | cons a rest ih =>
+    rw [List.nodup_cons] at h_nodup
+    have h_a_notin_rest : a ∉ rest := h_nodup.1
+    have h_rest_nodup : rest.Nodup := h_nodup.2
+    have h_a_in_B : a ∈ B := h_sub a List.mem_cons_self
+    have h_rest_sub_erase : ∀ r ∈ rest, r ∈ B.erase a := by
+      intro r hr
+      have h_r_in_B : r ∈ B := h_sub r (List.mem_cons_of_mem _ hr)
+      have h_r_ne_a : r ≠ a := by
+        intro heq; rw [heq] at hr; exact h_a_notin_rest hr
+      rw [List.mem_erase_of_ne h_r_ne_a]
+      exact h_r_in_B
+    have ih' := ih (B.erase a) h_rest_nodup h_rest_sub_erase
+    have h_erase_len : (B.erase a).length = B.length - 1 := by
+      rw [List.length_erase]; simp [h_a_in_B]
+    have h_B_pos : 0 < B.length := by
+      cases B with
+      | nil => simp at h_a_in_B
+      | cons => simp
+    simp only [List.length_cons]
+    omega
+
+/-- |cycleOf| ≤ |es| because cycleOf is Nodup and each element appears in es as a dst. -/
+theorem cycleOf_length_le
+    (start : UInt32) (es : Edges) (hC : OnCycle start es) :
+    (cycleOf start es hC).length ≤ es.length := by
+  unfold cycleOf
+  obtain ⟨_, _, h_nodup, h_path⟩ := hC.choose_spec
+  -- Build the list of all dsts in es; each cycle element is a dst.
+  have h_sub : ∀ a ∈ hC.choose, a ∈ es.map Prod.snd := by
+    intro a h_a
+    -- a is a node in the cycle. We can show a has a writer in es (by walking back).
+    -- For non-last position: writer is path[i+1]; (path[i+1], a) ∈ es.
+    -- For last position (a = path.last): writer is start; (start, a) ∈ es.
+    obtain ⟨n, h_get⟩ := List.mem_iff_get.mp h_a
+    let i := n.val
+    have hi : i < hC.choose.length := n.isLt
+    have h_get' : hC.choose.get ⟨i, hi⟩ = a := h_get
+    by_cases h_last : i + 1 < hC.choose.length
+    · have h_walk_eq : walkVisits hC.choose.length start start es = hC.choose :=
+        walkVisits_eq_of_onCycle start es hC hC.choose.length (Nat.le_refl _)
+      have h_mem_emit :
+          (hC.choose.get ⟨i + 1, h_last⟩, hC.choose.get ⟨i, hi⟩) ∈
+            walkEmits hC.choose.length start start es := by
+        rw [walkEmits_eq_consPairs_walkVisits, h_walk_eq]
+        exact consPairs_mem_pair hC.choose i h_last
+      have h_in_es : (hC.choose.get ⟨i + 1, h_last⟩, hC.choose.get ⟨i, hi⟩) ∈ es :=
+        walkEmits_subset_es _ _ _ _ _ h_mem_emit
+      rw [List.mem_map]
+      refine ⟨_, h_in_es, ?_⟩
+      exact h_get'
+    · have h_i_eq : i = hC.choose.length - 1 := by omega
+      have h_ne_nil : hC.choose ≠ [] := hC.choose_spec.1
+      have h_get_eq_last : hC.choose.get ⟨i, hi⟩ = hC.choose.getLast! :=
+        (nodup_get_eq_getLast!_iff hC.choose h_nodup h_ne_nil i hi).mpr h_i_eq
+      have h_last_in_es : (start, hC.choose.getLast!) ∈ es :=
+        cyclePathTo_last_edge h_path
+      rw [List.mem_map]
+      refine ⟨_, h_last_in_es, ?_⟩
+      rw [← h_get_eq_last]; exact h_get'
+  have h_bound : hC.choose.length ≤ (es.map Prod.snd).length :=
+    nodup_subset_length_le _ _ h_nodup h_sub
+  rw [List.length_map] at h_bound
+  exact h_bound
+
 /-! ## Filter preserves structural invariants -/
 
 theorem filter_uniqueDst
