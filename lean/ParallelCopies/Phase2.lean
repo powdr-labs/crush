@@ -1898,7 +1898,20 @@ theorem allOnCycle_preserved_by_breakOneCycle
     exact h_disjoint v hv
   exact ⟨hD.choose, hD.choose_spec.1, h_head_D, h_nodup_D, h_path_lifted⟩
 
-/-! ## Concrete proof: breakOneCycle handles a swap (2-cycle) correctly -/
+/-! ## Filter preserves structural invariants -/
+
+theorem filter_uniqueDst
+    (es : Edges) (p : Edge → Bool) (hWF : UniqueDst es) :
+    UniqueDst (es.filter p) := by
+  intro s₁ s₂ d hm1 hm2
+  exact hWF s₁ s₂ d
+    (List.mem_filter.mp hm1).1 (List.mem_filter.mp hm2).1
+
+theorem filter_no_self_loops
+    (es : Edges) (p : Edge → Bool) (h : ∀ e ∈ es, e.1 ≠ e.2) :
+    ∀ e ∈ es.filter p, e.1 ≠ e.2 :=
+  fun e he => h e (List.mem_filter.mp he).1
+
 
 /-- For a 2-cycle `[(a, b), (b, a)]` with `a ≠ b`, `breakOneCycle`
     starting at `a` produces a schedule whose sequential application
