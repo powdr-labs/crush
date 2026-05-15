@@ -140,4 +140,45 @@ theorem sequenceParallelCopies_correct_on_empty
       applyParallel #[] s r := by
   simp
 
+/-! ## Helper for phase1's residual length bound -/
+
+private theorem phase1_length_le :
+    ∀ (fuel : Nat) (es : Edges) (acc : List Edge),
+      (phase1 fuel es acc).1.length ≤ es.length
+  | 0, es, _ => by simp [phase1]
+  | n + 1, es, acc => by
+    unfold phase1
+    cases h_find : findLeafEdge es with
+    | none => simp
+    | some pair =>
+      obtain ⟨s, d⟩ := pair
+      simp only
+      calc (phase1 n (peelStep s d es) (acc ++ [(s, d)])).1.length
+          ≤ (peelStep s d es).length := phase1_length_le n _ _
+        _ ≤ es.length := peelStep_length_le s d es
+
+/-! ## Final theorem (assembly remains for future work)
+
+The pieces needed to assemble `RealisesParallel sequenceParallelCopies` are
+all in place — see Phase2.lean and the documentation block above for the
+catalog. The final assembly is a routine composition:
+
+```
+applySequentialL (sequenceParallelCopiesL pairs.toList) (lift s) (.given r)
+  = applySequentialL (phase2 ...) (applySequentialL nonCycle_mapped (lift s)) (.given r)
+                                              [foldl_append]
+  = applyParallelLS es_residual (applySequentialL nonCycle_mapped (lift s)) (.given r)
+                                              [phase2_sound, with AllOnCycle via
+                                               phase1_residual_allOnCycle]
+  = applyParallelLS preprocess(pairs.toList) (lift s) (.given r)
+                                              [phase1_sound]
+  = applyParallelLS pairs.toList (lift s) (.given r)
+                                              [applyParallelLS_preprocess_eq]
+  = applyParallelL pairs.toList s r              [lift unfolding]
+```
+
+The remaining mechanical work is threading the `let` bindings of
+`sequenceParallelCopiesL` through Lean's `generalize`/`obtain` tactics
+without losing pattern matches against the lemmas. -/
+
 end ParallelCopies
