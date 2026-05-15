@@ -2661,7 +2661,80 @@ theorem iterForward_returns_to_v
   refine ⟨b - a, by omega, ?_, h_at_0.symm⟩
   · omega
 
-/-! ## phase1 fixpoint: no leaves remain -/
+/-! ## Existence of minimal return-to-v -/
+
+/-- The minimal `k > 0` with `iterForward k v es = some v`, when one exists. -/
+private theorem iterForward_min_return
+    (es : Edges) (v : UInt32) :
+    ∀ (k : Nat) (_ : 0 < k) (_ : iterForward k v es = some v),
+      ∃ k_min : Nat, 0 < k_min ∧ k_min ≤ k ∧
+        iterForward k_min v es = some v ∧
+        ∀ j, 0 < j → j < k_min → iterForward j v es ≠ some v := by
+  intro k
+  induction k using Nat.strongRecOn with
+  | ind k ih =>
+    intro h_k_pos h_iter
+    by_cases h_any : ∃ j, 0 < j ∧ j < k ∧ iterForward j v es = some v
+    · obtain ⟨j, h_j_pos, h_j_lt, h_j_iter⟩ := h_any
+      obtain ⟨k_min, h_k_min_pos, h_k_min_le_j, h_k_min_iter, h_k_min_min⟩ :=
+        ih j h_j_lt h_j_pos h_j_iter
+      refine ⟨k_min, h_k_min_pos, ?_, h_k_min_iter, h_k_min_min⟩
+      omega
+    · refine ⟨k, h_k_pos, Nat.le_refl _, h_iter, ?_⟩
+      intro j h_j_pos h_j_lt h_j_iter
+      apply h_any
+      exact ⟨j, h_j_pos, h_j_lt, h_j_iter⟩
+
+/-! ## iterForward visits distinct nodes up to minimal return -/
+
+/-- Under no-leaves + UniqueDst + Nodup dsts: the forward chain produces
+    distinct values up to the minimal return-to-v step. -/
+private theorem iterForward_nodup_until_return
+    (es : Edges) (hWF : UniqueDst es)
+    (h_no_leaves : findLeafEdge es = none)
+    (h_dsts_nodup : (es.map Prod.snd).Nodup)
+    (v : UInt32) (h_v : v ∈ es.map Prod.snd)
+    (k_min : Nat) (h_k_pos : 0 < k_min)
+    (h_iter : iterForward k_min v es = some v)
+    (h_min : ∀ j, 0 < j → j < k_min → iterForward j v es ≠ some v) :
+    ∀ a b : Nat, a < k_min → b < k_min → a < b →
+      iterForward a v es ≠ iterForward b v es := by
+  intro a b h_a h_b h_a_lt_b h_eq
+  -- Both iterForward a v and iterForward b v are some (by iterForward_in_dsts).
+  obtain ⟨w_a, h_a_some, _⟩ := iterForward_in_dsts es h_no_leaves v h_v a
+  obtain ⟨w_b, h_b_some, _⟩ := iterForward_in_dsts es h_no_leaves v h_v b
+  rw [h_a_some, h_b_some] at h_eq
+  injection h_eq with h_w_eq
+  subst h_w_eq
+  -- Now both iterForward a, b v es = some w_a. Apply iterForward_eq_backward iteratively.
+  -- iterForward 0 v es = iterForward (b - a) v es (after a backward steps).
+  have h_collapse : ∀ k : Nat, k ≤ a →
+      iterForward (a - k) v es = iterForward (b - k) v es := by
+    intro k h_k
+    induction k with
+    | zero =>
+      simp
+      rw [h_a_some, h_b_some]
+    | succ m ih_m =>
+      have h_m_le : m ≤ a := by omega
+      have ih' := ih_m h_m_le
+      have h_a_pos : 0 < a - m := by omega
+      have h_b_pos : 0 < b - m := by omega
+      obtain ⟨w, h_a_w, _⟩ := iterForward_in_dsts es h_no_leaves v h_v (a - m)
+      have h_b_w : iterForward (b - m) v es = some w := by
+        rw [← ih']; exact h_a_w
+      have h_prev_eq :=
+        iterForward_eq_backward es hWF v (a - m) (b - m) h_a_pos h_b_pos w h_a_w h_b_w
+      rw [show a - m - 1 = a - (m + 1) from by omega] at h_prev_eq
+      rw [show b - m - 1 = b - (m + 1) from by omega] at h_prev_eq
+      exact h_prev_eq
+  have h_collapse_a := h_collapse a (Nat.le_refl _)
+  rw [show a - a = 0 from by omega] at h_collapse_a
+  rw [iterForward_zero] at h_collapse_a
+  -- iterForward (b - a) v es = some v. With 0 < b - a < k_min. Contradicts minimality.
+  have h_ba_pos : 0 < b - a := by omega
+  have h_ba_lt : b - a < k_min := by omega
+  exact h_min (b - a) h_ba_pos h_ba_lt h_collapse_a.symm
 
 /-- With sufficient fuel, phase 1 reaches a state where no leaves remain. -/
 theorem phase1_no_leaves
