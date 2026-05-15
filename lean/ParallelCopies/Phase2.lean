@@ -2804,6 +2804,21 @@ theorem iterWriter_of_iterForward :
       -- iterWriter k w' es = some v by IH.
       exact iterWriter_of_iterForward es hWF v w' k h_k
 
+/-! ## srcOf? through iterated eraseDst -/
+
+/-- `srcOf? curr` is unchanged by iterated `eraseDst` whose targets don't include `curr`. -/
+theorem srcOf?_foldr_eraseDst_ne :
+    ∀ (es : Edges) (erased : List UInt32) (curr : UInt32) (_ : curr ∉ erased),
+      srcOf? curr (erased.foldr eraseDst es) = srcOf? curr es
+  | _, [], _, _ => by simp
+  | es, e :: rest, curr, h_notin => by
+    simp only [List.foldr_cons]
+    have h_ne : curr ≠ e := by
+      intro heq; apply h_notin; rw [heq]; exact List.mem_cons_self
+    have h_notin_rest : curr ∉ rest := fun h => h_notin (List.mem_cons_of_mem _ h)
+    rw [srcOf?_eraseDst_ne _ _ _ h_ne]
+    exact srcOf?_foldr_eraseDst_ne es rest curr h_notin_rest
+
 /-! ## walkErased closes properly under our setup
 
 We show that under no-leaves, no-roots, UniqueDst, and `iterForward k v es = some v`,
@@ -2866,6 +2881,118 @@ theorem walkErasedClosesAt_imp_cyclePathTo :
         simp only [walkErased, hsrc, h_start, if_false]
         rw [h_tail] at h_inner ⊢
         exact CyclePathTo.step hsrc h_start h_inner
+
+/-! ## walkErasedClosesAt under iterWriter chain hypotheses -/
+
+/-- The full chain-tracing argument: under iterWriter (n+1) curr es = some start,
+    no-early-return, chain Nodup, and disjoint-from-erased, walkErasedClosesAt
+    holds in the erased-state. -/
+private theorem walkErasedClosesAt_chain_inductive
+    (es_orig : Edges) (hWF_orig : UniqueDst es_orig)
+    (start : UInt32) :
+    ∀ (n : Nat) (curr : UInt32) (erased : List UInt32),
+      iterWriter (n + 1) curr es_orig = some start →
+      (∀ j, 0 < j → j ≤ n → iterWriter j curr es_orig ≠ some start) →
+      (∀ i j, i ≤ n + 1 → j ≤ n + 1 → i < j →
+        iterWriter i curr es_orig ≠ iterWriter j curr es_orig) →
+      (∀ i, i ≤ n → ∀ e ∈ erased, iterWriter i curr es_orig ≠ some e) →
+      walkErasedClosesAt (n + 1) start curr (erased.foldr eraseDst es_orig)
+  | 0, curr, erased, h_iter, _, _, h_disjoint => by
+    -- iterWriter 1 curr es_orig = some start ⟹ srcOf? curr es_orig = some start.
+    rw [iterWriter_succ] at h_iter
+    simp at h_iter
+    -- iterWriter 1 curr = (iterWriter 0 curr).bind srcOf? = (some curr).bind srcOf? = srcOf? curr.
+    have h_src_orig : srcOf? curr es_orig = some start := h_iter
+    -- curr ∉ erased (by disjointness at i = 0).
+    have h_curr_notin : curr ∉ erased := by
+      intro h_e
+      have := h_disjoint 0 (Nat.le_refl _) curr h_e
+      apply this
+      rfl
+    -- srcOf? curr (foldr eraseDst es_orig) = srcOf? curr es_orig = some start.
+    have h_src_shrunk : srcOf? curr (erased.foldr eraseDst es_orig) = some start :=
+      (srcOf?_foldr_eraseDst_ne es_orig erased curr h_curr_notin).trans h_src_orig
+    simp [walkErasedClosesAt, h_src_shrunk]
+  | n + 1, curr, erased, h_iter, h_no_early, h_nodup, h_disjoint => by
+    -- iterWriter 1 curr = some w_1, w_1 ≠ start.
+    have h_iter_1 : iterWriter 1 curr es_orig ≠ some start :=
+      h_no_early 1 (by omega) (by omega)
+    -- Extract w_1: srcOf? curr es_orig = some w_1.
+    rw [iterWriter_succ] at h_iter_1
+    simp at h_iter_1
+    -- h_iter_1: srcOf? curr es_orig ≠ some start. So srcOf? curr es_orig is some w with w ≠ start.
+    cases h_src_orig : srcOf? curr es_orig with
+    | none =>
+      -- srcOf? curr = none ⟹ iterWriter k curr es_orig = none for all k ≥ 1.
+      exfalso
+      have h_iter_1_none : iterWriter 1 curr es_orig = none := by
+        rw [iterWriter_succ]; simp [h_src_orig]
+      have h_iter_succ_none : ∀ k, iterWriter (k + 1) curr es_orig = none := by
+        intro k
+        induction k with
+        | zero => exact h_iter_1_none
+        | succ m ih =>
+          rw [iterWriter_succ, ih]; simp
+      have := h_iter_succ_none (n + 1)
+      rw [this] at h_iter; simp at h_iter
+    | some w =>
+      have h_w_ne_start : w ≠ start := by
+        intro heq; rw [heq] at h_src_orig; rw [h_src_orig] at h_iter_1; exact h_iter_1 rfl
+      have h_curr_notin : curr ∉ erased := by
+        intro h_e
+        have := h_disjoint 0 (by omega) curr h_e
+        apply this; rfl
+      have h_src_shrunk : srcOf? curr (erased.foldr eraseDst es_orig) = some w :=
+        (srcOf?_foldr_eraseDst_ne es_orig erased curr h_curr_notin).trans h_src_orig
+      -- walkErasedClosesAt (n+2) start curr shrunk:
+      -- srcOf? curr shrunk = some w. w ≠ start. Recurse on (n+1) start w (eraseDst curr shrunk).
+      show walkErasedClosesAt (n + 1 + 1) start curr (erased.foldr eraseDst es_orig)
+      simp only [walkErasedClosesAt, h_src_shrunk, h_w_ne_start, ↓reduceIte]
+      -- The recursive call: walkErasedClosesAt (n+1) start w (eraseDst curr (foldr ...))
+      -- = walkErasedClosesAt (n+1) start w ((curr :: erased).foldr eraseDst es_orig).
+      have h_eq_eraseDst :
+          eraseDst curr (erased.foldr eraseDst es_orig) =
+          (curr :: erased).foldr eraseDst es_orig := by
+        simp [List.foldr_cons]
+      rw [h_eq_eraseDst]
+      -- Apply IH with curr := w, erased := curr :: erased.
+      apply walkErasedClosesAt_chain_inductive es_orig hWF_orig start n w (curr :: erased)
+      · -- iterWriter (n+1) w es_orig = some start.
+        -- We have iterWriter (n+2) curr = (iterWriter 1 curr).bind iterWriter n
+        -- = (some w).bind ... = iterWriter (n+1) w via shift. Let's use shift.
+        have h_shift : iterWriter (n + 2) curr es_orig = iterWriter (n + 1) w es_orig :=
+          iterWriter_one_then (n + 1) curr w es_orig h_src_orig
+        rw [show n + 1 + 1 = n + 2 from rfl] at h_iter
+        rw [h_shift] at h_iter
+        exact h_iter
+      · -- no early return for w's chain at j ≤ n
+        intro j h_j_pos h_j_le h_eq
+        have h_shift : iterWriter j w es_orig = iterWriter (j + 1) curr es_orig :=
+          (iterWriter_one_then j curr w es_orig h_src_orig).symm
+        rw [h_shift] at h_eq
+        exact h_no_early (j + 1) (by omega) (by omega) h_eq
+      · -- Nodup of w's chain at indices ≤ n+1
+        intro i j h_i h_j h_lt h_eq
+        have h_shift_i : iterWriter i w es_orig = iterWriter (i + 1) curr es_orig :=
+          (iterWriter_one_then i curr w es_orig h_src_orig).symm
+        have h_shift_j : iterWriter j w es_orig = iterWriter (j + 1) curr es_orig :=
+          (iterWriter_one_then j curr w es_orig h_src_orig).symm
+        rw [h_shift_i, h_shift_j] at h_eq
+        exact h_nodup (i + 1) (j + 1) (by omega) (by omega) (by omega) h_eq
+      · -- disjointness: w's chain at i ≤ n, e ∈ curr :: erased
+        intro i h_i e h_e h_eq
+        have h_shift : iterWriter i w es_orig = iterWriter (i + 1) curr es_orig :=
+          (iterWriter_one_then i curr w es_orig h_src_orig).symm
+        rw [h_shift] at h_eq
+        rcases List.mem_cons.mp h_e with h_e_curr | h_e_rest
+        · -- e = curr. iterWriter (i+1) curr = some e = some curr = iterWriter 0 curr.
+          rw [h_e_curr] at h_eq
+          have h_iter0 : iterWriter 0 curr es_orig = some curr := rfl
+          have h_nodup_i := h_nodup 0 (i + 1) (by omega) (by omega) (by omega)
+          rw [h_iter0] at h_nodup_i
+          exact h_nodup_i h_eq.symm
+        · -- e ∈ erased. iterWriter (i+1) curr ≠ some e from h_disjoint.
+          exact h_disjoint (i + 1) (by omega) e h_e_rest h_eq
 
 /-! ## phase2_sound: phase 2 realizes the parallel block for all-cycle inputs -/
 
