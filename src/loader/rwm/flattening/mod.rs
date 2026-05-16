@@ -5,6 +5,11 @@
 
 mod sequence_parallel_copies;
 
+#[cfg(test)]
+mod diff_tests;
+#[cfg(test)]
+mod legacy_reference;
+
 use itertools::Itertools;
 use wasmparser::{FuncType, Operator as Op, ValType};
 
