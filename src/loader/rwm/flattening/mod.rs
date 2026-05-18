@@ -420,7 +420,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
 
             let mut drop_selector = reg_changes.dying.contains(&selector.start);
             let mut choice_inputs = Vec::with_capacity(table_inputs.len());
-            let jump_instructions = targets
+            let mut jump_instructions = targets
                 .into_iter()
                 .map(|target| {
                     // The inputs for one particular target are a permutation of the inputs
@@ -451,8 +451,12 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                 })
                 .collect_vec();
 
+            // The last target is special, because it is the default target.
+            let (default_target, dying) = jump_instructions.pop().unwrap();
+            default_target.save_live_at_jump::<S>(live_regs_at_jump, &live_regs, dying);
+
             // We need to save the live registers at each jump, so that the target labels can emit the relevant drops.
-            let mut jump_instructions = jump_instructions
+            let jump_instructions = jump_instructions
                 .into_iter()
                 .map(|(jump_result, mut dying)| {
                     if drop_selector {
@@ -464,9 +468,6 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                     jump_result
                 })
                 .collect_vec();
-
-            // The last target is special, because it is the default target.
-            let default_target = jump_instructions.pop().unwrap();
 
             // We need to handle the default target separately first, because it will be
             // the target in case the selector is out of bounds.
