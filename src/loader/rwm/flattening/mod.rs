@@ -460,7 +460,8 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                 .into_iter()
                 .map(|(jump_result, mut dying)| {
                     if drop_selector {
-                        // Selector will be dropped at jump site, doesn't need to be dropped at the target.
+                        // For the non-default targets, the selector will be dropped at the
+                        // jump site, so it doesn't need to be dropped at the target.
                         dying.remove(&selector.start);
                     }
 
