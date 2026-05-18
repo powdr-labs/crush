@@ -140,7 +140,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
         .collect_vec();
 
     //// DEBUG ////
-    /*if func_idx == 4 {
+    /*if func_idx == 13 {
         let newly_live_values = BTreeSet::from_iter(reg_changes.newly_live.iter().copied());
         let new_ranges = occupation_tracker
             .active()
@@ -329,10 +329,6 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             assert!(reg_changes.newly_live.is_empty());
             assert!(reg_changes.ephemeral.is_empty());
 
-            // If the selector is dying, it must be dropped wether the branch is taken or not,
-            // so we handle it as a special case.
-            let drop_selector = reg_changes.dying.remove(&cond_reg.start);
-
             // Must clone, because the we also need to emit the drops if branch is not taken,
             // done in the outer scope.
             let mut dying_regs = reg_changes.dying.clone();
@@ -345,6 +341,10 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                 func_idx,
                 &mut dying_regs,
             );
+
+            // If the selector is dying, it must be dropped wether the branch is taken or not,
+            // so we handle it as a special case.
+            let drop_selector = dying_regs.remove(&cond_reg.start);
 
             // We must save all the currently live registers so that the target label can emit the relevant drops.
             let live_regs = ctx.allocation.occupation_for_node(node_idx);
@@ -415,12 +415,12 @@ fn process_node<'a, 'b, S: Settings<'a>>(
 
             let (selector, table_inputs) = inputs.split_last().unwrap();
             let selector = selector.as_register().unwrap().clone();
-            let drop_selector = reg_changes.dying.remove(&selector.start);
 
             let live_regs = ctx.allocation.occupation_for_node(node_idx);
 
+            let mut drop_selector = reg_changes.dying.contains(&selector.start);
             let mut choice_inputs = Vec::with_capacity(table_inputs.len());
-            let mut jump_instructions = targets
+            let jump_instructions = targets
                 .into_iter()
                 .map(|target| {
                     // The inputs for one particular target are a permutation of the inputs
@@ -441,6 +441,25 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                         func_idx,
                         &mut dying,
                     );
+
+                    if drop_selector && !dying.contains(&selector.start) {
+                        // If the selector was needed at this branch, we can't drop it at the jump.
+                        drop_selector = false;
+                    }
+
+                    (jump_result, dying)
+                })
+                .collect_vec();
+
+            // We need to save the live registers at each jump, so that the target labels can emit the relevant drops.
+            let mut jump_instructions = jump_instructions
+                .into_iter()
+                .map(|(jump_result, mut dying)| {
+                    if drop_selector {
+                        // Selector will be dropped at jump site, doesn't need to be dropped at the target.
+                        dying.remove(&selector.start);
+                    }
+
                     jump_result.save_live_at_jump::<S>(live_regs_at_jump, &live_regs, dying);
                     jump_result
                 })
@@ -816,10 +835,10 @@ impl<D> JumpResult<D> {
             .target()
             .and_then(|target| live_regs_at_jump.get_mut(target))
         {
-            // Whenever this jump is a conditional jump (br_table included), we can have extra "sudden" register
-            // deaths: registers that must be kept alive if this branch is not taken, but are no longer needed if
-            // this branch is taken. We must save what are the registers that are currently live at the jump,
-            // so that the target can know what drops to emit.
+            // Whenever this jump is a conditional jump (br_table jumps included), we can have extra "sudden"
+            // register deaths: registers that must be kept alive if this branch is not taken, but are no longer
+            // needed if this branch is taken. We must save what are the registers that are currently live at the
+            // jump, so that the target can know what drops to emit.
             for range in currently_live {
                 for reg in range.clone() {
                     live_set.insert(reg);
