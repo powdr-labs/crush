@@ -59,17 +59,25 @@ def WellFormed (pairs : Array (UInt32 × UInt32)) : Prop :=
 
 /-- Turn the pairs of assignments into a partial function that maps destination to source. -/
 def sourceOf (pairs : Array (UInt32 × UInt32)) (d : UInt32) : Option UInt32 :=
-    match pairs.find? (fun (s, d') => s ≠ d ∧ d = d') with
-    | some (s, _) => some s
-    | none => none
+  match pairs.find? (fun e => e.2 == d && e.1 != e.2) with
+  | some (s, _) => some s
+  | none => none
 
 /-- After specifying `sourceOf` constructively, verify that it actually does what we want. -/
 theorem sourceOf_correct (pairs : Array (UInt32 × UInt32)) (h_wf : WellFormed pairs) :
   ∀ s d, sourceOf pairs d = some s ↔ (s, d) ∈ pairs ∧ s ≠ d := by
   intros s d
+  unfold sourceOf
   constructor
-  · sorry
-  · sorry
+  · intro h
+    grind
+  · intro ⟨hmem, hsne⟩
+    cases hfind : pairs.find? (fun e => e.2 == d && e.1 != e.2) with
+    | none => grind
+    | some pair =>
+      rcases pair with ⟨s0, d0⟩
+      have : s0 = s := h_wf s0 s d (by grind) hsne (by grind) hmem
+      grind
 
 def applyParallel (pairs : Array (UInt32 × UInt32)) (mem : Memory) : Memory :=
   fun addr =>
