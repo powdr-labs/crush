@@ -1,9 +1,10 @@
 import Std.Data.HashSet.Basic
+import Std.Data.TreeMap.Basic
+import Std.Data.TreeSet.Basic
 /-!
 # Parallel-Copy Sequencing — verified Lean 4 implementation
 
-A port of `crush::loader::rwm::flattening::sequence_parallel_copies` to Lean 4,
-with a full machine-checked correctness proof.
+A port of `crush::loader::rwm::flattening::sequence_parallel_copies` to Lean 4.
 
 Given a set of *parallel* assignments `dst_i := src_i` with at most one source
 per destination, produce a sequential schedule of register copies with at most
@@ -22,10 +23,26 @@ The algorithm has two phases:
   into a single temporary, walk the cycle emitting intra-cycle copies, then
   close it with `temp → last`.
 
-The graph is represented internally as a `List (UInt32 × UInt32)` of
-non-self-loop edges; this representation has no out-of-line invariants and is
-straightforward to reason about. The public entry point converts at the
-boundary.
+## Data structures
+
+The graph is represented as a pair of balanced search trees:
+
+* `dstToSrc : Std.TreeMap UInt32 UInt32` — destination ↦ source. Each edge
+  `(s, d)` appears as `d ↦ s`. Unique destinations are enforced by the
+  precondition.
+* `srcToDsts : Std.TreeMap UInt32 (Std.TreeSet UInt32)` — source ↦ set of
+  destinations it writes to. A source with no outgoing edges has no entry.
+
+Together with a `LeafSet` (destinations not currently in `srcToDsts`), all
+graph operations run in `O(log n)` and the schedule is fully deterministic:
+Phase 1 always peels the smallest available leaf, Phase 2 always starts
+each cycle at its smallest destination. Total: `O(n log n)`.
+
+We choose trees over hash tables because hash iteration order is sensitive
+to the hash function and resize history; using `Std.HashMap` here would make
+the emitted schedule non-deterministic across runs. (`preprocess` still uses
+`Std.HashSet` for dedup — it iterates the *input array* in fixed order, so
+the dedup is order-independent.)
 -/
 
 namespace ParallelCopies
@@ -37,16 +54,18 @@ inductive Register
   | given (r : UInt32)
   deriving Repr, BEq, DecidableEq, Hashable, Inhabited
 
-/-! ## Internal list-based representation -/
-
 /-- An edge `(src, dst)` of the copy graph: the value at `src` should end up
     at `dst`. -/
 abbrev Edge := UInt32 × UInt32
 
-/-- The graph during the algorithm: a list of `(src, dst)` edges, maintained
-    free of self-loops and (after preprocessing) free of exact duplicates.
-    Well-formed inputs additionally have at most one edge per destination. -/
-abbrev Edges := List Edge
+/-! ## Graph data structures -/
+
+/-- Destination ↦ source. -/
+abbrev DstMap := Std.TreeMap UInt32 UInt32
+/-- Source ↦ set of destinations it writes to. -/
+abbrev SrcMap := Std.TreeMap UInt32 (Std.TreeSet UInt32)
+/-- Destinations that are not currently sources of any remaining edge. -/
+abbrev LeafSet := Std.TreeSet UInt32
 
 /-! ## Phase 0 — preprocessing -/
 
@@ -65,90 +84,94 @@ def preprocess (edges : Array Edge) : Array Edge := Id.run do
       result := result.push e
   return result
 
+/-! ## Graph construction -/
+
+/-- Build the `(dstToSrc, srcToDsts)` pair from a preprocessed edge array. -/
+def buildGraph (edges : Array Edge) : DstMap × SrcMap := Id.run do
+  let mut d2s : DstMap := ∅
+  let mut s2d : SrcMap := ∅
+  for (s, d) in edges do
+    d2s := d2s.insert d s
+    let outs := s2d.getD s ∅
+    s2d := s2d.insert s (outs.insert d)
+  return (d2s, s2d)
+
+/-- Initial set of leaves: destinations of `d2s` that are not in `s2d`. -/
+def initLeaves (d2s : DstMap) (s2d : SrcMap) : LeafSet := Id.run do
+  let mut leaves : LeafSet := ∅
+  for (d, _) in d2s do
+    if !s2d.contains d then
+      leaves := leaves.insert d
+  return leaves
+
 /-! ## Phase 1 — prune trees -/
 
-/-- A register is a *leaf* in `es` if no edge has it as a source. -/
-def isLeaf (r : UInt32) (es : Edges) : Bool :=
-  es.all (fun e => e.1 != r)
+/-- Phase-1 driver. Peels the smallest available leaf each iteration; emits
+    `(src, dst)` in peel order, source-swaps the rewires, and propagates new
+    leaves. Fuel-bounded for trivial termination; `fuel ≥ |edges|` suffices.
 
-/-- Find any edge whose destination is a leaf. -/
-def findLeafEdge (es : Edges) : Option Edge :=
-  es.find? (fun e => isLeaf e.2 es)
-
-/-- Source-swap step: drop the peeled edge `(s, d)`; for every remaining edge
-    that still uses `s` as its source, rewire it to read from `d` instead. -/
-def peelStep (s d : UInt32) : Edges → Edges
-  | []         => []
-  | e :: es    =>
-    let rest := peelStep s d es
-    if e = (s, d) then rest
-    else if e.1 = s then (d, e.2) :: rest
-    else e :: rest
-
-/-- Phase 1 driver: repeatedly peel a leaf until none remain. The acc grows
-    with each emitted copy in emission order; the remaining `es` is the
-    cycle-only residue. Fuel-bounded for trivial termination. -/
-def phase1 : Nat → Edges → List Edge → Edges × List Edge
-  | 0,    es, acc => (es, acc)
-  | n+1,  es, acc =>
-    match findLeafEdge es with
-    | none        => (es, acc)
-    | some (s, d) => phase1 n (peelStep s d es) (acc ++ [(s, d)])
+    Returns the cycle-only residue (in `dstToSrc`) and the array of emitted
+    non-cycle copies. -/
+def phase1 : Nat → DstMap → SrcMap → LeafSet → Array Edge → DstMap × Array Edge
+  | 0,    d2s, _,   _,      acc => (d2s, acc)
+  | n+1,  d2s, s2d, leaves, acc =>
+    match leaves.min? with
+    | none => (d2s, acc)
+    | some d =>
+      match d2s.get? d with
+      | none =>
+        -- Stale leaf entry (invariant temporarily broken); drop it and retry.
+        phase1 n d2s s2d (leaves.erase d) acc
+      | some s =>
+        let acc          := acc.push (s, d)
+        let d2s          := d2s.erase d
+        let sOuts        := s2d.getD s ∅
+        let sOutsMinusD  := sOuts.erase d
+        let s2d          := s2d.erase s
+        -- Rewire each remaining `(s, x)` to `(d, x)` by updating `dstToSrc`.
+        let d2s          := sOutsMinusD.foldl (init := d2s)
+                              fun m x => m.insert x d
+        -- `d` inherits `s`'s remaining out-edges (if any).
+        let s2d          := if sOutsMinusD.isEmpty then s2d
+                            else s2d.insert d sOutsMinusD
+        let leaves       := leaves.erase d
+        -- `s` may now be a leaf: it is no longer a source, and may still be
+        -- a destination of some other edge.
+        let leaves       := if d2s.contains s && !s2d.contains s
+                            then leaves.insert s else leaves
+        phase1 n d2s s2d leaves acc
 
 /-! ## Phase 2 — break remaining cycles -/
 
-/-- Pick the smallest destination in `es` (used as the deterministic
-    starting register for a cycle). -/
-def smallestDst (es : Edges) : Option UInt32 :=
-  es.foldl (init := none) fun best e =>
-    some <| best.elim e.2 (Nat.min e.2.toNat ·.toNat |>.toUInt32)
-
-/-- Look up the (unique) source of register `r` in `es`. -/
-def srcOf? (r : UInt32) (es : Edges) : Option UInt32 :=
-  es.find? (fun e => e.2 = r) |>.map Prod.fst
-
-/-- Delete the edge whose destination is `r` (there is at most one in a
-    well-formed graph). -/
-def eraseDst (r : UInt32) (es : Edges) : Edges :=
-  es.filter (fun e => e.2 != r)
-
-/-- Walk one cycle starting at `start` from `curr`: each step removes the
-    edge writing to `curr` and emits the corresponding copy. Returns the
-    last visited register (whose value will be filled from the temporary).
-    Fuel-bounded. -/
+/-- Walk one cycle from `curr`, emitting `(src, curr)` register copies and
+    erasing the edge writing to `curr`. When the source of `curr` is the
+    original `start`, emit `(tmp, curr)` and stop. Fuel-bounded. -/
 def walkCycle :
-    Nat → UInt32 → UInt32 → Edges → List (Register × Register)
-      → UInt32 × Edges × List (Register × Register)
-  | 0,    _,     curr, es, acc => (curr, es, acc)
-  | n+1,  start, curr, es, acc =>
-    match srcOf? curr es with
-    | none        => (curr, es, acc)
-    | some source =>
-      let es := eraseDst curr es
-      if source = start then
-        (curr, es, acc)
+    Nat → DstMap → UInt32 → UInt32 → Array (Register × Register)
+      → DstMap × Array (Register × Register)
+  | 0,    d2s, _,     _,    acc => (d2s, acc)
+  | n+1,  d2s, start, curr, acc =>
+    match d2s.get? curr with
+    | none => (d2s, acc)
+    | some src =>
+      let d2s := d2s.erase curr
+      if src == start then
+        (d2s, acc.push (.temp, .given curr))
       else
-        walkCycle n start source es (acc ++ [(.given source, .given curr)])
+        walkCycle n d2s start src (acc.push (.given src, .given curr))
 
-/-- Break one cycle: spill the start to `tmp`, walk the cycle, fill the
-    last register from `tmp`. -/
-def breakOneCycle (fuel : Nat) (tmp : Register) (start : UInt32)
-    (es : Edges) (acc : List (Register × Register))
-    : Edges × List (Register × Register) :=
-  let (last, es, acc) := walkCycle fuel start start es (acc ++ [(.given start, tmp)])
-  (es, acc ++ [(tmp, .given last)])
-
-/-- Phase 2 driver: drain every remaining cycle. -/
-def phase2 :
-    Nat → Register → Edges → List (Register × Register)
-      → List (Register × Register)
-  | 0,    _,   _,  acc => acc
-  | n+1,  tmp, es, acc =>
-    match smallestDst es with
+/-- Phase-2 driver: drain every remaining cycle, starting each cycle at its
+    smallest destination. Fuel-bounded. -/
+def phase2 : Nat → DstMap → Array (Register × Register) → Array (Register × Register)
+  | 0,    _,   acc => acc
+  | n+1,  d2s, acc =>
+    match d2s.minKey? with
     | none       => acc
     | some start =>
-      let (es, acc) := breakOneCycle (n+1) tmp start es acc
-      phase2 n tmp es acc
+      -- Spill: `tmp := start`, then walk the cycle.
+      let acc          := acc.push (.given start, .temp)
+      let (d2s, acc)   := walkCycle n d2s start start acc
+      phase2 n d2s acc
 
 /-! ## Top-level entry point -/
 
@@ -157,21 +180,13 @@ def phase2 :
     once as a non-self-copy destination. -/
 def sequenceParallelCopies (pairs : Array Edge) : Array (Register × Register) :=
   let es              := preprocess pairs
+  let (d2s, s2d)      := buildGraph es
+  let leaves          := initLeaves d2s s2d
   let fuel            := es.size + 1
-  -- TODO change this to array
-  let (es, nonCycle)  := phase1 fuel es.toList []
-  -- nonCycle (leaf-pruning) runs first, then phase2 (cycle-breaking).
-  -- The two blocks act on disjoint Lean-level register sets — phase2 only
-  -- writes `.temp` and `.given d` for cycle dsts `d`; nonCycle only touches
-  -- `.given` regs outside the cycle — so this order is sound at the spec
-  -- level. Composes directly with `phase1_sound` (whose invariant has
-  -- `nonCycle` applied first). NOTE: consumers that materialise `.temp` to a
-  -- concrete register must ensure it doesn't alias a nonCycle destination, or
-  -- the order-dependence shows up at the implementation level (see
-  -- `src/loader/rwm/flattening/mod.rs::parallel_copy`).
-  nonCycle.map (fun (s, d) => (Register.given s, Register.given d))
-    ++ phase2 fuel Register.temp es [] |>.toArray
-
+  let (d2s, nonCycle) := phase1 fuel d2s s2d leaves #[]
+  let nonCycleRegs    := nonCycle.map fun (s, d) =>
+                          (Register.given s, Register.given d)
+  nonCycleRegs ++ phase2 fuel d2s #[]
 
 /-! ## FFI surface
 
