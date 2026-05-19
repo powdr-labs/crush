@@ -436,6 +436,24 @@ mod tests {
     }
 
     #[test]
+    fn test_br_table_two_targets_sample() {
+        test_interpreter_from_sample_programs(
+            "br_table_two_targets.wasm",
+            "br_table_two_targets",
+            &[0],
+            vec![],
+            &[50],
+        );
+        test_interpreter_from_sample_programs(
+            "br_table_two_targets.wasm",
+            "br_table_two_targets",
+            &[7],
+            vec![],
+            &[42],
+        );
+    }
+
+    #[test]
     fn test_label_namespace_uses_exports_and_name_section() {
         let wat = r#"
             (module
