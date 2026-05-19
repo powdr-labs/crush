@@ -48,24 +48,23 @@ pub fn flatten_dag<'a, S: Settings<'a>>(
         function_name: prog.get_function_name(func_idx),
     };
 
-    // For each local label, what registers are live at jumps targeting it.
-    // This is used to calculate what drops to emit after the label.
-    let mut live_regs_at_jump = HashMap::new();
-
     let mut ctrl_stack = VecDeque::new();
     ctrl_stack.push_front(StackEntry {
         loop_label: None,
         allocation: dag.block_data,
     });
 
-    let directives = process_dag(
+    let mut flattener = Flattener {
         s,
-        &common_ctx,
-        &mut ctrl_stack,
-        &mut live_regs_at_jump,
-        dag.nodes,
+        common_ctx: &common_ctx,
+        ctrl_stack,
+        // For each local label, what registers are live at jumps targeting it.
+        // This is used to calculate what drops to emit after the label.
+        live_regs_at_jump: HashMap::new(),
         func_idx,
-    );
+    };
+
+    let directives = flattener.process_dag(dag.nodes);
 
     FunctionAsm {
         func_idx,
@@ -79,715 +78,774 @@ struct StackEntry {
     allocation: Allocation,
 }
 
-fn process_dag<'a, 'b, S: Settings<'a>>(
-    s: &S,
-    ctx: &'b CommonContext<'a, 'b>,
-    ctrl_stack: &mut VecDeque<StackEntry>,
-    live_regs_at_jump: &mut HashMap<String, BTreeSet<u32>>,
-    nodes: Vec<register_allocation::Node<'a>>,
+/// Long-lived state for flattening a single function: settings, function-level
+/// context, the nested block stack, the per-label live-register map, and the
+/// function index. `process_dag` / `process_node` / `emit_jump` are methods on
+/// this so each call site doesn't have to thread these through explicitly.
+struct Flattener<'a, 'b, S: Settings<'a>> {
+    s: &'b S,
+    common_ctx: &'b CommonContext<'a, 'b>,
+    ctrl_stack: VecDeque<StackEntry>,
+    live_regs_at_jump: HashMap<String, BTreeSet<u32>>,
     func_idx: u32,
-) -> Tree<S::Directive> {
-    let mut occupation_tracker = ctrl_stack[0].allocation.per_node_occupation();
-
-    nodes
-        .into_iter()
-        .enumerate()
-        .map(|(node_idx, node)| {
-            process_node(
-                s,
-                ctx,
-                ctrl_stack,
-                live_regs_at_jump,
-                node,
-                node_idx,
-                func_idx,
-                &mut occupation_tracker,
-            )
-        })
-        .collect_vec()
-        .into()
 }
 
-fn process_node<'a, 'b, S: Settings<'a>>(
-    s: &S,
-    common_ctx: &'b CommonContext<'a, 'b>,
-    ctrl_stack: &mut VecDeque<StackEntry>,
-    live_regs_at_jump: &mut HashMap<String, BTreeSet<u32>>,
-    node: register_allocation::Node<'a>,
-    node_idx: usize,
-    func_idx: u32,
-    occupation_tracker: &mut PerNodeOccupation,
-) -> Tree<S::Directive> {
-    let mut reg_changes = occupation_tracker.advance();
-    assert_eq!(reg_changes.node_index, node_idx);
+impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
+    fn process_dag(&mut self, nodes: Vec<register_allocation::Node<'a>>) -> Tree<S::Directive> {
+        let mut tracker = self.ctrl_stack[0].allocation.per_node_occupation();
+        nodes
+            .into_iter()
+            .enumerate()
+            .map(|(node_idx, node)| self.process_node(&mut tracker, node, node_idx))
+            .collect_vec()
+            .into()
+    }
 
-    // Destructure the node so we can use parts in separate scopes.
-    let register_allocation::Node {
-        operation,
-        inputs: raw_inputs,
-        output_types,
-    } = node;
+    fn process_node(
+        &mut self,
+        tracker: &mut PerNodeOccupation,
+        node: register_allocation::Node<'a>,
+        node_idx: usize,
+    ) -> Tree<S::Directive> {
+        let mut reg_changes = tracker.advance();
+        assert_eq!(reg_changes.node_index, node_idx);
 
-    let allocation = &ctrl_stack[0].allocation;
+        // Destructure the node so we can use parts in separate scopes.
+        let register_allocation::Node {
+            operation,
+            inputs: raw_inputs,
+            output_types,
+        } = node;
 
-    // Resolve all the inputs to register ranges.
-    let inputs = raw_inputs
-        .into_iter()
-        .map(|input| match input {
-            NodeInput::Constant(c) => WasmOpInput::Constant(c),
-            NodeInput::Reference(origin) => WasmOpInput::Register(allocation.get(&origin).unwrap()),
-        })
-        .collect_vec();
+        let allocation = &self.ctrl_stack[0].allocation;
 
-    //// DEBUG ////
-    /*if func_idx == 13 {
-        let newly_live_values = BTreeSet::from_iter(reg_changes.newly_live.iter().copied());
-        let new_ranges = occupation_tracker
-            .active()
-            .filter(|range| newly_live_values.contains(&range.regs.start))
+        // Resolve all the inputs to register ranges.
+        let inputs = raw_inputs
+            .into_iter()
+            .map(|input| match input {
+                NodeInput::Constant(c) => WasmOpInput::Constant(c),
+                NodeInput::Reference(origin) => {
+                    WasmOpInput::Register(allocation.get(&origin).unwrap())
+                }
+            })
             .collect_vec();
-        println!(
-            "## {node_idx} ## {operation:?}, new regs: {}, dying regs: {:?}",
-            new_ranges
-                .into_iter()
-                .map(|range| {
-                    format!(
-                        "${}..${} [{}..{})",
-                        range.regs.start, range.regs.end, range.live.start, range.live.end
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
-            reg_changes.dying
-        );
-    }*/
 
-    let mut ctx = Context::new(common_ctx, allocation, node_idx, &inputs);
-    let node_directives = match operation {
-        Operation::Inputs => {
-            // Inputs node marks the start of the block. If this the toplevel function, we must issue the function label here.
-            // Add the function label with the frame size.
-            if ctrl_stack.len() == 1 {
-                let mut directives = Vec::with_capacity(2);
-                directives.push(
-                    s.emit_label(&mut ctx, format_label(func_idx, LabelType::Function))
+        let mut ctx = Context::new(self.common_ctx, allocation, node_idx, &inputs);
+        let node_directives = match operation {
+            Operation::Inputs => {
+                // Inputs node marks the start of the block. If this the toplevel function, we must issue the function label here.
+                // Add the function label with the frame size.
+                if self.ctrl_stack.len() == 1 {
+                    let mut directives = Vec::with_capacity(2);
+                    directives.push(
+                        self.s
+                            .emit_label(&mut ctx, format_label(self.func_idx, LabelType::Function))
+                            .into(),
+                    );
+
+                    if let Some(name) = ctx.common.prog.get_exported_func(self.func_idx) {
+                        // Add an alternative label, using the exported function name.
+                        directives.push(self.s.emit_label(&mut ctx, name.to_string()).into());
+                    }
+                    directives.into()
+                } else {
+                    Tree::Empty
+                }
+            }
+            Operation::Label { id } => {
+                // The execution always reaches a local label through a jump. Registers dying in
+                // the previous PC are not relevant here, as this is unreachable through that path.
+                drop(reg_changes.dying);
+
+                let label = format_label(id, LabelType::Local);
+                let entry = &self.ctrl_stack[0];
+                let live_at_jump = self.live_regs_at_jump.remove(&label);
+
+                let label = self.s.emit_label(&mut ctx, label).into();
+
+                // If there were registers dying at the jumps targeting this label, we need to emit the drops for them right after the label.
+                return if let Some(live_at_jump) = live_at_jump {
+                    let live_regs_at_label = entry.allocation.occupation_for_node(node_idx);
+                    vec![
+                        label,
+                        emit_drops_after_label(
+                            self.s,
+                            &mut ctx,
+                            live_at_jump,
+                            live_regs_at_label,
+                            reg_changes.ephemeral,
+                        )
                         .into(),
+                    ]
+                    .into()
+                } else {
+                    label
+                };
+            }
+            Operation::Loop { sub_dag, .. } => {
+                let AllocatedDag {
+                    nodes: loop_nodes,
+                    block_data: loop_allocation,
+                } = sub_dag;
+
+                // Find where the loop expects its inputs to be.
+                let input_ranges = loop_allocation.get_for_node(0);
+
+                // Copy the loop inputs if needed.
+                assert!(reg_changes.newly_live.is_empty());
+                assert!(reg_changes.ephemeral.is_empty());
+                let mut loop_directives = drop_regs_and_copy_inputs(
+                    self.s,
+                    &mut ctx,
+                    &inputs,
+                    input_ranges,
+                    reg_changes.dying,
                 );
 
-                if let Some(name) = ctx.common.prog.get_exported_func(func_idx) {
-                    // Add an alternative label, using the exported function name.
-                    directives.push(s.emit_label(&mut ctx, name.to_string()).into());
-                }
-                directives.into()
-            } else {
-                Tree::Empty
-            }
-        }
-        Operation::Label { id } => {
-            // The execution always reaches a local label through a jump. Registers dying in
-            // the previous PC are not relevant here, as this is unreachable through that path.
-            drop(reg_changes.dying);
+                // Generate loop label.
+                let loop_label = ctx.new_label(LabelType::Loop);
+                loop_directives.push(self.s.emit_label(&mut ctx, loop_label.clone()).into());
 
-            let label = format_label(id, LabelType::Local);
-            let entry = &ctrl_stack[0];
-            let live_at_jump = live_regs_at_jump.remove(&label);
+                // We need to disassemble the context to reassemble later,
+                // because we need to mutate self.ctrl_stack.
+                let Context {
+                    function_call_prelude_size,
+                    tmp_tracker,
+                    ..
+                } = ctx;
 
-            let label = s.emit_label(&mut ctx, label).into();
+                // Process the loop body.
+                self.ctrl_stack.push_front(StackEntry {
+                    loop_label: Some(loop_label),
+                    allocation: loop_allocation,
+                });
+                let loop_tree = self.process_dag(loop_nodes);
+                let sub_entry = self.ctrl_stack.pop_front().unwrap();
 
-            // If there were registers dying at the jumps targeting this label, we need to emit the drops for them right after the label.
-            return if let Some(live_at_jump) = live_at_jump {
-                let live_regs_at_label = entry.allocation.occupation_for_node(node_idx);
-                vec![
-                    label,
+                // Get the registers that were live at the call site of the loop.
+                let live_at_jump = self
+                    .live_regs_at_jump
+                    .remove(&sub_entry.loop_label.unwrap())
+                    .unwrap_or_default();
+
+                // Generate the drops right after loop label
+                let live_regs_at_loop_start = sub_entry.allocation.occupation_for_node(0);
+                let mut ctx = Context {
+                    common: self.common_ctx,
+                    node_index: node_idx,
+                    node_inputs: &inputs,
+                    function_call_prelude_size,
+                    tmp_tracker,
+                    allocation: &self.ctrl_stack[0].allocation,
+                };
+
+                loop_directives.push(
                     emit_drops_after_label(
-                        s,
+                        self.s,
                         &mut ctx,
                         live_at_jump,
-                        live_regs_at_label,
-                        reg_changes.ephemeral,
+                        live_regs_at_loop_start,
+                        Vec::new(),
                     )
                     .into(),
-                ]
-                .into()
-            } else {
-                label
-            };
-        }
-        Operation::Loop { sub_dag, .. } => {
-            let AllocatedDag {
-                nodes: loop_nodes,
-                block_data: loop_allocation,
-            } = sub_dag;
+                );
 
-            // Find where the loop expects its inputs to be.
-            let input_ranges = loop_allocation.get_for_node(0);
-
-            // Copy the loop inputs if needed.
-            assert!(reg_changes.newly_live.is_empty());
-            assert!(reg_changes.ephemeral.is_empty());
-            let mut loop_directives =
-                drop_regs_and_copy_inputs(s, &mut ctx, &inputs, input_ranges, reg_changes.dying);
-
-            // Generate loop label.
-            let loop_label = ctx.new_label(LabelType::Loop);
-            loop_directives.push(s.emit_label(&mut ctx, loop_label.clone()).into());
-
-            // We need to disassemble the context to reassemble later,
-            // because we need to mutate ctrl_stack.
-            let Context {
-                function_call_prelude_size,
-                tmp_tracker,
-                ..
-            } = ctx;
-
-            // Process the loop body.
-            ctrl_stack.push_front(StackEntry {
-                loop_label: Some(loop_label),
-                allocation: loop_allocation,
-            });
-            let loop_tree = process_dag(
-                s,
-                common_ctx,
-                ctrl_stack,
-                live_regs_at_jump,
-                loop_nodes,
-                func_idx,
-            );
-            let sub_entry = ctrl_stack.pop_front().unwrap();
-
-            // Get the registers that were live at the call site of the loop.
-            let live_at_jump = live_regs_at_jump
-                .remove(&sub_entry.loop_label.unwrap())
-                .unwrap_or_default();
-
-            // Generate the drops right after loop label
-            let live_regs_at_loop_start = sub_entry.allocation.occupation_for_node(0);
-            let mut ctx = Context {
-                common: common_ctx,
-                node_index: node_idx,
-                node_inputs: &inputs,
-                function_call_prelude_size,
-                tmp_tracker,
-                allocation: &ctrl_stack[0].allocation,
-            };
-
-            loop_directives.push(
-                emit_drops_after_label(
-                    s,
-                    &mut ctx,
-                    live_at_jump,
-                    live_regs_at_loop_start,
-                    Vec::new(),
-                )
-                .into(),
-            );
-
-            // Push the loop directives.
-            loop_directives.push(loop_tree);
-            return loop_directives.into();
-        }
-        Operation::Br(break_target) => {
-            assert!(reg_changes.newly_live.is_empty());
-            assert!(reg_changes.ephemeral.is_empty());
-
-            let jump_directives = emit_jump(
-                s,
-                &mut ctx,
-                ctrl_stack,
-                break_target,
-                &inputs,
-                func_idx,
-                &mut reg_changes.dying,
-            )
-            .into_tree(s);
-
-            // Br is unconditional, so we can always put the remaining drops before it,
-            // without worrying about the case where the branch is not taken.
-            return if reg_changes.dying.is_empty() {
-                jump_directives
-            } else {
-                let mut directives = Vec::with_capacity(reg_changes.dying.len() + 1);
-                for reg in reg_changes.dying {
-                    directives.push(s.emit_drop(&mut ctx, reg).into());
-                }
-                directives.push(jump_directives);
-                directives.into()
-            };
-        }
-        Operation::BrIf(target) | Operation::BrIfZero(target) => {
-            let (cond, inverse_cond) = match operation {
-                Operation::BrIf(..) => (JumpCondition::IfNotZero, JumpCondition::IfZero),
-                Operation::BrIfZero(..) => (JumpCondition::IfZero, JumpCondition::IfNotZero),
-                _ => unreachable!(),
-            };
-
-            // Get the conditional variable from the inputs.
-            let (cond_reg, inputs) = ctx.node_inputs.split_last().unwrap();
-            let cond_reg = cond_reg.as_register().unwrap().clone();
-            assert_reg::<S>(&cond_reg, ValType::I32);
-
-            assert!(reg_changes.newly_live.is_empty());
-            assert!(reg_changes.ephemeral.is_empty());
-
-            // Must clone, because the we also need to emit the drops if branch is not taken,
-            // done in the outer scope.
-            let mut dying_regs = reg_changes.dying.clone();
-            let jump_directives = emit_jump(
-                s,
-                &mut ctx,
-                ctrl_stack,
-                target,
-                inputs,
-                func_idx,
-                &mut dying_regs,
-            );
-
-            // If the selector is dying, it must be dropped wether the branch is taken or not,
-            // so we handle it as a special case.
-            let drop_selector = dying_regs.remove(&cond_reg.start);
-
-            // We must save all the currently live registers so that the target label can emit the relevant drops.
-            let live_regs = ctx.allocation.occupation_for_node(node_idx);
-            jump_directives.save_live_at_jump(live_regs_at_jump, &live_regs, dying_regs);
-
-            let mut directives = Vec::new();
-            if drop_selector {
-                directives.push(s.emit_drop_on_next_instr(&mut ctx, cond_reg.start).into());
+                // Push the loop directives.
+                loop_directives.push(loop_tree);
+                return loop_directives.into();
             }
+            Operation::Br(break_target) => {
+                assert!(reg_changes.newly_live.is_empty());
+                assert!(reg_changes.ephemeral.is_empty());
 
-            if S::is_jump_condition_available(cond)
-                && let JumpResult::PlainJump(target) = jump_directives
-            {
+                let jump_directives = self
+                    .emit_jump(&mut ctx, break_target, &inputs, &mut reg_changes.dying)
+                    .into_tree(self.s);
+
+                // Br is unconditional, so we can always put the remaining drops before it,
+                // without worrying about the case where the branch is not taken.
+                return if reg_changes.dying.is_empty() {
+                    jump_directives
+                } else {
+                    let mut directives = Vec::with_capacity(reg_changes.dying.len() + 1);
+                    for reg in reg_changes.dying {
+                        directives.push(self.s.emit_drop(&mut ctx, reg).into());
+                    }
+                    directives.push(jump_directives);
+                    directives.into()
+                };
+            }
+            Operation::BrIf(target) | Operation::BrIfZero(target) => {
+                let (cond, inverse_cond) = match operation {
+                    Operation::BrIf(..) => (JumpCondition::IfNotZero, JumpCondition::IfZero),
+                    Operation::BrIfZero(..) => (JumpCondition::IfZero, JumpCondition::IfNotZero),
+                    _ => unreachable!(),
+                };
+
+                // Get the conditional variable from the inputs.
+                let (cond_reg, inputs) = ctx.node_inputs.split_last().unwrap();
+                let cond_reg = cond_reg.as_register().unwrap().clone();
+                assert_reg::<S>(&cond_reg, ValType::I32);
+
+                assert!(reg_changes.newly_live.is_empty());
+                assert!(reg_changes.ephemeral.is_empty());
+
+                // Must clone, because the we also need to emit the drops if branch is not taken,
+                // done in the outer scope.
+                let mut dying_regs = reg_changes.dying.clone();
+                let jump_directives = self.emit_jump(&mut ctx, target, inputs, &mut dying_regs);
+
+                // If the selector is dying, it must be dropped wether the branch is taken or not,
+                // so we handle it as a special case.
+                let drop_selector = dying_regs.remove(&cond_reg.start);
+
+                // We must save all the currently live registers so that the target label can emit the relevant drops.
+                let live_regs = ctx.allocation.occupation_for_node(node_idx);
+                jump_directives.save_live_at_jump(
+                    &mut self.live_regs_at_jump,
+                    &live_regs,
+                    dying_regs,
+                );
+
+                let mut directives = Vec::new();
+                if drop_selector {
+                    directives.push(
+                        self.s
+                            .emit_drop_on_next_instr(&mut ctx, cond_reg.start)
+                            .into(),
+                    );
+                }
+
+                if S::is_jump_condition_available(cond)
+                    && let JumpResult::PlainJump(target) = jump_directives
+                {
+                    directives.push(
+                        self.s
+                            .emit_conditional_jump(&mut ctx, cond, target, cond_reg)
+                            .into(),
+                    );
+                } else {
+                    let jump_directives = jump_directives.into_tree(self.s);
+                    if S::is_jump_condition_available(inverse_cond) {
+                        // Uses branch on inverse condition for the general case. This is the second best case.
+                        let cont_label = ctx.new_label(LabelType::Local);
+                        directives.extend([
+                            // Emit the jump to continuation if the condition is non-zero.
+                            self.s
+                                .emit_conditional_jump(
+                                    &mut ctx,
+                                    inverse_cond,
+                                    cont_label.clone(),
+                                    cond_reg,
+                                )
+                                .into(),
+                            // Emit the jump to the target label.
+                            jump_directives,
+                            // Emit the continuation label.
+                            self.s.emit_label(&mut ctx, cont_label).into(),
+                        ]);
+                    } else if S::is_jump_condition_available(cond) {
+                        // Uses conditional branch for the general case. This is the worst case, because it
+                        // it requires two labels and two jumps.
+                        let cont_label = ctx.new_label(LabelType::Local);
+                        let jump_label = ctx.new_label(LabelType::Local);
+
+                        directives.extend([
+                            // Emit the jump to the to the jump code
+                            self.s
+                                .emit_conditional_jump(&mut ctx, cond, jump_label.clone(), cond_reg)
+                                .into(),
+                            // Emit the jump to the continuation label.
+                            self.s.emit_jump(cont_label.clone()).into(),
+                            // Emit the jump label.
+                            self.s.emit_label(&mut ctx, jump_label).into(),
+                            // Emit the jump code.
+                            jump_directives,
+                            // Emit the continuation label.
+                            self.s.emit_label(&mut ctx, cont_label).into(),
+                        ]);
+                    } else {
+                        panic!(
+                            "Neither branch if zero nor branch if not zero is available in the settings."
+                        );
+                    }
+                }
+
+                directives.into()
+            }
+            Operation::BrTable { targets } => {
+                assert!(reg_changes.newly_live.is_empty());
+                assert!(reg_changes.ephemeral.is_empty());
+
+                let (selector, table_inputs) = inputs.split_last().unwrap();
+                let selector = selector.as_register().unwrap().clone();
+
+                let live_regs = ctx.allocation.occupation_for_node(node_idx);
+
+                let mut choice_inputs = Vec::with_capacity(table_inputs.len());
+                let mut jump_instructions = targets
+                    .into_iter()
+                    .map(|target| {
+                        // The inputs for one particular target are a permutation of the inputs
+                        // of the BrTable operation.
+                        choice_inputs.clear();
+                        for &idx in &target.input_permutation {
+                            choice_inputs.push(table_inputs[idx as usize].clone());
+                        }
+
+                        // Emit the jump to the target label.
+                        let mut dying = reg_changes.dying.clone();
+                        let jump_result =
+                            self.emit_jump(&mut ctx, target.target, &choice_inputs, &mut dying);
+
+                        (jump_result, dying)
+                    })
+                    .collect_vec();
+
+                // The last target is special, because it is the default target.
+                let (default_target, dying) = jump_instructions.pop().unwrap();
+                default_target.save_live_at_jump(&mut self.live_regs_at_jump, &live_regs, dying);
+
+                // Decide whether or not to drop the selector at the relative jump instruction.
+                assert!(!jump_instructions.is_empty());
+                let drop_selector = jump_instructions
+                    .iter()
+                    .all(|(_, dying)| dying.contains(&selector.start));
+
+                // We need to save the live registers at each jump, so that the target labels can emit the relevant drops.
+                let jump_instructions = jump_instructions
+                    .into_iter()
+                    .map(|(jump_result, mut dying)| {
+                        if drop_selector {
+                            // For the non-default targets, the selector will be dropped at the
+                            // jump site, so it doesn't need to be dropped at the target.
+                            dying.remove(&selector.start);
+                        }
+
+                        jump_result.save_live_at_jump(
+                            &mut self.live_regs_at_jump,
+                            &live_regs,
+                            dying,
+                        );
+                        jump_result
+                    })
+                    .collect_vec();
+
+                // We need to handle the default target separately first, because it will be
+                // the target in case the selector is out of bounds.
+                let mut directives = Vec::new();
+                match default_target {
+                    JumpResult::PlainJump(target) => {
+                        // If the default target is a plain jump to a local label,
+                        // just jump if the selector is out of bounds.
+                        directives.push(
+                            self.s
+                                .emit_conditional_jump_cmp_immediate(
+                                    &mut ctx,
+                                    ComparisonFunction::GreaterThanOrEqualUnsigned,
+                                    selector.clone(),
+                                    jump_instructions.len() as u32,
+                                    target,
+                                    false,
+                                )
+                                .into(),
+                        );
+                    }
+                    JumpResult::CopyJump(_, jump_directives)
+                    | JumpResult::Return(jump_directives) => {
+                        // If the default target is a complex jump.
+                        let table_label = ctx.new_label(LabelType::Local);
+                        directives.extend([
+                            // Jump to the table if the selector is in bounds.
+                            self.s
+                                .emit_conditional_jump_cmp_immediate(
+                                    &mut ctx,
+                                    ComparisonFunction::LessThanUnsigned,
+                                    selector.clone(),
+                                    jump_instructions.len() as u32,
+                                    table_label.clone(),
+                                    false,
+                                )
+                                .into(),
+                        ]);
+
+                        directives.extend([
+                            // Otherwise fall through to the default target.
+                            jump_directives.into(),
+                            // Emit the label for the jump table that will follow.
+                            self.s.emit_label(&mut ctx, table_label).into(),
+                        ])
+                    }
+                }
+
+                if !S::is_relative_jump_available() {
+                    // TODO: emit a sequence of conditional jumps if relative jumps are not available.
+                    todo!();
+                } else {
+                    // TODO: do the way it is currently done below.
+                }
+
+                // For robustness, the jump table has two indirections:
+                // - jump_offset $selector
+                // - choice_0:
+                // - jump jump_to_target_0
+                // - choice_1:
+                // - jump jump_to_target_1
+                // - ...
+                // - choice_n:
+                // - jump jump_to_target_n
+                // - jump_to_target_0:
+                // - <actual instructions to jump to target 0>
+                // - jump_to_target_1:
+                // - <actual instructions to jump to target 1>
+                // - ...
+                // - jump_to_target_n:
+                // - <actual instructions to jump to target n>
+                //
+                // The exception is if the target jump contains one single local jump instruction,
+                // which can be embedded in the jump table directly.
+                //
+                // TODO: theoretically, any single instruction can be embedded in the jump table,
+                // but it would require the guarantee that further translations wouldn't implement
+                // any of them as multiple ISA instructions. It is safer to assume just Jump will
+                // remain a single instruction. Maybe also Return?
+                //
+                // TODO: if jump_offset can jump $selector * N, where N is some immediate, this
+                // can be implemented with a single indirection, but that would also require
+                // 1-to-1 mapping in all the instructions belonging to the jump table.
+                if drop_selector {
+                    directives.push(
+                        self.s
+                            .emit_drop_on_next_instr(&mut ctx, selector.start)
+                            .into(),
+                    );
+                }
+                directives.push(self.s.emit_relative_jump(&mut ctx, selector).into());
+
+                let jump_instructions = jump_instructions
+                    .into_iter()
+                    .filter_map(|jump_directives| {
+                        // This label is not actually refereced statically, but it marks
+                        // one possible target of the relative jump. It is useful on backends
+                        // that rely on labels to find all the possible jump targets.
+                        let marker_label = ctx.new_label(LabelType::Marker);
+                        directives.push(self.s.emit_label(&mut ctx, marker_label).into());
+                        match jump_directives {
+                            JumpResult::PlainJump(target) => {
+                                // This is a plain jump, just emit it directly.
+                                directives.push(self.s.emit_jump(target).into());
+                                None
+                            }
+                            JumpResult::CopyJump(_, jump_directives)
+                            | JumpResult::Return(jump_directives) => {
+                                // This is a complex jump, we need to create a new label
+                                // and do one indirection.
+                                let jump_label = ctx.new_label(LabelType::Local);
+                                directives.push(self.s.emit_jump(jump_label.clone()).into());
+                                Some((jump_label, jump_directives))
+                            }
+                        }
+                    })
+                    // Collecting here is essential, because of side effects of pushing
+                    // into `directives`.
+                    .collect_vec();
+
+                // Finally emit the jump directives for each target.
+                for (jump_label, jump_directives) in jump_instructions {
+                    directives.push(self.s.emit_label(&mut ctx, jump_label).into());
+                    directives.push(jump_directives.into());
+                }
+                return directives.into();
+            }
+            Operation::WASMOp(Op::Call { function_index }) => {
+                let curr_entry = self.ctrl_stack.front().unwrap();
+
+                if let Some((module, function)) = ctx.common.prog.get_imported_func(function_index)
+                {
+                    // Imported functions are kinda like system calls, and we assume
+                    // the implementation can access the input and output registers directly,
+                    // so we just have to emit the call directive.
+                    let outputs = (0..output_types.len())
+                        .map(|output_idx| {
+                            curr_entry
+                                .allocation
+                                .get(&ValueOrigin {
+                                    node: node_idx,
+                                    output_idx: output_idx as u32,
+                                })
+                                .unwrap()
+                        })
+                        .collect_vec();
+
+                    self.s
+                        .emit_imported_call(&mut ctx, module, function, &inputs, outputs)
+                        .into()
+                } else {
+                    // Normal function calls requires inputs to be copied to where they are needed in the
+                    // function frame, and also may require outputs to be copied to where the users expect
+                    // the values.
+                    let func_type = &ctx.common.prog.get_func_type(function_index).ty;
+                    let call = prepare_function_call(
+                        self.s,
+                        &mut ctx,
+                        &curr_entry.allocation,
+                        node_idx,
+                        &inputs,
+                        func_type,
+                        reg_changes,
+                    );
+
+                    return vec![
+                        call.prefix_directives.into(),
+                        self.s
+                            .emit_function_call(
+                                &mut ctx,
+                                format_label(function_index, LabelType::Function),
+                                call.frame_start,
+                                call.ret_pc,
+                                call.ret_fp,
+                            )
+                            .into(),
+                        call.suffix_directives.into(),
+                    ]
+                    .into();
+                }
+            }
+            Operation::WASMOp(Op::CallIndirect {
+                table_index,
+                type_index,
+            }) => {
+                let curr_entry = self.ctrl_stack.front().unwrap();
+
+                // The last input of the CallIndirect operation is the table entry, the others are the function arguments.
+                let (entry_idx, inputs) = inputs.split_last().unwrap();
+                let entry_idx = entry_idx.as_register().unwrap().clone();
+
+                let fn_entry_is_dying = reg_changes.dying.remove(&entry_idx.start);
+
+                let fn_type = ctx.common.prog.get_type(type_index);
+                let call = prepare_function_call(
+                    self.s,
+                    &mut ctx,
+                    &curr_entry.allocation,
+                    node_idx,
+                    inputs,
+                    &fn_type.ty,
+                    reg_changes,
+                );
+
+                // We need to load the function reference from the table, so we allocate
+                // the space for it and emit the table.get directive.
+                let func_ref_reg = ctx.allocate_tmp_type::<S>(ValType::FUNCREF);
+
+                // Split the components of the function reference:
+                let split_ref = split_func_ref_regs::<S>(func_ref_reg.clone());
+
+                // Indirect calls require checking the function type first.
+                // We need a label for the OK case.
+                let ok_label = ctx.new_label(LabelType::Local);
+
+                // The sequence to load the function reference, check the type,
+                // and then perform the indirect call.
+                let mut directives = Vec::with_capacity(11);
                 directives.push(
-                    s.emit_conditional_jump(&mut ctx, cond, target, cond_reg)
+                    self.s
+                        .emit_wasm_op(
+                            &mut ctx,
+                            Op::TableGet { table: table_index },
+                            &[WasmOpInput::Register(entry_idx.clone())],
+                            Some(func_ref_reg),
+                        )
                         .into(),
                 );
-            } else {
-                let jump_directives = jump_directives.into_tree(s);
-                if S::is_jump_condition_available(inverse_cond) {
-                    // Uses branch on inverse condition for the general case. This is the second best case.
-                    let cont_label = ctx.new_label(LabelType::Local);
-                    directives.extend([
-                        // Emit the jump to continuation if the condition is non-zero.
-                        s.emit_conditional_jump(
+
+                if fn_entry_is_dying {
+                    directives.push(self.s.emit_drop(&mut ctx, entry_idx.start).into());
+                }
+
+                directives.extend([
+                    // Func frame size is not used in RW mode.
+                    self.s
+                        .emit_drop(&mut ctx, split_ref[FunctionRef::<S>::FUNC_FRAME_SIZE].start)
+                        .into(),
+                    self.s
+                        .emit_conditional_jump_cmp_immediate(
                             &mut ctx,
-                            inverse_cond,
-                            cont_label.clone(),
-                            cond_reg,
+                            ComparisonFunction::Equal,
+                            split_ref[FunctionRef::<S>::TYPE_ID].clone(),
+                            fn_type.unique_id,
+                            ok_label.clone(),
+                            // TYPE_ID is no longer needed after this jump.
+                            true,
                         )
                         .into(),
-                        // Emit the jump to the target label.
-                        jump_directives,
-                        // Emit the continuation label.
-                        s.emit_label(&mut ctx, cont_label).into(),
-                    ]);
-                } else if S::is_jump_condition_available(cond) {
-                    // Uses conditional branch for the general case. This is the worst case, because it
-                    // it requires two labels and two jumps.
-                    let cont_label = ctx.new_label(LabelType::Local);
-                    let jump_label = ctx.new_label(LabelType::Local);
-
-                    directives.extend([
-                        // Emit the jump to the to the jump code
-                        s.emit_conditional_jump(&mut ctx, cond, jump_label.clone(), cond_reg)
-                            .into(),
-                        // Emit the jump to the continuation label.
-                        s.emit_jump(cont_label.clone()).into(),
-                        // Emit the jump label.
-                        s.emit_label(&mut ctx, jump_label).into(),
-                        // Emit the jump code.
-                        jump_directives,
-                        // Emit the continuation label.
-                        s.emit_label(&mut ctx, cont_label).into(),
-                    ]);
-                } else {
-                    panic!(
-                        "Neither branch if zero nor branch if not zero is available in the settings."
-                    );
-                }
-            }
-
-            directives.into()
-        }
-        Operation::BrTable { targets } => {
-            assert!(reg_changes.newly_live.is_empty());
-            assert!(reg_changes.ephemeral.is_empty());
-
-            let (selector, table_inputs) = inputs.split_last().unwrap();
-            let selector = selector.as_register().unwrap().clone();
-
-            let live_regs = ctx.allocation.occupation_for_node(node_idx);
-
-            let mut choice_inputs = Vec::with_capacity(table_inputs.len());
-            let mut jump_instructions = targets
-                .into_iter()
-                .map(|target| {
-                    // The inputs for one particular target are a permutation of the inputs
-                    // of the BrTable operation.
-                    choice_inputs.clear();
-                    for &idx in &target.input_permutation {
-                        choice_inputs.push(table_inputs[idx as usize].clone());
-                    }
-
-                    // Emit the jump to the target label.
-                    let mut dying = reg_changes.dying.clone();
-                    let jump_result = emit_jump(
-                        s,
-                        &mut ctx,
-                        ctrl_stack,
-                        target.target,
-                        &choice_inputs,
-                        func_idx,
-                        &mut dying,
-                    );
-
-                    (jump_result, dying)
-                })
-                .collect_vec();
-
-            // The last target is special, because it is the default target.
-            let (default_target, dying) = jump_instructions.pop().unwrap();
-            default_target.save_live_at_jump(live_regs_at_jump, &live_regs, dying);
-
-            // Decide whether or not to drop the selector at the relative jump instruction.
-            assert!(!jump_instructions.is_empty());
-            let drop_selector = jump_instructions
-                .iter()
-                .all(|(_, dying)| dying.contains(&selector.start));
-
-            // We need to save the live registers at each jump, so that the target labels can emit the relevant drops.
-            let jump_instructions = jump_instructions
-                .into_iter()
-                .map(|(jump_result, mut dying)| {
-                    if drop_selector {
-                        // For the non-default targets, the selector will be dropped at the
-                        // jump site, so it doesn't need to be dropped at the target.
-                        dying.remove(&selector.start);
-                    }
-
-                    jump_result.save_live_at_jump(live_regs_at_jump, &live_regs, dying);
-                    jump_result
-                })
-                .collect_vec();
-
-            // We need to handle the default target separately first, because it will be
-            // the target in case the selector is out of bounds.
-            let mut directives = Vec::new();
-            match default_target {
-                JumpResult::PlainJump(target) => {
-                    // If the default target is a plain jump to a local label,
-                    // just jump if the selector is out of bounds.
-                    directives.push(
-                        s.emit_conditional_jump_cmp_immediate(
+                    self.s
+                        .emit_drop(&mut ctx, split_ref[FunctionRef::<S>::FUNC_ADDR].start)
+                        .into(),
+                    self.s
+                        .emit_trap(&mut ctx, TrapReason::WrongIndirectCallFunctionType)
+                        .into(),
+                    self.s.emit_label(&mut ctx, ok_label).into(),
+                    call.prefix_directives.into(),
+                    self.s
+                        .emit_drop_on_next_instr(
                             &mut ctx,
-                            ComparisonFunction::GreaterThanOrEqualUnsigned,
-                            selector.clone(),
-                            jump_instructions.len() as u32,
-                            target,
-                            false,
+                            split_ref[FunctionRef::<S>::FUNC_ADDR].start,
                         )
                         .into(),
-                    );
-                }
-                JumpResult::CopyJump(_, jump_directives) | JumpResult::Return(jump_directives) => {
-                    // If the default target is a complex jump.
-                    let table_label = ctx.new_label(LabelType::Local);
-                    directives.extend([
-                        // Jump to the table if the selector is in bounds.
-                        s.emit_conditional_jump_cmp_immediate(
+                    self.s
+                        .emit_indirect_call(
                             &mut ctx,
-                            ComparisonFunction::LessThanUnsigned,
-                            selector.clone(),
-                            jump_instructions.len() as u32,
-                            table_label.clone(),
-                            false,
+                            split_ref[FunctionRef::<S>::FUNC_ADDR].clone(),
+                            call.frame_start,
+                            call.ret_pc,
+                            call.ret_fp,
                         )
                         .into(),
-                    ]);
+                    call.suffix_directives.into(),
+                ]);
 
-                    directives.extend([
-                        // Otherwise fall through to the default target.
-                        jump_directives.into(),
-                        // Emit the label for the jump table that will follow.
-                        s.emit_label(&mut ctx, table_label).into(),
-                    ])
-                }
+                return directives.into();
             }
-
-            if !S::is_relative_jump_available() {
-                // TODO: emit a sequence of conditional jumps if relative jumps are not available.
-                todo!();
-            } else {
-                // TODO: do the way it is currently done below.
+            Operation::WASMOp(Op::Unreachable) => {
+                return self
+                    .s
+                    .emit_trap(&mut ctx, TrapReason::UnreachableInstruction)
+                    .into();
             }
-
-            // For robustness, the jump table has two indirections:
-            // - jump_offset $selector
-            // - choice_0:
-            // - jump jump_to_target_0
-            // - choice_1:
-            // - jump jump_to_target_1
-            // - ...
-            // - choice_n:
-            // - jump jump_to_target_n
-            // - jump_to_target_0:
-            // - <actual instructions to jump to target 0>
-            // - jump_to_target_1:
-            // - <actual instructions to jump to target 1>
-            // - ...
-            // - jump_to_target_n:
-            // - <actual instructions to jump to target n>
-            //
-            // The exception is if the target jump contains one single local jump instruction,
-            // which can be embedded in the jump table directly.
-            //
-            // TODO: theoretically, any single instruction can be embedded in the jump table,
-            // but it would require the guarantee that further translations wouldn't implement
-            // any of them as multiple ISA instructions. It is safer to assume just Jump will
-            // remain a single instruction. Maybe also Return?
-            //
-            // TODO: if jump_offset can jump $selector * N, where N is some immediate, this
-            // can be implemented with a single indirection, but that would also require
-            // 1-to-1 mapping in all the instructions belonging to the jump table.
-            if drop_selector {
-                directives.push(s.emit_drop_on_next_instr(&mut ctx, selector.start).into());
-            }
-            directives.push(s.emit_relative_jump(&mut ctx, selector).into());
-
-            let jump_instructions = jump_instructions
-                .into_iter()
-                .filter_map(|jump_directives| {
-                    // This label is not actually refereced statically, but it marks
-                    // one possible target of the relative jump. It is useful on backends
-                    // that rely on labels to find all the possible jump targets.
-                    let marker_label = ctx.new_label(LabelType::Marker);
-                    directives.push(s.emit_label(&mut ctx, marker_label).into());
-                    match jump_directives {
-                        JumpResult::PlainJump(target) => {
-                            // This is a plain jump, just emit it directly.
-                            directives.push(s.emit_jump(target).into());
-                            None
-                        }
-                        JumpResult::CopyJump(_, jump_directives)
-                        | JumpResult::Return(jump_directives) => {
-                            // This is a complex jump, we need to create a new label
-                            // and do one indirection.
-                            let jump_label = ctx.new_label(LabelType::Local);
-                            directives.push(s.emit_jump(jump_label.clone()).into());
-                            Some((jump_label, jump_directives))
-                        }
-                    }
-                })
-                // Collecting here is essential, because of side effects of pushing
-                // into `directives`.
-                .collect_vec();
-
-            // Finally emit the jump directives for each target.
-            for (jump_label, jump_directives) in jump_instructions {
-                directives.push(s.emit_label(&mut ctx, jump_label).into());
-                directives.push(jump_directives.into());
-            }
-            return directives.into();
-        }
-        Operation::WASMOp(Op::Call { function_index }) => {
-            let curr_entry = ctrl_stack.front().unwrap();
-
-            if let Some((module, function)) = ctx.common.prog.get_imported_func(function_index) {
-                // Imported functions are kinda like system calls, and we assume
-                // the implementation can access the input and output registers directly,
-                // so we just have to emit the call directive.
-                let outputs = (0..output_types.len())
-                    .map(|output_idx| {
+            Operation::WASMOp(op) => {
+                // Normal WASM operations are handled by the ISA emmiter directly.
+                let curr_entry = self.ctrl_stack.front().unwrap();
+                let output = match output_types.len() {
+                    0 => None,
+                    1 => Some(
                         curr_entry
                             .allocation
                             .get(&ValueOrigin {
                                 node: node_idx,
-                                output_idx: output_idx as u32,
+                                output_idx: 0,
                             })
-                            .unwrap()
-                    })
-                    .collect_vec();
-
-                s.emit_imported_call(&mut ctx, module, function, &inputs, outputs)
-                    .into()
-            } else {
-                // Normal function calls requires inputs to be copied to where they are needed in the
-                // function frame, and also may require outputs to be copied to where the users expect
-                // the values.
-                let func_type = &ctx.common.prog.get_func_type(function_index).ty;
-                let call = prepare_function_call(
-                    s,
-                    &mut ctx,
-                    &curr_entry.allocation,
-                    node_idx,
-                    &inputs,
-                    func_type,
-                    reg_changes,
-                );
-
-                return vec![
-                    call.prefix_directives.into(),
-                    s.emit_function_call(
-                        &mut ctx,
-                        format_label(function_index, LabelType::Function),
-                        call.frame_start,
-                        call.ret_pc,
-                        call.ret_fp,
-                    )
-                    .into(),
-                    call.suffix_directives.into(),
-                ]
-                .into();
+                            .unwrap(),
+                    ),
+                    _ => {
+                        panic!("WASM instructions with multiple outputs! This is a bug.");
+                    }
+                };
+                self.s.emit_wasm_op(&mut ctx, op, &inputs, output).into()
             }
+        };
+
+        // Some nodes return early, and execution never gets here. They are:
+        //
+        // Operations that don't have fallthrough, so it is not necessary to emit drops following them:
+        // - Operation::Br
+        // - Operation::BrTable
+        // - Operation::Loop
+        // - Operation::WASMOp(Op::Unreachable)
+        //
+        // Calls, because they emit their own drops, as they need to emit the more encompassing DropFrom,
+        // which cleans the entire function frame.
+        // - Operation::WASMOp(Op::Call)
+        // - Operation::WASMOp(Op::CallIndirect)
+        //
+        // Labels, because they have to consider the dying registers from all the jumps targeting them.
+        // - Operation::Label
+
+        // On the general case, ephemeral registers must be dropped just like any dying register.
+        for reg in reg_changes.ephemeral {
+            reg_changes.dying.insert(reg);
         }
-        Operation::WASMOp(Op::CallIndirect {
-            table_index,
-            type_index,
-        }) => {
-            let curr_entry = ctrl_stack.front().unwrap();
 
-            // The last input of the CallIndirect operation is the table entry, the others are the function arguments.
-            let (entry_idx, inputs) = inputs.split_last().unwrap();
-            let entry_idx = entry_idx.as_register().unwrap().clone();
-
-            let fn_entry_is_dying = reg_changes.dying.remove(&entry_idx.start);
-
-            let fn_type = ctx.common.prog.get_type(type_index);
-            let call = prepare_function_call(
-                s,
-                &mut ctx,
-                &curr_entry.allocation,
-                node_idx,
-                inputs,
-                &fn_type.ty,
-                reg_changes,
-            );
-
-            // We need to load the function reference from the table, so we allocate
-            // the space for it and emit the table.get directive.
-            let func_ref_reg = ctx.allocate_tmp_type::<S>(ValType::FUNCREF);
-
-            // Split the components of the function reference:
-            let split_ref = split_func_ref_regs::<S>(func_ref_reg.clone());
-
-            // Indirect calls require checking the function type first.
-            // We need a label for the OK case.
-            let ok_label = ctx.new_label(LabelType::Local);
-
-            // The sequence to load the function reference, check the type,
-            // and then perform the indirect call.
-            let mut directives = Vec::with_capacity(11);
-            directives.push(
-                s.emit_wasm_op(
-                    &mut ctx,
-                    Op::TableGet { table: table_index },
-                    &[WasmOpInput::Register(entry_idx.clone())],
-                    Some(func_ref_reg),
-                )
-                .into(),
-            );
-
-            if fn_entry_is_dying {
-                directives.push(s.emit_drop(&mut ctx, entry_idx.start).into());
+        if !reg_changes.dying.is_empty() {
+            // We need to filter newly live values out of dying values
+            // (i.e. values that were overritten at this node, reusing the same input register as output)
+            for reused_reg in reg_changes.newly_live {
+                reg_changes.dying.remove(&reused_reg);
             }
 
-            directives.extend([
-                // Func frame size is not used in RW mode.
-                s.emit_drop(&mut ctx, split_ref[FunctionRef::<S>::FUNC_FRAME_SIZE].start)
-                    .into(),
-                s.emit_conditional_jump_cmp_immediate(
-                    &mut ctx,
-                    ComparisonFunction::Equal,
-                    split_ref[FunctionRef::<S>::TYPE_ID].clone(),
-                    fn_type.unique_id,
-                    ok_label.clone(),
-                    // TYPE_ID is no longer needed after this jump.
-                    true,
-                )
-                .into(),
-                s.emit_drop(&mut ctx, split_ref[FunctionRef::<S>::FUNC_ADDR].start)
-                    .into(),
-                s.emit_trap(&mut ctx, TrapReason::WrongIndirectCallFunctionType)
-                    .into(),
-                s.emit_label(&mut ctx, ok_label).into(),
-                call.prefix_directives.into(),
-                s.emit_drop_on_next_instr(&mut ctx, split_ref[FunctionRef::<S>::FUNC_ADDR].start)
-                    .into(),
-                s.emit_indirect_call(
-                    &mut ctx,
-                    split_ref[FunctionRef::<S>::FUNC_ADDR].clone(),
-                    call.frame_start,
-                    call.ret_pc,
-                    call.ret_fp,
-                )
-                .into(),
-                call.suffix_directives.into(),
-            ]);
-
-            return directives.into();
+            let mut result = vec![node_directives];
+            for reg in reg_changes.dying {
+                result.push(self.s.emit_drop(&mut ctx, reg).into());
+            }
+            result.into()
+        } else {
+            node_directives
         }
-        Operation::WASMOp(Op::Unreachable) => {
-            return s
-                .emit_trap(&mut ctx, TrapReason::UnreachableInstruction)
-                .into();
-        }
-        Operation::WASMOp(op) => {
-            // Normal WASM operations are handled by the ISA emmiter directly.
-            let curr_entry = ctrl_stack.front().unwrap();
-            let output = match output_types.len() {
-                0 => None,
-                1 => Some(
-                    curr_entry
-                        .allocation
-                        .get(&ValueOrigin {
-                            node: node_idx,
-                            output_idx: 0,
-                        })
-                        .unwrap(),
-                ),
-                _ => {
-                    panic!("WASM instructions with multiple outputs! This is a bug.");
-                }
-            };
-            s.emit_wasm_op(&mut ctx, op, &inputs, output).into()
-        }
-    };
-
-    // Some nodes return early, and execution never gets here. They are:
-    //
-    // Operations that don't have fallthrough, so it is not necessary to emit drops following them:
-    // - Operation::Br
-    // - Operation::BrTable
-    // - Operation::Loop
-    // - Operation::WASMOp(Op::Unreachable)
-    //
-    // Calls, because they emit their own drops, as they need to emit the more encompassing DropFrom,
-    // which cleans the entire function frame.
-    // - Operation::WASMOp(Op::Call)
-    // - Operation::WASMOp(Op::CallIndirect)
-    //
-    // Labels, because they have to consider the dying registers from all the jumps targeting them.
-    // - Operation::Label
-
-    // On the general case, ephemeral registers must be dropped just like any dying register.
-    for reg in reg_changes.ephemeral {
-        reg_changes.dying.insert(reg);
     }
 
-    if !reg_changes.dying.is_empty() {
-        // We need to filter newly live values out of dying values
-        // (i.e. values that were overritten at this node, reusing the same input register as output)
-        for reused_reg in reg_changes.newly_live {
-            reg_changes.dying.remove(&reused_reg);
-        }
+    fn emit_jump(
+        &self,
+        ctx: &mut Context<'a, '_>,
+        target: BreakTarget,
+        inputs: &[WasmOpInput],
+        dying_regs: &mut BTreeSet<u32>,
+    ) -> JumpResult<S::Directive> {
+        // There are 3 different kinds of jumps we have to deal with:
+        //
+        // 1. Jumps to a forward label in the current function.
+        // 2. Jump backwards to a loop iteration.
+        // 3. Returns from the function.
 
-        let mut result = vec![node_directives];
-        for reg in reg_changes.dying {
-            result.push(s.emit_drop(&mut ctx, reg).into());
+        let target_entry = &self.ctrl_stack[target.depth as usize];
+        let allocation = &target_entry.allocation;
+        let (output_node_idx, target) = match target.kind {
+            TargetType::Loop => {
+                let loop_label = target_entry
+                    .loop_label
+                    .as_ref()
+                    .expect("Loop target should have a loop label");
+
+                // This is a jump to a new loop iteration.
+                // The node whose outputs we want are the Inputs node of the loop (index 0).
+                (0, loop_label.as_str().into())
+            }
+            TargetType::Function => {
+                assert!(target_entry.loop_label.is_none());
+                // This is a return from the function.
+                // Calculate the outputs registers from the function type.
+                let func_type = &ctx.common.prog.get_func_type(self.func_idx).ty;
+                let ret_types = func_type.results();
+                // They are tightly packed at the top of the frame.
+                let mut fn_output_size = 0;
+                let input_ranges = ranges_for_types::<S>(ret_types, &mut fn_output_size);
+
+                // Use the current block's allocation to source the copied inputs:
+                let mut directives =
+                    copy_inputs_if_needed(self.s, ctx, inputs, input_ranges, dying_regs);
+
+                // Also calculate the space needed by the function inputs, to calculate where
+                // the return address and caller frame pointer are stored.
+                let fn_input_size = word_count_types::<S>(func_type.params());
+                let (ra, caller_fp) = calculate_ra_and_fp::<S>(fn_input_size, fn_output_size);
+
+                directives.push(self.s.emit_return(ctx, ra, caller_fp).into());
+
+                return JumpResult::Return(directives);
+            }
+            TargetType::Label(id) => {
+                // This is a jump to a label in the current function.
+                // The node we want is the target label's node.
+                (
+                    target_entry.allocation.labels[&id],
+                    format_label(id, LabelType::Local),
+                )
+            }
+        };
+
+        let input_ranges = allocation.get_for_node(output_node_idx);
+        let mut directives = copy_inputs_if_needed(self.s, ctx, inputs, input_ranges, dying_regs);
+        if directives.is_empty() {
+            JumpResult::PlainJump(target)
+        } else {
+            // Stuff remaining in dying_regs (i.e., unused inputs in BrTable)
+            // must be dropped before the jump.
+            for reg in std::mem::take(dying_regs) {
+                directives.push(self.s.emit_drop(ctx, reg).into());
+            }
+            directives.push(self.s.emit_jump(target.clone()).into());
+
+            JumpResult::CopyJump(target, directives)
         }
-        result.into()
-    } else {
-        node_directives
     }
 }
 
@@ -844,82 +902,6 @@ impl<D> JumpResult<D> {
                 live_set.insert(reg);
             }
         }
-    }
-}
-
-fn emit_jump<'a, S: Settings<'a>>(
-    s: &S,
-    ctx: &mut Context<'a, '_>,
-    ctrl_stack: &VecDeque<StackEntry>,
-    target: BreakTarget,
-    inputs: &[WasmOpInput],
-    func_idx: u32,
-    dying_regs: &mut BTreeSet<u32>,
-) -> JumpResult<S::Directive> {
-    // There are 3 different kinds of jumps we have to deal with:
-    //
-    // 1. Jumps to a forward label in the current function.
-    // 2. Jump backwards to a loop iteration.
-    // 3. Returns from the function.
-
-    let target_entry = &ctrl_stack[target.depth as usize];
-    let allocation = &target_entry.allocation;
-    let (output_node_idx, target) = match target.kind {
-        TargetType::Loop => {
-            let loop_label = target_entry
-                .loop_label
-                .as_ref()
-                .expect("Loop target should have a loop label");
-
-            // This is a jump to a new loop iteration.
-            // The node whose outputs we want are the Inputs node of the loop (index 0).
-            (0, loop_label.as_str().into())
-        }
-        TargetType::Function => {
-            assert!(target_entry.loop_label.is_none());
-            // This is a return from the function.
-            // Calculate the outputs registers from the function type.
-            let func_type = &ctx.common.prog.get_func_type(func_idx).ty;
-            let ret_types = func_type.results();
-            // They are tightly packed at the top of the frame.
-            let mut fn_output_size = 0;
-            let input_ranges = ranges_for_types::<S>(ret_types, &mut fn_output_size);
-
-            // Use the current block's allocation to source the copied inputs:
-            let mut directives = copy_inputs_if_needed(s, ctx, inputs, input_ranges, dying_regs);
-
-            // Also calculate the space needed by the function inputs, to calculate where
-            // the return address and caller frame pointer are stored.
-            let fn_input_size = word_count_types::<S>(func_type.params());
-            let (ra, caller_fp) = calculate_ra_and_fp::<S>(fn_input_size, fn_output_size);
-
-            directives.push(s.emit_return(ctx, ra, caller_fp).into());
-
-            return JumpResult::Return(directives);
-        }
-        TargetType::Label(id) => {
-            // This is a jump to a label in the current function.
-            // The node we want is the target label's node.
-            (
-                target_entry.allocation.labels[&id],
-                format_label(id, LabelType::Local),
-            )
-        }
-    };
-
-    let input_ranges = allocation.get_for_node(output_node_idx);
-    let mut directives = copy_inputs_if_needed(s, ctx, inputs, input_ranges, dying_regs);
-    if directives.is_empty() {
-        JumpResult::PlainJump(target)
-    } else {
-        // Stuff remaining in dying_regs (i.e., unused inputs in BrTable)
-        // must be dropped before the jump.
-        for reg in std::mem::take(dying_regs) {
-            directives.push(s.emit_drop(ctx, reg).into());
-        }
-        directives.push(s.emit_jump(target.clone()).into());
-
-        JumpResult::CopyJump(target, directives)
     }
 }
 
