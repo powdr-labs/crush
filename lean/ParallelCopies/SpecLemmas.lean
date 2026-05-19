@@ -50,7 +50,7 @@ theorem Pair.appliesTo_of_ne_dst {src dst r : UInt32} (h : r ≠ dst) :
 /-! ## `applyParallel`: basic identities -/
 
 /-- Applying an empty list of parallel copies is the identity. -/
-@[simp] theorem applyParallel_nil (s : State) :
+@[simp] theorem applyParallel_nil (s : Memory) :
     applyParallel #[] s = s := by
   funext r
   simp [applyParallel]
@@ -58,7 +58,7 @@ theorem Pair.appliesTo_of_ne_dst {src dst r : UInt32} (h : r ≠ dst) :
 /-- Applying a single non-self-copy writes the source's *original* value to
     the destination, and leaves every other register unchanged. -/
 theorem applyParallel_single
-    {src dst : UInt32} (hne : src ≠ dst) (s : State) :
+    {src dst : UInt32} (hne : src ≠ dst) (s : Memory) :
     applyParallel #[(src, dst)] s =
       fun r => if r = dst then s src else s r := by
   funext r
@@ -72,7 +72,7 @@ theorem applyParallel_single
     simp [h]
 
 /-- A single self-copy is a no-op. -/
-@[simp] theorem applyParallel_selfCopy (r : UInt32) (s : State) :
+@[simp] theorem applyParallel_selfCopy (r : UInt32) (s : Memory) :
     applyParallel #[(r, r)] s = s := by
   funext q
   unfold applyParallel
@@ -110,10 +110,10 @@ theorem step_other (s : SState) (cp : Register × Register) {r : Register}
 
 /-! ## `lift`: the embedding from concrete state to sequential state -/
 
-@[simp] theorem lift_given (s : State) (tmp : UInt32) (r : UInt32) :
+@[simp] theorem lift_given (s : Memory) (tmp : UInt32) (r : UInt32) :
     lift s tmp (.given r) = s r := rfl
 
-@[simp] theorem lift_temp (s : State) (tmp : UInt32) :
+@[simp] theorem lift_temp (s : Memory) (tmp : UInt32) :
     lift s tmp .temp = tmp := rfl
 
 /-! ## Putting it together: a sanity-check theorem -/
@@ -121,7 +121,7 @@ theorem step_other (s : SState) (cp : Register × Register) {r : Register}
 /-- For empty input, the empty implementation already realises `applyParallel`.
     Sanity check that our framing is right. -/
 theorem realisesParallel_emptyImpl_on_empty
-    (s : State) (r : UInt32) :
+    (s : Memory) (r : UInt32) :
     applySequential #[] (lift s) (Register.given r) = applyParallel #[] s r := by
   simp
 

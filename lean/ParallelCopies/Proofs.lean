@@ -55,7 +55,7 @@ open Spec
   simp [sequenceParallelCopies]
 
 theorem sequenceParallelCopies_correct_on_empty
-    (s : State) (r : UInt32) :
+    (s : Memory) (r : UInt32) :
     applySequential (sequenceParallelCopies #[]) (lift s) (.given r) =
       applyParallel #[] s r := by
   simp
@@ -98,7 +98,7 @@ theorem sequenceParallelCopies_correct :
       sequenceParallelCopiesL pairs.toList := by simp [sequenceParallelCopies]
   rw [h_arr_to_list, sequenceParallelCopiesL_eq_explicit]
   have h_wfL : WellFormedL pairs.toList :=
-    fun s₁ s₂ d h_ne1 h_ne2 h_m1 h_m2 => h_wf s₁ s₂ d h_ne1 h_ne2 h_m1 h_m2
+    fun s₁ s₂ d h_ne1 h_ne2 h_m1 h_m2 => h_wf s₁ s₂ d h_ne1 h_ne2 (by grind) (by grind)
   have h_wf_pre : WellFormedL (preprocess pairs.toList) := preprocess_wellFormedL _ h_wfL
   have h_pre_uniq : UniqueDst (preprocess pairs.toList) := preprocess_uniqueDst _ h_wfL
   have h_pre_no_self : ∀ e ∈ preprocess pairs.toList, e.1 ≠ e.2 := preprocess_no_self _

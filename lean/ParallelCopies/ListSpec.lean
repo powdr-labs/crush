@@ -21,7 +21,7 @@ open Register
 /-- The list version of `applyParallel`. Uses the same predicate as
     `Spec.findWriter?` (`Pair.appliesTo`) so the array-bridge lemma is
     a straightforward `Array.find?_toList`. -/
-def applyParallelL (es : List Edge) (s : State) : State :=
+def applyParallelL (es : List Edge) (s : Memory) : Memory :=
   fun r =>
     match es.find? (Pair.appliesTo · r) with
     | some (src, _) => s src
@@ -38,7 +38,7 @@ def applyParallelLS (es : List Edge) (σ : SState) : SState :=
       | some (src, _) => σ (.given src)
       | none          => σ (.given r')
 
-@[simp] theorem applyParallelL_nil (s : State) :
+@[simp] theorem applyParallelL_nil (s : Memory) :
     applyParallelL [] s = s := by funext r; simp [applyParallelL]
 
 @[simp] theorem applyParallelLS_nil (σ : SState) :
@@ -47,7 +47,7 @@ def applyParallelLS (es : List Edge) (σ : SState) : SState :=
   cases r <;> simp [applyParallelLS]
 
 /-- The `LS` version respects lifting from `State`. -/
-theorem applyParallelLS_lift (es : List Edge) (s : State) :
+theorem applyParallelLS_lift (es : List Edge) (s : Memory) :
     applyParallelLS es (lift s) = lift (applyParallelL es s) := by
   funext r
   cases r with
@@ -87,7 +87,7 @@ theorem applySequential_eq_L
   simp [applySequential, applySequentialL, Array.foldl_toList]
 
 theorem applyParallel_eq_L
-    (pairs : Array Edge) (s : State) :
+    (pairs : Array Edge) (s : Memory) :
     applyParallel pairs s = applyParallelL pairs.toList s := by
   funext r
   unfold applyParallel applyParallelL findWriter?
