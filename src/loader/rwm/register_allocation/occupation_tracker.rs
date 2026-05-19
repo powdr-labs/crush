@@ -54,7 +54,7 @@ struct AllocationEntry {
 /// an `AllocationEntry`. Dimensionless ranges `[X, X)` are widened to `[X, X + 1)`
 /// because `iset::IntervalMap` does not accept empty intervals. All other ranges
 /// pass through unchanged.
-fn interval_map_range(r: &Range<usize>) -> Range<usize> {
+fn interval_map_range_fix(r: &Range<usize>) -> Range<usize> {
     if r.start < r.end {
         r.clone()
     } else {
@@ -90,7 +90,7 @@ impl Occupation {
     pub fn reg_occupation(&self, live_ranges: &[Range<usize>]) -> Vec<Range<u32>> {
         live_ranges
             .iter()
-            .map(interval_map_range)
+            .map(interval_map_range_fix)
             .flat_map(|live_range| {
                 self.alive_interval_map
                     .values(live_range)
@@ -629,7 +629,7 @@ impl OccupationTracker {
         for range in live_ranges.iter() {
             self.occupation
                 .alive_interval_map
-                .force_insert(interval_map_range(range), entry_idx);
+                .force_insert(interval_map_range_fix(range), entry_idx);
         }
 
         self.occupation.allocations.push(AllocationEntry {
@@ -653,7 +653,7 @@ impl OccupationTracker {
         for live_range in alloc.live_ranges.iter() {
             self.occupation
                 .alive_interval_map
-                .remove_where(interval_map_range(live_range), |idx| *idx == entry_idx);
+                .remove_where(interval_map_range_fix(live_range), |idx| *idx == entry_idx);
         }
 
         // Now we need to fix the references to the entry moved by swap_remove.
@@ -669,7 +669,7 @@ impl OccupationTracker {
         }
 
         for live_range in moved_entry.live_ranges.iter() {
-            let im_range = interval_map_range(live_range);
+            let im_range = interval_map_range_fix(live_range);
             self.occupation
                 .alive_interval_map
                 .remove_where(im_range.clone(), |idx| *idx == old_idx);
