@@ -478,10 +478,16 @@ fn recursive_block_allocation<'a, S: Settings>(
                         // This input outlives the loop body, but inside the loop
                         // it is just forwarded unchanged to the next iteration.
                         // We can always reuse the allocation from the outer level.
+                        //
+                        // The register must stay alive for the whole loop body:
+                        // dropping it inside would also drop the outer value, since
+                        // they share the same register. Mark the inner alias as
+                        // alive throughout the block so no drop is ever emitted for
+                        // it inside the loop.
                         let allocation = oa[0].occupation_tracker.get_allocation(*origin).unwrap();
                         number_of_saved_copies += allocation.len();
 
-                        occupation_tracker.set_allocation(
+                        occupation_tracker.set_allocation_alive_throughout(
                             ValueOrigin {
                                 node: 0,
                                 output_idx: input_idx as u32,

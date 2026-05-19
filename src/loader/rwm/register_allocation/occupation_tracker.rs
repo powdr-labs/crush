@@ -194,6 +194,31 @@ impl OccupationTracker {
         );
     }
 
+    /// Like [`set_allocation`], but marks the value as alive for the entire
+    /// block (live range `0..usize::MAX`). The register will not be dropped
+    /// anywhere inside this block.
+    ///
+    /// Intended for redirected loop inputs whose outer value is still alive
+    /// after the loop: the inner alias must share the outer register without
+    /// ever being released inside the loop body.
+    ///
+    /// Warning: this function doesn't check for overlaps with other existing allocations!
+    pub fn set_allocation_alive_throughout(&mut self, origin: ValueOrigin, reg_range: Range<u32>) {
+        if let Some(alloc_idx) = self.origin_map.get(&origin) {
+            let existing_alloc = &self.occupation.allocations[*alloc_idx];
+            assert_eq!(existing_alloc.reg_range, reg_range);
+        }
+
+        self.insert(
+            AllocationType::Value {
+                origin,
+                do_not_relocate: true,
+            },
+            reg_range,
+            WHOLE_RANGE.clone(),
+        );
+    }
+
     /// Reserve a given register range, blocking it from being used.
     pub fn reserve_range(&mut self, reg_range: Range<u32>) {
         self.insert(
