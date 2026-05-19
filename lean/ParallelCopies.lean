@@ -1,3 +1,4 @@
+import Std.Data.HashSet.Basic
 /-!
 # Parallel-Copy Sequencing — verified Lean 4 implementation
 
@@ -51,13 +52,18 @@ abbrev Edges := List Edge
 
 /-- Drop self-copies and exact duplicates while preserving the order of first
     occurrence. -/
-def preprocess : List Edge → Edges
-  | []           => []
-  | (s, d) :: es =>
-    let rest := preprocess es
-    if s = d then rest
-    else if rest.contains (s, d) then rest
-    else (s, d) :: rest
+def preprocess (edges : Array Edge) : Array Edge := Id.run do
+  let mut seen : Std.HashSet Edge := {}
+  let mut result := #[]
+  for e in edges do
+    if e.1 == e.2 then
+      continue
+    else if seen.contains e then
+      continue
+    else
+      seen := seen.insert e
+      result := result.push e
+  return result
 
 /-! ## Phase 1 — prune trees -/
 
@@ -149,10 +155,11 @@ def phase2 :
 /-- Sequence parallel copies into a sequential schedule with at most one
     temporary. **Pre-condition**: every destination register appears at most
     once as a non-self-copy destination. -/
-def sequenceParallelCopiesL (pairs : List Edge) : List (Register × Register) :=
+def sequenceParallelCopies (pairs : Array Edge) : Array (Register × Register) :=
   let es              := preprocess pairs
-  let fuel            := es.length + 1
-  let (es, nonCycle)  := phase1 fuel es []
+  let fuel            := es.size + 1
+  -- TODO change this to array
+  let (es, nonCycle)  := phase1 fuel es.toList []
   -- nonCycle (leaf-pruning) runs first, then phase2 (cycle-breaking).
   -- The two blocks act on disjoint Lean-level register sets — phase2 only
   -- writes `.temp` and `.given d` for cycle dsts `d`; nonCycle only touches
@@ -163,11 +170,8 @@ def sequenceParallelCopiesL (pairs : List Edge) : List (Register × Register) :=
   -- the order-dependence shows up at the implementation level (see
   -- `src/loader/rwm/flattening/mod.rs::parallel_copy`).
   nonCycle.map (fun (s, d) => (Register.given s, Register.given d))
-    ++ phase2 fuel Register.temp es []
+    ++ phase2 fuel Register.temp es [] |>.toArray
 
-/-- Array wrapper: the public entry point used by the FFI. -/
-def sequenceParallelCopies (pairs : Array Edge) : Array (Register × Register) :=
-  (sequenceParallelCopiesL pairs.toList).toArray
 
 /-! ## FFI surface
 
