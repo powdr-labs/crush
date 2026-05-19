@@ -348,7 +348,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
 
             // We must save all the currently live registers so that the target label can emit the relevant drops.
             let live_regs = ctx.allocation.occupation_for_node(node_idx);
-            jump_directives.save_live_at_jump::<S>(live_regs_at_jump, &live_regs, dying_regs);
+            jump_directives.save_live_at_jump(live_regs_at_jump, &live_regs, dying_regs);
 
             let mut directives = Vec::new();
             if drop_selector {
@@ -447,7 +447,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
 
             // The last target is special, because it is the default target.
             let (default_target, dying) = jump_instructions.pop().unwrap();
-            default_target.save_live_at_jump::<S>(live_regs_at_jump, &live_regs, dying);
+            default_target.save_live_at_jump(live_regs_at_jump, &live_regs, dying);
 
             // Decide whether or not to drop the selector at the relative jump instruction.
             assert!(!jump_instructions.is_empty());
@@ -465,7 +465,7 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                         dying.remove(&selector.start);
                     }
 
-                    jump_result.save_live_at_jump::<S>(live_regs_at_jump, &live_regs, dying);
+                    jump_result.save_live_at_jump(live_regs_at_jump, &live_regs, dying);
                     jump_result
                 })
                 .collect_vec();
@@ -475,12 +475,6 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             let mut directives = Vec::new();
             match default_target {
                 JumpResult::PlainJump(target) => {
-                    // add the temp to the set of live registers at the target label, to make sure it gets dropped there.
-                    live_regs_at_jump
-                        .entry(target.clone())
-                        .or_default()
-                        .insert(selector.start);
-
                     // If the default target is a plain jump to a local label,
                     // just jump if the selector is out of bounds.
                     directives.push(
@@ -823,20 +817,22 @@ impl<D> JumpResult<D> {
         }
     }
 
-    fn save_live_at_jump<'a, S: Settings<'a>>(
+    fn save_live_at_jump(
         &self,
         live_regs_at_jump: &mut HashMap<String, BTreeSet<u32>>,
         currently_live: &[Range<u32>],
         dying_regs: BTreeSet<u32>,
     ) {
-        if let Some(live_set) = self
-            .target()
-            .and_then(|target| live_regs_at_jump.get_mut(target))
-        {
+        if currently_live.is_empty() && dying_regs.is_empty() {
+            return;
+        }
+
+        if let Some(target) = self.target() {
             // Whenever this jump is a conditional jump (br_table jumps included), we can have extra "sudden"
             // register deaths: registers that must be kept alive if this branch is not taken, but are no longer
             // needed if this branch is taken. We must save what are the registers that are currently live at the
             // jump, so that the target can know what drops to emit.
+            let live_set = live_regs_at_jump.entry(target.clone()).or_default();
             for range in currently_live {
                 for reg in range.clone() {
                     live_set.insert(reg);
