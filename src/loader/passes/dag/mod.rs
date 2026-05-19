@@ -184,14 +184,14 @@ struct BreakArgs {
     locals: BTreeSet<u32>,
 }
 
+type LocalGetter<'a> = dyn Fn(&mut Vec<Node<'a>>, &mut [Value], u32) -> ValueOrigin;
+
 /// Follows the instructions sequence of a block to build the DAG.
 ///
 /// For that we need to keep track of the stack and of which of our hypergraph edges is
 /// currently each local variable. When a local is assigned, it becames a new edge.
 // TODO: refactor "too many arguments"
 #[allow(clippy::too_many_arguments)]
-// TODO: refactor
-#[allow(clippy::type_complexity)]
 fn build_dag<'a>(
     module: &Module<'a>,
     locals_types: &[ValType],
@@ -200,7 +200,7 @@ fn build_dag<'a>(
     stack: Vec<ValueOrigin>,
     mut locals: Vec<Value>,
     block_elements: Vec<Element<'a>>,
-    local_getter: &dyn Fn(&mut Vec<Node>, &mut [Value], u32) -> ValueOrigin,
+    local_getter: &LocalGetter<'a>,
 ) -> wasmparser::Result<Vec<Node<'a>>> {
     let mut t = StackTracker {
         module,
@@ -249,24 +249,14 @@ fn build_dag<'a>(
                 // We now handle the break instructions. They are special because they
                 // take inputs both from the stack and from the locals, and to know
                 // which locals are inputs we need to look up at the block stack.
-                Ins::WASMOp(op @ Op::Br { relative_depth }) => {
-                    let target = &block_stack[relative_depth as usize];
-
-                    // The stack part of the input
-                    let mut inputs = t.stack_pop_many(target.stack.len());
-                    assert!(types_matches(&t.nodes, &target.stack, &inputs));
-
-                    // The locals part of the input
-                    for local_index in target.locals.iter() {
-                        let value = local_getter(&mut t.nodes, &mut locals, *local_index);
-                        inputs.push(value.into());
-                    }
-
-                    t.nodes.push(Node {
-                        operation: Operation::WASMOp(op),
-                        inputs,
-                        output_types: Vec::new(),
-                    });
+                Ins::WASMOp(Op::Br { relative_depth }) => {
+                    emit_br(
+                        &mut t,
+                        &mut locals,
+                        block_stack,
+                        local_getter,
+                        relative_depth,
+                    );
                 }
                 Ins::WASMOp(Op::BrIf { relative_depth }) | Ins::BrIfZero { relative_depth } => {
                     let operation = match inst {
@@ -321,6 +311,13 @@ fn build_dag<'a>(
                         t.nodes[choice.node].output_types[choice.output_idx as usize],
                         ValType::I32
                     );
+
+                    // If there's only the default target, this is just an unconditional
+                    // branch with an unused choice value. Emit a Br instead.
+                    if targets.len() == 1 {
+                        emit_br(&mut t, &mut locals, block_stack, local_getter, targets[0]);
+                        continue;
+                    }
 
                     // Calculate how much of the stack to take
                     let largest_stack = targets
@@ -628,6 +625,33 @@ fn types_matches(nodes: &[Node], expected_types: &[ValType], inputs: &[NodeInput
 enum Value {
     UnusedLocal { val_type: ValType },
     Defined(ValueOrigin),
+}
+
+/// Emits a `Br` node, popping the target's stack inputs and gathering its locals.
+fn emit_br<'a>(
+    t: &mut StackTracker<'a, '_>,
+    locals: &mut [Value],
+    block_stack: &VecDeque<BreakArgs>,
+    local_getter: &LocalGetter<'a>,
+    relative_depth: u32,
+) {
+    let target = &block_stack[relative_depth as usize];
+
+    // The stack part of the input
+    let mut inputs = t.stack_pop_many(target.stack.len());
+    assert!(types_matches(&t.nodes, &target.stack, &inputs));
+
+    // The locals part of the input
+    for local_index in target.locals.iter() {
+        let value = local_getter(&mut t.nodes, locals, *local_index);
+        inputs.push(value.into());
+    }
+
+    t.nodes.push(Node {
+        operation: Operation::WASMOp(Op::Br { relative_depth }),
+        inputs,
+        output_types: Vec::new(),
+    });
 }
 
 /// Returns a constant with the default value for the given type.
