@@ -418,7 +418,6 @@ fn process_node<'a, 'b, S: Settings<'a>>(
 
             let live_regs = ctx.allocation.occupation_for_node(node_idx);
 
-            let mut drop_selector = reg_changes.dying.contains(&selector.start);
             let mut choice_inputs = Vec::with_capacity(table_inputs.len());
             let mut jump_instructions = targets
                 .into_iter()
@@ -442,11 +441,6 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                         &mut dying,
                     );
 
-                    if drop_selector && !dying.contains(&selector.start) {
-                        // If the selector was needed at this branch, we can't drop it at the jump.
-                        drop_selector = false;
-                    }
-
                     (jump_result, dying)
                 })
                 .collect_vec();
@@ -454,6 +448,12 @@ fn process_node<'a, 'b, S: Settings<'a>>(
             // The last target is special, because it is the default target.
             let (default_target, dying) = jump_instructions.pop().unwrap();
             default_target.save_live_at_jump::<S>(live_regs_at_jump, &live_regs, dying);
+
+            // Decide whether or not to drop the selector at the relative jump instruction.
+            assert!(!jump_instructions.is_empty());
+            let drop_selector = jump_instructions
+                .iter()
+                .all(|(_, dying)| dying.contains(&selector.start));
 
             // We need to save the live registers at each jump, so that the target labels can emit the relevant drops.
             let jump_instructions = jump_instructions
