@@ -457,6 +457,69 @@ mod tests {
     }
 
     #[test]
+    fn test_br_table_sel_used_in_default() {
+        // Default branch consumes the br_table selector value as one of its
+        // branch arguments. arg+10 is both the selector and the topmost arg.
+        // Non-default targets (idx 0/1) drop the args and return fixed pairs;
+        // the default branch passes [7, arg+10] through as the function's
+        // two return values.
+        for (arg, expected) in [
+            (4294967286u32, vec![1000, 1100]), // arg+10 == 0 -> idx 0
+            (4294967287u32, vec![1001, 1101]), // arg+10 == 1 -> idx 1
+            (0u32, vec![7, 10]),               // arg+10 == 10 -> default
+            (5u32, vec![7, 15]),               // arg+10 == 15 -> default
+        ] {
+            test_interpreter_from_sample_programs(
+                "br_table_selector_drop.wasm",
+                "sel_used_in_default",
+                &[arg],
+                vec![],
+                &expected,
+            );
+        }
+    }
+
+    #[test]
+    fn test_br_table_sel_used_in_specific() {
+        // The middle target (idx 1) consumes both branch arguments and
+        // returns them; the other two drop them and return fixed pairs.
+        for (arg, expected) in [
+            (4294967286u32, vec![2000, 2100]), // idx 0
+            (4294967287u32, vec![7, 1]),       // idx 1 — keeps the value
+            (0u32, vec![2002, 2102]),          // default
+            (5u32, vec![2002, 2102]),          // default
+        ] {
+            test_interpreter_from_sample_programs(
+                "br_table_selector_drop.wasm",
+                "sel_used_in_specific",
+                &[arg],
+                vec![],
+                &expected,
+            );
+        }
+    }
+
+    #[test]
+    fn test_br_table_sel_unused_after_table() {
+        // No branch arguments: the selector value must be dropped at the
+        // br_table itself. Each target returns its own constant.
+        for (arg, expected) in [
+            (4294967286u32, 3000), // idx 0
+            (4294967287u32, 3001), // idx 1
+            (0u32, 3002),          // default
+            (5u32, 3002),          // default
+        ] {
+            test_interpreter_from_sample_programs(
+                "br_table_selector_drop.wasm",
+                "sel_unused_after_table",
+                &[arg],
+                vec![],
+                &[expected],
+            );
+        }
+    }
+
+    #[test]
     fn test_label_namespace_uses_exports_and_name_section() {
         let wat = r#"
             (module

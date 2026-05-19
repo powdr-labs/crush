@@ -511,10 +511,6 @@ fn process_node<'a, 'b, S: Settings<'a>>(
                         .into(),
                     ]);
 
-                    if drop_selector {
-                        directives.push(s.emit_drop(&mut ctx, selector.start).into());
-                    }
-
                     directives.extend([
                         // Otherwise fall through to the default target.
                         jump_directives.into(),
