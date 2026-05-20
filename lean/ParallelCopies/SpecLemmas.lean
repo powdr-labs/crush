@@ -98,42 +98,38 @@ theorem applySeqState_push (r : MProd Memory UInt32)
 theorem sourceOf_isSome_iff (pairs : Array (UInt32 × UInt32)) (d : UInt32) :
     (sourceOf pairs d).isSome ↔ ∃ s, (s, d) ∈ pairs ∧ s ≠ d := by
   unfold sourceOf
-  constructor
+  refine ⟨?_, ?_⟩
   · intro h
     cases hfind : pairs.find? (fun e => e.2 == d && e.1 != e.2) with
-    | none => rw [hfind] at h; simp at h
+    | none => simp_all
     | some p =>
       obtain ⟨s, d'⟩ := p
       have hp := Array.find?_some hfind
       have hmem := Array.mem_of_find?_eq_some hfind
       simp at hp
-      obtain ⟨hd, hne⟩ := hp
-      subst hd
+      obtain ⟨rfl, hne⟩ := hp
       exact ⟨s, hmem, hne⟩
   · intro ⟨s, hmem, hne⟩
     have hsome : (pairs.find? (fun e => e.2 == d && e.1 != e.2)).isSome := by
-      rw [Array.find?_isSome]
-      exact ⟨(s, d), hmem, by simp [hne]⟩
+      rw [Array.find?_isSome]; exact ⟨(s, d), hmem, by simp [hne]⟩
     cases hfind : pairs.find? (fun e => e.2 == d && e.1 != e.2) with
-    | none => rw [hfind] at hsome; simp at hsome
+    | none => simp_all
     | some p => cases p; simp
 
 theorem sourceOf_eq_none_iff (pairs : Array (UInt32 × UInt32)) (d : UInt32) :
     sourceOf pairs d = none ↔ ∀ s, ¬ ((s, d) ∈ pairs ∧ s ≠ d) := by
-  constructor
+  refine ⟨?_, ?_⟩
   · intro h s ⟨hmem, hne⟩
-    have hsome : (sourceOf pairs d).isSome := by
-      rw [sourceOf_isSome_iff]; exact ⟨s, hmem, hne⟩
-    rw [h] at hsome
-    simp at hsome
+    have hsome : (sourceOf pairs d).isSome :=
+      (sourceOf_isSome_iff pairs d).mpr ⟨s, hmem, hne⟩
+    simp_all
   · intro h
     cases hs : sourceOf pairs d with
     | none => rfl
     | some s =>
       exfalso
       have hsome : (sourceOf pairs d).isSome := by rw [hs]; rfl
-      rw [sourceOf_isSome_iff] at hsome
-      obtain ⟨s', hmem, hne⟩ := hsome
+      obtain ⟨s', hmem, hne⟩ := (sourceOf_isSome_iff pairs d).mp hsome
       exact h s' ⟨hmem, hne⟩
 
 /-! ## `preprocess` preserves `applyParallel`

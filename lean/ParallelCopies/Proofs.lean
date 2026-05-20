@@ -460,35 +460,26 @@ theorem Phase1Inv.peelable
     {d2s : DstMap} {s2d : SrcMap} {leaves : LeafSet}
     (hinv : Phase1Inv d2s s2d leaves)
     {d s : UInt32}
-    (h_leaf : d ∈ leaves) (h_src : d2s[d]? = some s) :
+    (h_leaf : d ∈ leaves) (_h_src : d2s[d]? = some s) :
     let sOutsMinusD := (s2d.getD s ∅).erase d
     (∀ x : UInt32, d2s[x]? ≠ some d) ∧
     d ∉ sOutsMinusD ∧
     (∀ x : UInt32,
       x ∈ sOutsMinusD ↔ x ≠ d ∧ d2s[x]? = some s) := by
   refine ⟨?_, ?_, ?_⟩
-  · -- d not a source. From the leaves invariant, d ∉ s2d (since d ∈ leaves).
-    intro x hd2s_x_eq_d
+  · intro x hd2s_x_eq_d
     have hd_not_s2d : d ∉ s2d := ((hinv.leaves_iff d).mp h_leaf).2
     have hx_in_s2d_d : x ∈ s2d.getD d ∅ := (hinv.s2d_inv x d).mpr hd2s_x_eq_d
-    -- d ∉ s2d → getD = ∅; x ∈ ∅ is false.
     rw [Std.TreeMap.getD_eq_fallback hd_not_s2d] at hx_in_s2d_d
-    exact (Std.TreeSet.not_mem_emptyc (k := x)) hx_in_s2d_d
-  · -- d ∉ (... ).erase d.
-    rw [Std.TreeSet.mem_erase]
-    intro ⟨hcmp, _⟩
-    exact hcmp Std.ReflCmp.compare_self
+    exact Std.TreeSet.not_mem_emptyc hx_in_s2d_d
+  · rw [Std.TreeSet.mem_erase]
+    intro ⟨hcmp, _⟩; exact hcmp Std.ReflCmp.compare_self
   · intro x
-    rw [Std.TreeSet.mem_erase]
-    constructor
-    · intro ⟨hcmp_ne, hx_in⟩
-      refine ⟨?_, (hinv.s2d_inv x s).mp hx_in⟩
-      intro heq
-      exact hcmp_ne (heq ▸ Std.ReflCmp.compare_self)
-    · intro ⟨h_ne, h_get⟩
-      refine ⟨?_, (hinv.s2d_inv x s).mpr h_get⟩
-      intro heq
-      exact h_ne ((Std.LawfulEqOrd.eq_of_compare heq).symm)
+    rw [Std.TreeSet.mem_erase, hinv.s2d_inv x s]
+    refine ⟨fun ⟨hcmp_ne, hin⟩ => ⟨?_, hin⟩,
+            fun ⟨h_ne, hin⟩ => ⟨?_, hin⟩⟩
+    · intro heq; exact hcmp_ne (heq ▸ Std.ReflCmp.compare_self)
+    · intro heq; exact h_ne (Std.LawfulEqOrd.eq_of_compare heq).symm
 
 /-! ### Phase 1 semantic invariant (statement)
 
@@ -542,40 +533,12 @@ theorem peelDstMap_get_cases (d2s : DstMap) (d : UInt32)
 /-- Membership in `peelS2D` after peel. -/
 theorem peelS2D_mem (s2d : SrcMap) (s d : UInt32)
     (sOutsMinusD : Std.TreeSet UInt32) (s' : UInt32)
-    (h_d_ne_s : d ≠ s) (h_d_not_in_s2d : d ∉ s2d) :
+    (_h_d_ne_s : d ≠ s) (_h_d_not_in_s2d : d ∉ s2d) :
     s' ∈ peelS2D s2d s d sOutsMinusD ↔
       (s' = d ∧ ¬sOutsMinusD.isEmpty) ∨ (s' ∈ s2d ∧ s' ≠ s) := by
   unfold peelS2D
-  split <;> rename_i h_empty
-  · -- isEmpty branch: peelS2D = s2d.erase s.
-    simp only [Std.TreeMap.mem_erase]
-    constructor
-    · intro ⟨hcmp, hin⟩
-      have hne : s ≠ s' := fun heq => hcmp (heq ▸ Std.ReflCmp.compare_self)
-      right; exact ⟨hin, hne.symm⟩
-    · intro h
-      rcases h with ⟨heq, hne⟩ | ⟨hin, hne⟩
-      · subst heq; exfalso; simp_all
-      · refine ⟨?_, hin⟩
-        intro heq
-        exact hne (Std.LawfulEqOrd.eq_of_compare heq).symm
-  · -- non-empty: peelS2D = (s2d.erase s).insert d sOutsMinusD
-    simp only [Std.TreeMap.mem_insert, Std.TreeMap.mem_erase]
-    constructor
-    · intro h
-      rcases h with hcmp_eq | ⟨hcmp_ne, hin⟩
-      · have : d = s' := Std.LawfulEqOrd.eq_of_compare hcmp_eq
-        left; exact ⟨this.symm, by simp [h_empty]⟩
-      · have h_ne_s : s ≠ s' := fun heq => hcmp_ne (heq ▸ Std.ReflCmp.compare_self)
-        right; exact ⟨hin, h_ne_s.symm⟩
-    · intro h
-      rcases h with ⟨heq, _⟩ | ⟨hin, hne⟩
-      · subst heq
-        left; exact Std.ReflCmp.compare_self
-      · right
-        refine ⟨?_, hin⟩
-        intro heq
-        exact hne (Std.LawfulEqOrd.eq_of_compare heq).symm
+  split <;> rename_i h_empty <;>
+    simp only [Std.TreeMap.mem_erase, Std.TreeMap.mem_insert] <;> grind
 
 /-! ### `no_self` component of Phase1Inv preservation -/
 
@@ -605,30 +568,18 @@ theorem peelS2D_getD_at_d
     (h_d_ne_s : d ≠ s) (h_d_not_in_s2d : d ∉ s2d) (x : UInt32) :
     x ∈ (peelS2D s2d s d sOutsMinusD).getD d ∅ ↔ x ∈ sOutsMinusD := by
   unfold peelS2D
+  have h_cmp_s_d : compare s d ≠ .eq := fun heq =>
+    h_d_ne_s (Std.LawfulEqOrd.eq_of_compare heq).symm
   split
   · rename_i h_empty
-    -- s2d' = s2d.erase s. getD at d. Since d ≠ s, this is s2d[d]? defaulted.
-    -- d ∉ s2d so s2d.getD d ∅ = ∅. Also sOutsMinusD has isEmpty=true so empty.
     rw [Std.TreeMap.getD_erase]
-    have h_cmp_s_d : compare s d ≠ .eq := fun heq =>
-      h_d_ne_s (Std.LawfulEqOrd.eq_of_compare heq).symm
-    simp [h_cmp_s_d]
-    rw [Std.TreeMap.getD_eq_fallback h_d_not_in_s2d]
-    constructor
-    · intro h; exact absurd h Std.TreeSet.not_mem_emptyc
-    · intro h
-      -- sOutsMinusD empty by h_empty, so x ∈ ∅
-      have : ∀ y, y ∉ sOutsMinusD := by
-        intro y hy
-        have : sOutsMinusD.isEmpty = false := by
-          rw [Std.TreeSet.isEmpty_eq_false_iff_exists_contains_eq_true]
-          exact ⟨y, by simp_all⟩
-        simp_all
-      exact absurd h (this x)
-  · -- non-empty: s2d' = (s2d.erase s).insert d sOutsMinusD
-    rw [Std.TreeMap.getD_insert]
-    have h_cmp_d_d : compare d d = .eq := Std.ReflCmp.compare_self
-    simp [h_cmp_d_d]
+    simp [h_cmp_s_d, Std.TreeMap.getD_eq_fallback h_d_not_in_s2d]
+    intro h
+    have : sOutsMinusD.isEmpty = false :=
+      Std.TreeSet.isEmpty_eq_false_iff_exists_contains_eq_true.mpr ⟨x, by simp_all⟩
+    simp_all
+  · rw [Std.TreeMap.getD_insert]
+    simp [Std.ReflCmp.compare_self]
 
 /-- After peel: querying `s2d'` at `s` returns `∅` (s has been erased). -/
 theorem peelS2D_getD_at_s
@@ -638,12 +589,11 @@ theorem peelS2D_getD_at_s
   unfold peelS2D
   have h_cmp_d_s : compare d s ≠ .eq := fun heq =>
     h_d_ne_s (Std.LawfulEqOrd.eq_of_compare heq)
-  have h_cmp_s_s : compare s s = .eq := Std.ReflCmp.compare_self
   split
   · rw [Std.TreeMap.getD_erase]
-    simp [h_cmp_s_s]
+    simp [Std.ReflCmp.compare_self]
   · rw [Std.TreeMap.getD_insert]
-    simp [h_cmp_d_s, Std.TreeMap.getD_erase, h_cmp_s_s]
+    simp [h_cmp_d_s]
 
 /-- After peel: querying `s2d'` at `s'` (where `s' ≠ d, s`) returns the
     original `s2d.getD s' ∅`. -/
@@ -678,51 +628,34 @@ theorem Phase1Inv.peel_s2d_inv
   have h_d_ne_s : d ≠ s := fun heq => h_inv.no_self d (heq.symm ▸ h_src)
   have h_d_not_in_s2d : d ∉ s2d := ((h_inv.leaves_iff d).mp h_leaf).2
   rw [peelDstMap_get_cases _ _ _ h_d_not_in]
-  -- Split on s' vs d / s without subst.
   by_cases h_s'_d : s' = d
-  · -- s' = d case.
-    rw [h_s'_d]
-    rw [peelS2D_getD_at_d _ _ _ _ h_d_ne_s h_d_not_in_s2d x]
+  · rw [h_s'_d, peelS2D_getD_at_d _ _ _ _ h_d_ne_s h_d_not_in_s2d x]
     by_cases hxd : x = d
     · rw [hxd]; simp
-    · by_cases hxs : x ∈ (s2d.getD s ∅).erase d
-      · simp [hxd, hxs]
-      · simp [hxd, hxs]; intro heq; exact h_d_leaf x heq
+    · by_cases hxs : x ∈ (s2d.getD s ∅).erase d <;>
+        simp [hxd, hxs] <;> grind
   · by_cases h_s'_s : s' = s
-    · -- s' = s case.
-      rw [h_s'_s]
-      constructor
-      · intro hx
-        exact absurd hx (peelS2D_getD_at_s _ _ _ _ h_d_ne_s x)
-      · intro h_eq
-        exfalso
-        by_cases hxd : x = d
-        · rw [hxd] at h_eq; simp at h_eq
-        · by_cases hxs : x ∈ (s2d.getD s ∅).erase d
-          · simp [hxd, hxs] at h_eq
-            exact h_d_ne_s h_eq
-          · simp [hxd, hxs] at h_eq
-            exact hxs ((h_sOuts_iff x).mpr ⟨hxd, h_eq⟩)
-    · -- s' ≠ d, s'.
-      rw [peelS2D_getD_at_other _ _ _ _ _ h_s'_d h_s'_s x]
+    · rw [h_s'_s]
+      refine ⟨fun hx => absurd hx (peelS2D_getD_at_s _ _ _ _ h_d_ne_s x), ?_⟩
+      intro h_eq; exfalso
+      by_cases hxd : x = d
+      · rw [hxd] at h_eq; simp at h_eq
+      · by_cases hxs : x ∈ (s2d.getD s ∅).erase d <;>
+          simp [hxd, hxs] at h_eq
+        · exact h_d_ne_s h_eq
+        · exact hxs ((h_sOuts_iff x).mpr ⟨hxd, h_eq⟩)
+    · rw [peelS2D_getD_at_other _ _ _ _ _ h_s'_d h_s'_s x]
       by_cases hxd : x = d
       · rw [hxd]; simp
         intro h_in
         have h_eq : d2s[d]? = some s' := (h_inv.s2d_inv d s').mp h_in
-        rw [h_src] at h_eq
-        injection h_eq with h_inner
-        exact h_s'_s h_inner.symm
+        grind
       · by_cases hxs : x ∈ (s2d.getD s ∅).erase d
         · simp [hxd, hxs]
-          constructor
-          · intro h_in
-            have h_eq : d2s[x]? = some s' := (h_inv.s2d_inv x s').mp h_in
-            have h_eq_s : d2s[x]? = some s := ((h_sOuts_iff x).mp hxs).2
-            rw [h_eq_s] at h_eq
-            injection h_eq with h_inner
-            exact (h_s'_s h_inner.symm).elim
-          · intro h_d_eq
-            exact (h_s'_d h_d_eq.symm).elim
+          have h_d2s_s : d2s[x]? = some s := ((h_sOuts_iff x).mp hxs).2
+          refine ⟨fun h_in => ?_, fun h_d_eq => (h_s'_d h_d_eq.symm).elim⟩
+          have h_eq := (h_inv.s2d_inv x s').mp h_in
+          grind
         · simp [hxd, hxs]
           exact h_inv.s2d_inv x s'
 
@@ -778,22 +711,21 @@ theorem Phase1Inv.peel_leaves_iff
   rw [peelDstMap_mem _ _ _ h_d_not_in h_sOuts_in_d2s]
   by_cases hxd : x = d
   · rw [hxd]
-    constructor
-    · intro hx
-      unfold peelLeaves at hx
-      simp only at hx
-      split at hx
-      · rw [Std.TreeSet.mem_insert] at hx
-        rcases hx with hcmp | hin
-        · exfalso; exact h_d_ne_s.symm (Std.LawfulEqOrd.eq_of_compare hcmp)
-        · rw [Std.TreeSet.mem_erase] at hin
-          exact absurd Std.ReflCmp.compare_self hin.1
-      · rw [Std.TreeSet.mem_erase] at hx
-        exact absurd Std.ReflCmp.compare_self hx.1
-    · intro ⟨⟨h_ne, _⟩, _⟩
-      exact absurd rfl h_ne
+    refine ⟨?_, fun ⟨⟨h_ne, _⟩, _⟩ => absurd rfl h_ne⟩
+    intro hx
+    unfold peelLeaves at hx
+    simp only at hx
+    split at hx
+    · rw [Std.TreeSet.mem_insert] at hx
+      rcases hx with hcmp | hin
+      · exfalso; exact h_d_ne_s.symm (Std.LawfulEqOrd.eq_of_compare hcmp)
+      · rw [Std.TreeSet.mem_erase] at hin
+        exact absurd Std.ReflCmp.compare_self hin.1
+    · rw [Std.TreeSet.mem_erase] at hx
+      exact absurd Std.ReflCmp.compare_self hx.1
   · by_cases hxs : x = s
     · rw [hxs]
+      have h_s_ne_d : ¬(s = d) := fun h => h_d_ne_s.symm h
       constructor
       · intro hx
         refine ⟨⟨h_d_ne_s.symm, ?_⟩, h_s_not_in_s2d'⟩
@@ -804,7 +736,6 @@ theorem Phase1Inv.peel_leaves_iff
           simp only [Bool.and_eq_true, Bool.not_eq_true'] at hcond
           rw [Std.TreeMap.contains_eq_isSome_getElem?,
               peelDstMap_get_cases _ _ _ h_d_not_in] at hcond
-          have h_s_ne_d : ¬(s = d) := fun h => h_d_ne_s.symm h
           simp [h_s_ne_d, h_s_not_in_sOuts] at hcond
           exact hcond.1
         · rw [Std.TreeSet.mem_erase] at hx
@@ -814,7 +745,6 @@ theorem Phase1Inv.peel_leaves_iff
             (peelDstMap d2s d ((s2d.getD s ∅).erase d)).contains s = true := by
           rw [Std.TreeMap.contains_eq_isSome_getElem?,
               peelDstMap_get_cases _ _ _ h_d_not_in]
-          have h_s_ne_d : ¬(s = d) := fun h => h_d_ne_s.symm h
           simp [h_s_ne_d, h_s_not_in_sOuts]
           exact hs_in_d2s
         have h_s2d'_not_contains_s :
@@ -824,12 +754,10 @@ theorem Phase1Inv.peel_leaves_iff
         unfold peelLeaves
         simp only
         split
-        · rw [Std.TreeSet.mem_insert]
-          left; exact Std.ReflCmp.compare_self
+        · rw [Std.TreeSet.mem_insert]; left; exact Std.ReflCmp.compare_self
         · rename_i hcond
           simp only [Bool.and_eq_true, Bool.not_eq_true'] at hcond
-          exfalso
-          exact hcond ⟨h_d2s'_contains_s, h_s2d'_not_contains_s⟩
+          exact absurd ⟨h_d2s'_contains_s, h_s2d'_not_contains_s⟩ hcond
     · have h_x_not_inserted_s : ¬ compare s x = .eq := fun hcmp =>
         hxs (Std.LawfulEqOrd.eq_of_compare hcmp).symm
       have h_leaves_simp : x ∈ peelLeaves leaves s
@@ -837,38 +765,13 @@ theorem Phase1Inv.peel_leaves_iff
           (peelS2D s2d s d ((s2d.getD s ∅).erase d)) d ↔ x ∈ leaves := by
         unfold peelLeaves
         simp only
-        split
-        · rw [Std.TreeSet.mem_insert, Std.TreeSet.mem_erase]
-          constructor
-          · intro h
-            rcases h with hcmp | ⟨_, hin⟩
-            · exact absurd hcmp h_x_not_inserted_s
-            · exact hin
-          · intro hin
-            right
-            refine ⟨?_, hin⟩
-            intro heq
-            exact hxd (Std.LawfulEqOrd.eq_of_compare heq).symm
-        · rw [Std.TreeSet.mem_erase]
-          constructor
-          · intro ⟨_, hin⟩; exact hin
-          · intro hin
-            refine ⟨?_, hin⟩
-            intro heq
-            exact hxd (Std.LawfulEqOrd.eq_of_compare heq).symm
+        split <;>
+          simp only [Std.TreeSet.mem_insert, Std.TreeSet.mem_erase,
+                     h_x_not_inserted_s, false_or] <;>
+          grind [Std.LawfulEqOrd.eq_of_compare]
       rw [h_leaves_simp, h_inv.leaves_iff x,
           peelS2D_mem _ _ _ _ _ h_d_ne_s h_d_not_in_s2d]
-      constructor
-      · intro ⟨hxd2s, hxs2d⟩
-        refine ⟨⟨hxd, hxd2s⟩, ?_⟩
-        intro h_or
-        rcases h_or with ⟨hd_eq, _⟩ | ⟨hin, _⟩
-        · exact hxd hd_eq
-        · exact hxs2d hin
-      · intro ⟨⟨_, h_in_d2s⟩, h_not_in_s2d'⟩
-        refine ⟨h_in_d2s, ?_⟩
-        intro h_in_s2d
-        exact h_not_in_s2d' (Or.inr ⟨h_in_s2d, hxs⟩)
+      grind
 
 /-- All three components together — Phase1Inv preserved by one peel. -/
 theorem Phase1Inv.peel_step
