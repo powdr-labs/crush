@@ -259,6 +259,8 @@ fn build_dag<'a>(
                     );
                 }
                 Ins::WASMOp(Op::BrIf { relative_depth }) | Ins::BrIfZero { relative_depth } => {
+                    // Pop the condition to reinsert it after the locals:
+                    let cond = t.stack.pop().unwrap();
                     let operation = match inst {
                         Ins::WASMOp(Op::BrIf { .. }) => {
                             Operation::WASMOp(Op::BrIf { relative_depth })
@@ -267,38 +269,15 @@ fn build_dag<'a>(
                         _ => unreachable!(),
                     };
 
-                    let target = &block_stack[relative_depth as usize];
-
-                    // Pop the condition to reinsert it after the locals:
-                    let cond = t.stack.pop().unwrap();
-                    // Assert the condition type is I32.
-                    assert_eq!(
-                        t.nodes[cond.node].output_types[cond.output_idx as usize],
-                        ValType::I32
-                    );
-
-                    // The stack part of the input
-                    // BrIf[Zero] does not consume the stack.
-                    let mut inputs: Vec<NodeInput> = t.stack[t.stack.len() - target.stack.len()..]
-                        .iter()
-                        .map(|&v| v.into())
-                        .collect();
-                    assert!(types_matches(&t.nodes, &target.stack, &inputs));
-
-                    // The locals part of the input
-                    for local_index in target.locals.iter() {
-                        let value = local_getter(&mut t.nodes, &mut locals, *local_index);
-                        inputs.push(value.into());
-                    }
-
-                    // Push the condition back to the inputs
-                    inputs.push(cond.into());
-
-                    t.nodes.push(Node {
+                    emit_conditional_br(
+                        &mut t,
+                        &mut locals,
+                        block_stack,
+                        local_getter,
+                        relative_depth,
+                        cond,
                         operation,
-                        inputs,
-                        output_types: Vec::new(),
-                    });
+                    );
                 }
                 Ins::BrTable { targets } => {
                     // The stack input for the br_table is the choice value, plus the
@@ -316,6 +295,37 @@ fn build_dag<'a>(
                     // branch with an unused choice value. Emit a Br instead.
                     if targets.len() == 1 {
                         emit_br(&mut t, &mut locals, block_stack, local_getter, targets[0]);
+                        continue;
+                    }
+
+                    // If there are only two targets, emit a BrIfZero to targets[0]
+                    // (branches when choice == 0) followed by an unconditional Br to
+                    // targets[1] (the default).
+                    if targets.len() == 2 {
+                        let target0_depth = targets[0];
+                        let target1_depth = targets[1];
+
+                        // Emit BrIfZero for targets[0]
+                        emit_conditional_br(
+                            &mut t,
+                            &mut locals,
+                            block_stack,
+                            local_getter,
+                            target0_depth,
+                            choice,
+                            Operation::BrIfZero {
+                                relative_depth: target0_depth,
+                            },
+                        );
+
+                        // Emit unconditional Br for targets[1] (the default)
+                        emit_br(
+                            &mut t,
+                            &mut locals,
+                            block_stack,
+                            local_getter,
+                            target1_depth,
+                        );
                         continue;
                     }
 
@@ -649,6 +659,48 @@ fn emit_br<'a>(
 
     t.nodes.push(Node {
         operation: Operation::WASMOp(Op::Br { relative_depth }),
+        inputs,
+        output_types: Vec::new(),
+    });
+}
+
+/// Emits a conditional branch node (`BrIf` or `BrIfZero`) using the provided condition value,
+/// preserving stack values (it does not consume the target stack inputs).
+fn emit_conditional_br<'a>(
+    t: &mut StackTracker<'a, '_>,
+    locals: &mut [Value],
+    block_stack: &VecDeque<BreakArgs>,
+    local_getter: &LocalGetter<'a>,
+    relative_depth: u32,
+    cond: ValueOrigin,
+    operation: Operation<'a, ()>,
+) {
+    let target = &block_stack[relative_depth as usize];
+
+    // Assert the condition type is I32.
+    assert_eq!(
+        t.nodes[cond.node].output_types[cond.output_idx as usize],
+        ValType::I32
+    );
+
+    // The stack part of the input. BrIf/BrIfZero do not consume the stack.
+    let mut inputs: Vec<NodeInput> = t.stack[t.stack.len() - target.stack.len()..]
+        .iter()
+        .map(|&v| v.into())
+        .collect();
+    assert!(types_matches(&t.nodes, &target.stack, &inputs));
+
+    // The locals part of the input.
+    for local_index in target.locals.iter() {
+        let value = local_getter(&mut t.nodes, locals, *local_index);
+        inputs.push(value.into());
+    }
+
+    // Push the condition after stack/locals inputs.
+    inputs.push(cond.into());
+
+    t.nodes.push(Node {
+        operation,
         inputs,
         output_types: Vec::new(),
     });
