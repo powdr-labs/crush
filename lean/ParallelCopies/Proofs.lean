@@ -49,13 +49,7 @@ theorem applyDstMap_insert (m : DstMap) (d s : UInt32) (mem : Memory) :
     applyDstMap (m.insert d s) mem =
       fun addr => if addr = d then mem s else applyDstMap m mem addr := by
   funext addr
-  unfold applyDstMap
-  rw [Std.TreeMap.getElem?_insert]
-  by_cases h : addr = d
-  · subst h; simp
-  · have hne : compare d addr ≠ .eq := fun heq =>
-      h (Std.LawfulEqOrd.eq_of_compare heq).symm
-    simp [hne, h]
+  grind [applyDstMap]
 
 /-- Effect of erasing `d` from the graph: `d` reverts to `mem d`,
     other addresses unchanged. -/
@@ -63,13 +57,7 @@ theorem applyDstMap_erase (m : DstMap) (d : UInt32) (mem : Memory) :
     applyDstMap (m.erase d) mem =
       fun addr => if addr = d then mem d else applyDstMap m mem addr := by
   funext addr
-  unfold applyDstMap
-  rw [Std.TreeMap.getElem?_erase]
-  by_cases h : addr = d
-  · subst h; simp
-  · have hne : compare d addr ≠ .eq := fun heq =>
-      h (Std.LawfulEqOrd.eq_of_compare heq).symm
-    simp [hne, h]
+  grind [applyDstMap]
 
 /-- Pointwise extensionality for `applyDstMap`: it's determined by `get?` on
     every address. -/
@@ -77,8 +65,7 @@ theorem applyDstMap_ext {m₁ m₂ : DstMap}
     (h : ∀ a : UInt32, m₁[a]? = m₂[a]?) (mem : Memory) :
     applyDstMap m₁ mem = applyDstMap m₂ mem := by
   funext addr
-  unfold applyDstMap
-  rw [h addr]
+  grind [applyDstMap]
 
 /-! ## Stage 2 — `buildGraph` correspondence
 
@@ -115,9 +102,7 @@ private theorem foldl_mprod_fst {α β γ : Type _}
       xs.foldl (fun b x => g x b) init.fst := by
   induction xs generalizing init with
   | nil => rfl
-  | cons head tail ih =>
-    simp only [List.foldl_cons]
-    rw [ih, hf]
+  | cons head tail ih => grind
 
 theorem buildGraph_fst_eq_edgeMap (edges : Array Edge) :
     (buildGraph edges).fst = edgeMap edges := by
@@ -137,38 +122,31 @@ induction. Two facts suffice for the correctness proof:
   the lookup is `some s`.
 -/
 
-/-- The foldl-insert form, parameterised on a starting map. -/
+/-- The foldl-insert form, parameterised on a starting map.
+
+NOTE: a `@[grind =]` annotation here would register the lemma in grind's
+symbol-indexed table but would not let bare `grind` fire it at the use sites —
+grind's E-matcher cannot discharge the `∀ s, (s, d) ∉ l` side-condition by
+matching it against a structurally identical `∀`-hypothesis in context. We
+therefore pass the lemma explicitly via `grind [foldl_insert_get?_eq_init]`,
+which `assertExtra` activates unconditionally at generation 0 and routes
+through code paths that handle this kind of side-condition discharge. -/
 private theorem foldl_insert_get?_eq_init
     (l : List Edge) (init : DstMap) (d : UInt32)
     (h : ∀ s, (s, d) ∉ l) :
     (l.foldl (fun m e => m.insert e.2 e.1) init)[d]? = init[d]? := by
   induction l generalizing init with
   | nil => rfl
-  | cons head tail ih =>
-    obtain ⟨s, d'⟩ := head
-    simp only [List.foldl_cons]
-    have htail : ∀ s, (s, d) ∉ tail := fun s hmem =>
-      h s (List.mem_cons_of_mem _ hmem)
-    have hne : d' ≠ d := fun heq =>
-      h s (heq ▸ List.mem_cons_self)
-    rw [ih _ htail]
-    -- (init.insert d' s)[d]? = init[d]? when d' ≠ d
-    rw [Std.TreeMap.getElem?_insert]
-    have hcmp : compare d' d ≠ .eq := fun heq =>
-      hne (Std.LawfulEqOrd.eq_of_compare heq)
-    simp [hcmp]
+  | cons head tail ih => grind
 
+@[grind =]
 theorem edgeMap_get_eq_none_of_not_mem
     (edges : Array Edge) (d : UInt32)
     (h : ∀ s, (s, d) ∉ edges) :
     (edgeMap edges)[d]? = none := by
   unfold edgeMap
   rcases edges with ⟨xs⟩
-  rw [← Array.foldl_toList]
-  have h' : ∀ s, (s, d) ∉ xs := fun s hmem =>
-    h s (Array.mem_def.mpr hmem)
-  rw [foldl_insert_get?_eq_init xs ∅ d h']
-  simp
+  grind [foldl_insert_get?_eq_init]
 
 /-- Foldl-insert with a uniquely-sourced destination ends with that source. -/
 private theorem foldl_insert_get?_eq_some
@@ -178,48 +156,15 @@ private theorem foldl_insert_get?_eq_some
     (l.foldl (fun m e => m.insert e.2 e.1) init)[d]? = some s := by
   induction l generalizing init with
   | nil => exact absurd hmem List.not_mem_nil
-  | cons head tail ih =>
-    obtain ⟨s', d'⟩ := head
-    simp only [List.foldl_cons]
-    by_cases hd : d' = d
-    · -- head writes to d (with source s' = s by uniqueness).
-      have hs_eq : s' = s := h_unique s' (hd ▸ List.mem_cons_self)
-      by_cases hmem_tail : ∃ s'', (s'', d) ∈ tail
-      · -- Tail also writes to d. By uniqueness, that source equals `s`.
-        obtain ⟨s'', hmem''⟩ := hmem_tail
-        have hs'' : s'' = s := h_unique s'' (List.mem_cons_of_mem _ hmem'')
-        exact ih (init.insert d' s') (hs'' ▸ hmem'')
-          (fun s''' hmem''' => h_unique s''' (List.mem_cons_of_mem _ hmem'''))
-      · -- Tail has no other writers; the last write to `d` is the head.
-        have hmem_tail' : ∀ s'', (s'', d) ∉ tail := fun s'' hmem'' =>
-          hmem_tail ⟨s'', hmem''⟩
-        rw [foldl_insert_get?_eq_init tail _ d hmem_tail']
-        rw [Std.TreeMap.getElem?_insert]
-        have hcmp : compare d' d = .eq := hd ▸ Std.ReflCmp.compare_self
-        simp [hcmp, hs_eq]
-    · -- d' ≠ d, head's insert doesn't affect d. Recurse with tail.
-      have hmem_tail : (s, d) ∈ tail := by
-        rcases List.mem_cons.mp hmem with heq | hmem'
-        · exfalso
-          have : d = d' := (Prod.mk.injEq ..).mp heq |>.2
-          exact hd this.symm
-        · exact hmem'
-      have h_unique' : ∀ s'', (s'', d) ∈ tail → s'' = s := fun s'' hmem'' =>
-        h_unique s'' (List.mem_cons_of_mem _ hmem'')
-      exact ih (init.insert d' s') hmem_tail h_unique'
+  | cons head tail ih => grind [foldl_insert_get?_eq_init]
 
 theorem edgeMap_get_eq_some_of_mem_unique
     (edges : Array Edge) (s d : UInt32)
     (hmem : (s, d) ∈ edges)
     (h_unique : ∀ s', (s', d) ∈ edges → s' = s) :
     (edgeMap edges)[d]? = some s := by
-  unfold edgeMap
   rcases edges with ⟨xs⟩
-  rw [← Array.foldl_toList]
-  have hmem' : (s, d) ∈ xs := Array.mem_def.mp hmem
-  have h_unique' : ∀ s', (s', d) ∈ xs → s' = s := fun s' hmem'' =>
-    h_unique s' (Array.mem_def.mpr hmem'')
-  exact foldl_insert_get?_eq_some xs ∅ d s hmem' h_unique'
+  grind [edgeMap, foldl_insert_get?_eq_some]
 
 /-! ## Stage 3 helpers — sequential application of edge-level copies -/
 
@@ -243,30 +188,22 @@ def liftEdges (acc : Array Edge) : Array (Register × Register) :=
 
 /-- The sequential interpreter on lifted edges agrees with `applyEdgesSeq`
     (the temporary `tmp` is irrelevant because no `.temp` register appears). -/
+@[grind =]
 theorem applySequential_liftEdges
     (tmp : UInt32) (acc : Array Edge) (mem : Memory) :
     applySequential tmp (liftEdges acc) mem = applyEdgesSeq acc mem := by
   rw [applySequential_eq_state]
   unfold liftEdges applyEdgesSeq applySeqState
-  -- Both sides are foldls; show the step-by-step .fst projections agree.
-  rw [Array.foldl_map, ← Array.foldl_toList, ← Array.foldl_toList]
   rcases acc with ⟨xs⟩
-  show (List.foldl
-          (fun (r : MProd Memory UInt32) x => applySeqStep _ r) ⟨mem, tmp⟩ xs).fst
-        = List.foldl _ mem xs
   induction xs generalizing mem tmp with
-  | nil => rfl
-  | cons head tail ih =>
-    obtain ⟨s, d⟩ := head
-    simp only [List.foldl_cons]
-    rw [show applySeqStep (Register.given s, Register.given d) ⟨mem, tmp⟩ =
-            ⟨FunUpdate mem d (mem s), tmp⟩ from rfl]
-    exact ih tmp (FunUpdate mem d (mem s))
+  | nil => grind
+  | cons head tail ih => grind [applySeqStep]
 
 /-! ### Stage 2 main theorem -/
 
 /-- For `WellFormed` input, the `dstToSrc` component of `buildGraph` applied
     to the preprocessed edge list realises `applyParallel`. -/
+@[grind =]
 theorem applyParallel_eq_applyDstMap_buildGraph
     (pairs : Array Edge) (h_wf : WellFormed pairs) (mem : Memory) :
     applyParallel pairs mem = applyDstMap (buildGraph (preprocess pairs)).fst mem := by
@@ -277,17 +214,12 @@ theorem applyParallel_eq_applyDstMap_buildGraph
   have h_wf' : WellFormed (preprocess pairs) := wellFormed_preprocess pairs h_wf
   have h_no_self := preprocess_no_id pairs
   cases hs : sourceOf (preprocess pairs) addr with
-  | none =>
-    -- No edge to addr in preprocess pairs (with no-self, no edges at all).
-    rw [sourceOf_eq_none_iff] at hs
-    have h_no_edge : ∀ s, (s, addr) ∉ preprocess pairs := fun s hmem =>
-      hs s ⟨hmem, h_no_self (s, addr) hmem⟩
-    rw [edgeMap_get_eq_none_of_not_mem _ _ h_no_edge]
+  | none => grind
   | some s =>
     have ⟨hmem, hne⟩ := (sourceOf_correct (preprocess pairs) h_wf' s addr).mp hs
     have h_unique : ∀ s', (s', addr) ∈ preprocess pairs → s' = s := fun s' hmem' =>
       h_wf' s' s addr (h_no_self (s', addr) hmem') hne hmem' hmem
-    rw [edgeMap_get_eq_some_of_mem_unique _ _ _ hmem h_unique]
+    grind [edgeMap_get_eq_some_of_mem_unique]
 
 /-! ## Stage 3 — Phase 1 soundness
 
@@ -305,16 +237,7 @@ private theorem foldl_insert_v_not_mem
     (l.foldl (fun m x => m.insert x v) init)[k]? = init[k]? := by
   induction l generalizing init with
   | nil => rfl
-  | cons head tail ih =>
-    have hk_head : head ≠ k := fun heq =>
-      h (heq ▸ List.mem_cons_self)
-    have hk_tail : k ∉ tail := fun hmem =>
-      h (List.mem_cons_of_mem _ hmem)
-    simp only [List.foldl_cons]
-    rw [ih _ hk_tail, Std.TreeMap.getElem?_insert]
-    have hcmp : compare head k ≠ .eq := fun heq =>
-      hk_head (Std.LawfulEqOrd.eq_of_compare heq)
-    simp [hcmp]
+  | cons head tail ih => grind
 
 /-- Folding inserts of a single value `v` over a list `l`: a key that is
     in `l` ends up mapped to `v`. -/
@@ -327,15 +250,11 @@ private theorem foldl_insert_v_mem
     simp only [List.foldl_cons]
     by_cases hk_tail : k ∈ tail
     · exact ih _ hk_tail
-    · -- k = head (else k would be in tail or absent).
-      have hk_head : head = k := by
-        rcases List.mem_cons.mp h with heq | hmem
-        · exact heq.symm
-        · exact absurd hmem hk_tail
-      rw [foldl_insert_v_not_mem tail _ v k hk_tail]
-      rw [Std.TreeMap.getElem?_insert]
-      have hcmp : compare head k = .eq := hk_head ▸ Std.ReflCmp.compare_self
-      simp [hcmp]
+    · have hk_head : head = k := by grind
+      subst hk_head
+      rw [foldl_insert_v_not_mem tail _ v head hk_tail,
+          Std.TreeMap.getElem?_insert]
+      simp [Std.ReflCmp.compare_self]
 
 /-- Concrete peel of `d2s` matching the algorithm's effect. `sOutsMinusD`
     is the set of destinations that `s` currently sources, with `d` removed.
@@ -350,10 +269,8 @@ theorem peelDstMap_get_d (d2s : DstMap) (d : UInt32)
     (sOutsMinusD : Std.TreeSet UInt32) (h : d ∉ sOutsMinusD) :
     (peelDstMap d2s d sOutsMinusD)[d]? = none := by
   unfold peelDstMap
-  rw [Std.TreeSet.foldl_eq_foldl_toList]
-  have h' : d ∉ sOutsMinusD.toList := by
-    rw [Std.TreeSet.mem_toList]; exact h
-  rw [foldl_insert_v_not_mem _ _ d d h']
+  rw [Std.TreeSet.foldl_eq_foldl_toList,
+      foldl_insert_v_not_mem _ _ d d (by simpa [Std.TreeSet.mem_toList])]
   exact Std.TreeMap.getElem?_erase_self
 
 theorem peelDstMap_get_mem (d2s : DstMap) (d : UInt32)
@@ -361,23 +278,18 @@ theorem peelDstMap_get_mem (d2s : DstMap) (d : UInt32)
     (peelDstMap d2s d sOutsMinusD)[x]? = some d := by
   unfold peelDstMap
   rw [Std.TreeSet.foldl_eq_foldl_toList]
-  have h' : x ∈ sOutsMinusD.toList := by
-    rw [Std.TreeSet.mem_toList]; exact h
-  exact foldl_insert_v_mem _ _ d x h'
+  exact foldl_insert_v_mem _ _ d x (by simpa [Std.TreeSet.mem_toList])
 
 theorem peelDstMap_get_other (d2s : DstMap) (d : UInt32)
     (sOutsMinusD : Std.TreeSet UInt32) (x : UInt32) (h_ne : x ≠ d)
     (h_not_mem : x ∉ sOutsMinusD) :
     (peelDstMap d2s d sOutsMinusD)[x]? = d2s[x]? := by
   unfold peelDstMap
-  rw [Std.TreeSet.foldl_eq_foldl_toList]
-  have h' : x ∉ sOutsMinusD.toList := by
-    rw [Std.TreeSet.mem_toList]; exact h_not_mem
-  rw [foldl_insert_v_not_mem _ _ d x h']
-  rw [Std.TreeMap.getElem?_erase]
-  have hcmp : compare d x ≠ .eq := fun heq =>
-    h_ne ((Std.LawfulEqOrd.eq_of_compare heq).symm)
-  simp [hcmp]
+  rw [Std.TreeSet.foldl_eq_foldl_toList,
+      foldl_insert_v_not_mem _ _ d x (by simpa [Std.TreeSet.mem_toList]),
+      Std.TreeMap.getElem?_erase]
+  simp [show compare d x ≠ .eq from fun heq =>
+    h_ne (Std.LawfulEqOrd.eq_of_compare heq).symm]
 
 /-! ### Peel-step soundness -/
 
@@ -407,21 +319,13 @@ theorem peelStep_sound
     rw [peelDstMap_get_d d2s addr sOutsMinusD h_d_not_in_sOuts, h_d_src]
     simp
   · by_cases h_addr_outs : addr ∈ sOutsMinusD
-    · -- addr is rewired to d.
-      rw [peelDstMap_get_mem d2s d sOutsMinusD addr h_addr_outs]
-      have := (h_sOuts_iff addr).mp h_addr_outs
-      rw [this.2]
+    · rw [peelDstMap_get_mem d2s d sOutsMinusD addr h_addr_outs,
+          ((h_sOuts_iff addr).mp h_addr_outs).2]
       simp
-    · -- addr is unchanged in d2s'.
-      rw [peelDstMap_get_other d2s d sOutsMinusD addr h_addr_d h_addr_outs]
-      -- Determine d2s[addr]? and case-split.
+    · rw [peelDstMap_get_other d2s d sOutsMinusD addr h_addr_d h_addr_outs]
       cases h_addr_get : d2s[addr]? with
       | none => simp [FunUpdate, h_addr_d]
-      | some src =>
-        -- src ≠ d (since d is a leaf) and src ≠ s (since addr ∉ sOutsMinusD and addr ≠ d).
-        have h_src_ne_d : src ≠ d := fun heq =>
-          h_d_leaf addr (heq ▸ h_addr_get)
-        simp [FunUpdate, h_src_ne_d]
+      | some src => grind [FunUpdate]
 
 /-! ### Well-formedness invariants for `(d2s, s2d, leaves)` -/
 
@@ -466,20 +370,15 @@ theorem Phase1Inv.peelable
     d ∉ sOutsMinusD ∧
     (∀ x : UInt32,
       x ∈ sOutsMinusD ↔ x ≠ d ∧ d2s[x]? = some s) := by
+  have hd_not_s2d : d ∉ s2d := ((hinv.leaves_iff d).mp h_leaf).2
   refine ⟨?_, ?_, ?_⟩
   · intro x hd2s_x_eq_d
-    have hd_not_s2d : d ∉ s2d := ((hinv.leaves_iff d).mp h_leaf).2
     have hx_in_s2d_d : x ∈ s2d.getD d ∅ := (hinv.s2d_inv x d).mpr hd2s_x_eq_d
     rw [Std.TreeMap.getD_eq_fallback hd_not_s2d] at hx_in_s2d_d
     exact Std.TreeSet.not_mem_emptyc hx_in_s2d_d
-  · rw [Std.TreeSet.mem_erase]
-    intro ⟨hcmp, _⟩; exact hcmp Std.ReflCmp.compare_self
+  · simp [Std.TreeSet.mem_erase, Std.ReflCmp.compare_self]
   · intro x
-    rw [Std.TreeSet.mem_erase, hinv.s2d_inv x s]
-    refine ⟨fun ⟨hcmp_ne, hin⟩ => ⟨?_, hin⟩,
-            fun ⟨h_ne, hin⟩ => ⟨?_, hin⟩⟩
-    · intro heq; exact hcmp_ne (heq ▸ Std.ReflCmp.compare_self)
-    · intro heq; exact h_ne (Std.LawfulEqOrd.eq_of_compare heq).symm
+    grind [hinv.s2d_inv x s]
 
 /-! ### Phase 1 semantic invariant (statement)
 
@@ -602,19 +501,14 @@ theorem peelS2D_getD_at_other
     (s' : UInt32) (h_ne_d : s' ≠ d) (h_ne_s : s' ≠ s) (x : UInt32) :
     x ∈ (peelS2D s2d s d sOutsMinusD).getD s' ∅ ↔ x ∈ s2d.getD s' ∅ := by
   unfold peelS2D
+  have h_cmp_s_s' : compare s s' ≠ .eq := fun heq =>
+    h_ne_s (Std.LawfulEqOrd.eq_of_compare heq).symm
+  have h_cmp_d_s' : compare d s' ≠ .eq := fun heq =>
+    h_ne_d (Std.LawfulEqOrd.eq_of_compare heq).symm
   split
-  · rw [Std.TreeMap.getD_erase]
-    have h_cmp_s_s' : compare s s' ≠ .eq := fun heq =>
-      h_ne_s (Std.LawfulEqOrd.eq_of_compare heq).symm
-    simp [h_cmp_s_s']
+  · rw [Std.TreeMap.getD_erase]; simp [h_cmp_s_s']
   · rw [Std.TreeMap.getD_insert]
-    have h_cmp_d_s' : compare d s' ≠ .eq := fun heq =>
-      h_ne_d (Std.LawfulEqOrd.eq_of_compare heq).symm
-    simp [h_cmp_d_s']
-    rw [Std.TreeMap.getD_erase]
-    have h_cmp_s_s' : compare s s' ≠ .eq := fun heq =>
-      h_ne_s (Std.LawfulEqOrd.eq_of_compare heq).symm
-    simp [h_cmp_s_s']
+    simp [h_cmp_d_s', Std.TreeMap.getD_erase, h_cmp_s_s']
 
 theorem Phase1Inv.peel_s2d_inv
     {d2s : DstMap} {s2d : SrcMap} {leaves : LeafSet}
@@ -646,18 +540,12 @@ theorem Phase1Inv.peel_s2d_inv
         · exact hxs ((h_sOuts_iff x).mpr ⟨hxd, h_eq⟩)
     · rw [peelS2D_getD_at_other _ _ _ _ _ h_s'_d h_s'_s x]
       by_cases hxd : x = d
-      · rw [hxd]; simp
-        intro h_in
-        have h_eq : d2s[d]? = some s' := (h_inv.s2d_inv d s').mp h_in
-        grind
+      · rw [hxd]; simp; grind [h_inv.s2d_inv]
       · by_cases hxs : x ∈ (s2d.getD s ∅).erase d
-        · simp [hxd, hxs]
-          have h_d2s_s : d2s[x]? = some s := ((h_sOuts_iff x).mp hxs).2
-          refine ⟨fun h_in => ?_, fun h_d_eq => (h_s'_d h_d_eq.symm).elim⟩
-          have h_eq := (h_inv.s2d_inv x s').mp h_in
-          grind
-        · simp [hxd, hxs]
-          exact h_inv.s2d_inv x s'
+        · have h_d2s_s : d2s[x]? = some s := ((h_sOuts_iff x).mp hxs).2
+          simp [hxd, hxs]
+          grind [h_inv.s2d_inv]
+        · simp [hxd, hxs]; exact h_inv.s2d_inv x s'
 
 /-! ### `leaves_iff` component of Phase1Inv preservation (helper only) -/
 
@@ -696,18 +584,11 @@ theorem Phase1Inv.peel_leaves_iff
   have h_sOuts_in_d2s : ∀ y, y ∈ (s2d.getD s ∅).erase d → y ∈ d2s := by
     intro y hy
     have hd2s_y : d2s[y]? = some s := ((h_sOuts_iff y).mp hy).2
-    rw [Std.TreeMap.mem_iff_contains, Std.TreeMap.contains_eq_isSome_getElem?, hd2s_y]
-    rfl
+    grind [Std.TreeMap.mem_iff_contains, Std.TreeMap.contains_eq_isSome_getElem?]
   have h_s_not_in_s2d' : s ∉ peelS2D s2d s d ((s2d.getD s ∅).erase d) := by
-    rw [peelS2D_mem _ _ _ _ _ h_d_ne_s h_d_not_in_s2d]
-    intro h
-    rcases h with ⟨heq, _⟩ | ⟨_, hne⟩
-    · exact h_d_ne_s.symm heq
-    · exact hne rfl
-  have h_s_not_in_sOuts : s ∉ (s2d.getD s ∅).erase d := by
-    intro h_in
-    have := ((h_sOuts_iff s).mp h_in).2
-    exact h_inv.no_self s this
+    rw [peelS2D_mem _ _ _ _ _ h_d_ne_s h_d_not_in_s2d]; grind
+  have h_s_not_in_sOuts : s ∉ (s2d.getD s ∅).erase d := fun h_in =>
+    h_inv.no_self s ((h_sOuts_iff s).mp h_in).2
   rw [peelDstMap_mem _ _ _ h_d_not_in h_sOuts_in_d2s]
   by_cases hxd : x = d
   · rw [hxd]
@@ -745,12 +626,10 @@ theorem Phase1Inv.peel_leaves_iff
             (peelDstMap d2s d ((s2d.getD s ∅).erase d)).contains s = true := by
           rw [Std.TreeMap.contains_eq_isSome_getElem?,
               peelDstMap_get_cases _ _ _ h_d_not_in]
-          simp [h_s_ne_d, h_s_not_in_sOuts]
-          exact hs_in_d2s
+          simp [h_s_ne_d, h_s_not_in_sOuts]; exact hs_in_d2s
         have h_s2d'_not_contains_s :
             (peelS2D s2d s d ((s2d.getD s ∅).erase d)).contains s = false := by
-          rw [← Bool.not_eq_true, ← Std.TreeMap.mem_iff_contains]
-          exact h_s_not_in_s2d'
+          grind [Std.TreeMap.mem_iff_contains]
         unfold peelLeaves
         simp only
         split
@@ -813,19 +692,15 @@ theorem phase1_sound
         exfalso
         have hd_in_d2s : d ∈ d2s := ((h_inv.leaves_iff d).mp h_d_in_leaves).1
         have hget' : d2s[d]? = none := hget
-        rw [Std.TreeMap.mem_iff_contains,
-            Std.TreeMap.contains_eq_isSome_getElem?, hget'] at hd_in_d2s
-        exact (by simp at hd_in_d2s : False)
+        grind [Std.TreeMap.mem_iff_contains,
+               Std.TreeMap.contains_eq_isSome_getElem?]
       · rename_i s hget
         have hget' : d2s[d]? = some s := hget
-        have h_inv' := h_inv.peel_step h_d_in_leaves hget'
         have ⟨h_d_leaf, h_d_not_in, h_sOuts_iff⟩ :=
           h_inv.peelable h_d_in_leaves hget'
-        have h_sem' : Phase1Sem d2s_initial
-            (peelDstMap d2s d ((s2d.getD s ∅).erase d)) (acc.push (s, d)) := by
-          exact Phase1Sem.peel_step d2s_initial d2s acc s d _
-            hget' h_d_leaf h_d_not_in h_sOuts_iff h_sem
-        exact ih _ _ _ _ h_inv' h_sem'
+        exact ih _ _ _ _ (h_inv.peel_step h_d_in_leaves hget')
+          (Phase1Sem.peel_step d2s_initial d2s acc s d _
+            hget' h_d_leaf h_d_not_in h_sOuts_iff h_sem)
 
 
 /-! ## Stage 4 — Phase 2 soundness
@@ -875,11 +750,7 @@ theorem applySeqState_liftEdges
   show (Array.toList _ |>.foldl _ _) = _
   induction acc.toList generalizing mem with
   | nil => rfl
-  | cons head tail ih =>
-    obtain ⟨s, d⟩ := head
-    simp only [List.foldl_cons]
-    rw [applySeqStep_given_given]
-    rw [ih]
+  | cons head tail ih => obtain ⟨s, d⟩ := head; grind [applySeqStep_given_given]
 
 /-- `applySequential` of a lifted-edges-only prefix doesn't change the
     implicit temporary's value. -/

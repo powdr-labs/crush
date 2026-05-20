@@ -29,6 +29,7 @@ abbrev Memory := UInt32 → UInt32
 
 /-! ## Sequential spec -/
 
+@[grind]
 def FunUpdate {α β} [DecidableEq α] (f : α → β) (a : α) (b : β) : α → β :=
   fun x => if x = a then b else f x
 
@@ -64,6 +65,7 @@ def sourceOf (pairs : Array (UInt32 × UInt32)) (d : UInt32) : Option UInt32 :=
   | none => none
 
 /-- After specifying `sourceOf` constructively, verify that it actually does what we want. -/
+@[grind =]
 theorem sourceOf_correct (pairs : Array (UInt32 × UInt32)) (h_wf : WellFormed pairs) :
   ∀ s d, sourceOf pairs d = some s ↔ (s, d) ∈ pairs ∧ s ≠ d := by
   intros s d

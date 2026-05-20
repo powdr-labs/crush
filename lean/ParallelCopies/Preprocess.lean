@@ -43,6 +43,7 @@ private def preprocessInv (i : Nat) (b : MProd (Array Edge) (Std.HashSet Edge)) 
   (∀ j (hj : j < edges.size), j < i → edges[j].1 ≠ edges[j].2 → edges[j] ∈ b.fst) ∧
   (∀ x : Edge, b.snd.contains x = true → x ∈ b.fst)
 
+@[grind .]
 theorem preprocess_complete :
   ∀ e ∈ edges, e.1 ≠ e.2 → e ∈ preprocess edges := by
   rw [preprocess_eq_foldl]

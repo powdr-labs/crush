@@ -59,6 +59,7 @@ private theorem forIn_body_eq {α β : Type _} {m : Type _ → Type _} [Monad m]
     forIn xs init f = forIn xs init g := by
   rw [h]
 
+@[grind =]
 theorem applySequential_eq_state
     (tmp : UInt32) (copies : Array (Register × Register)) (mem : Memory) :
     applySequential tmp copies mem = (applySeqState ⟨mem, tmp⟩ copies).fst := by
@@ -79,6 +80,7 @@ theorem applySeqState_append (r : MProd Memory UInt32)
     applySeqState r (a ++ b) = applySeqState (applySeqState r a) b := by
   simp [applySeqState]
 
+@[grind =]
 theorem applySeqState_push (r : MProd Memory UInt32)
     (a : Array (Register × Register)) (cp : Register × Register) :
     applySeqState r (a.push cp) = applySeqStep cp (applySeqState r a) := by
@@ -95,42 +97,15 @@ theorem applySeqState_push (r : MProd Memory UInt32)
     applyParallel #[] mem = mem := by
   funext addr; simp [applyParallel, sourceOf]
 
+@[grind =]
 theorem sourceOf_isSome_iff (pairs : Array (UInt32 × UInt32)) (d : UInt32) :
     (sourceOf pairs d).isSome ↔ ∃ s, (s, d) ∈ pairs ∧ s ≠ d := by
-  unfold sourceOf
-  refine ⟨?_, ?_⟩
-  · intro h
-    cases hfind : pairs.find? (fun e => e.2 == d && e.1 != e.2) with
-    | none => simp_all
-    | some p =>
-      obtain ⟨s, d'⟩ := p
-      have hp := Array.find?_some hfind
-      have hmem := Array.mem_of_find?_eq_some hfind
-      simp at hp
-      obtain ⟨rfl, hne⟩ := hp
-      exact ⟨s, hmem, hne⟩
-  · intro ⟨s, hmem, hne⟩
-    have hsome : (pairs.find? (fun e => e.2 == d && e.1 != e.2)).isSome := by
-      rw [Array.find?_isSome]; exact ⟨(s, d), hmem, by simp [hne]⟩
-    cases hfind : pairs.find? (fun e => e.2 == d && e.1 != e.2) with
-    | none => simp_all
-    | some p => cases p; simp
+  grind [sourceOf]
 
+@[grind =]
 theorem sourceOf_eq_none_iff (pairs : Array (UInt32 × UInt32)) (d : UInt32) :
     sourceOf pairs d = none ↔ ∀ s, ¬ ((s, d) ∈ pairs ∧ s ≠ d) := by
-  refine ⟨?_, ?_⟩
-  · intro h s ⟨hmem, hne⟩
-    have hsome : (sourceOf pairs d).isSome :=
-      (sourceOf_isSome_iff pairs d).mpr ⟨s, hmem, hne⟩
-    simp_all
-  · intro h
-    cases hs : sourceOf pairs d with
-    | none => rfl
-    | some s =>
-      exfalso
-      have hsome : (sourceOf pairs d).isSome := by rw [hs]; rfl
-      obtain ⟨s', hmem, hne⟩ := (sourceOf_isSome_iff pairs d).mp hsome
-      exact h s' ⟨hmem, hne⟩
+  grind [sourceOf]
 
 /-! ## `preprocess` preserves `applyParallel`
 
@@ -140,33 +115,22 @@ because (i) `preprocess` keeps every non-self edge of `pairs`
 source of any destination to a unique value, so the `find?` order doesn't
 matter. -/
 
+@[grind .]
 theorem wellFormed_preprocess (pairs : Array (UInt32 × UInt32))
     (h_wf : WellFormed pairs) : WellFormed (preprocess pairs) := by
   intro s₁ s₂ d h₁ h₂ h₁mem h₂mem
   exact h_wf s₁ s₂ d h₁ h₂
     (preprocess_subset pairs _ h₁mem) (preprocess_subset pairs _ h₂mem)
 
+@[grind =]
 theorem sourceOf_preprocess (pairs : Array (UInt32 × UInt32))
     (h_wf : WellFormed pairs) (d : UInt32) :
     sourceOf (preprocess pairs) d = sourceOf pairs d := by
-  cases h : sourceOf pairs d with
-  | none =>
-    rw [sourceOf_eq_none_iff] at h ⊢
-    intro s ⟨hmem, hne⟩
-    exact h s ⟨preprocess_subset pairs _ hmem, hne⟩
-  | some s =>
-    have hcorr := (sourceOf_correct pairs h_wf s d).mp h
-    have hcorr' :=
-      (sourceOf_correct (preprocess pairs) (wellFormed_preprocess pairs h_wf)
-        s d).mpr
-        ⟨preprocess_complete pairs _ hcorr.1 hcorr.2, hcorr.2⟩
-    exact hcorr'
+  grind [preprocess_subset, sourceOf]
 
 theorem applyParallel_preprocess (pairs : Array (UInt32 × UInt32))
     (h_wf : WellFormed pairs) (mem : Memory) :
     applyParallel (preprocess pairs) mem = applyParallel pairs mem := by
-  funext addr
-  unfold applyParallel
-  rw [sourceOf_preprocess pairs h_wf addr]
+  grind [applyParallel]
 
 end ParallelCopies.Spec
