@@ -5,6 +5,11 @@
 
 mod sequence_parallel_copies;
 
+#[cfg(test)]
+mod diff_tests;
+#[cfg(test)]
+mod legacy_reference;
+
 use itertools::Itertools;
 use wasmparser::{FuncType, Operator as Op, ValType};
 
@@ -27,7 +32,11 @@ use crate::{
     },
     utils::{range_consolidation::RangeConsolidationIterator, tree::Tree},
 };
-use std::{collections::VecDeque, ops::Range, sync::atomic::AtomicU32};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    ops::Range,
+    sync::atomic::AtomicU32,
+};
 
 pub fn flatten_dag<'a, S: Settings<'a>>(
     s: &S,
@@ -606,6 +615,14 @@ fn copy_inputs_if_needed<'a, S: Settings<'a>>(
 
 /// Given a set of source-destination register ranges, emits the sequence of copy instructions
 /// such that all copies are performed correctly, even in presence of overlapping ranges.
+///
+/// **Trust boundary**: the schedule returned by `sequence_parallel_copies` is correct under the
+/// Lean theorem `sequenceParallelCopies_correct`, which treats `Register::Temp` as an ADT
+/// variant disjoint from every `Register::Given(r)`. Materialising `Register::Temp` to a
+/// concrete `u32` (below) is *not* covered by that theorem: this function is responsible for
+/// choosing a temp register that does not alias any participant of the parallel-copy, so that
+/// the materialised schedule still realises parallel semantics. See `lean/README.md` ("Trust
+/// boundary") for details.
 fn parallel_copy<'a, S: Settings<'a>>(
     s: &S,
     ctx: &mut Context<'a, '_>,
@@ -615,18 +632,43 @@ fn parallel_copy<'a, S: Settings<'a>>(
     let copy_set = copy_set
         .into_iter()
         .flat_map(|(source_range, dest_range)| source_range.into_iter().zip(dest_range));
-    let copy_sequence = sequence_parallel_copies::sequence_parallel_copies(copy_set);
+    let copy_sequence: Vec<_> =
+        sequence_parallel_copies::sequence_parallel_copies(copy_set).collect();
 
-    // Just allocate a temporary register if needed.
+    // The Lean implementation emits `Register::Temp` for the cycle-break temp.
+    // The materialised temp register must NOT alias any parallel-copy participant
+    // (source or destination), otherwise the cycle-break save/restore would clash
+    // with a real copy and corrupt its value. Collect all participant registers and
+    // skip any allocation that lands on one of them.
+    let participants: BTreeSet<u32> = copy_sequence
+        .iter()
+        .flat_map(|(src, dst)| {
+            [src, dst].into_iter().filter_map(|r| match r {
+                Register::Given(reg) => Some(*reg),
+                Register::Temp => None,
+            })
+        })
+        .collect();
+
     let mut tmp_register = None;
     let mut materialize = |ctx: &mut Context<'a, '_>, reg| -> u32 {
         match reg {
             Register::Temp => match tmp_register {
                 Some(tmp_reg) => tmp_reg,
                 None => {
-                    let new_tmp = ctx.allocate_tmp_type::<S>(ValType::I32);
-                    assert_eq!(new_tmp.len(), 1);
-                    let new_tmp = new_tmp.start;
+                    // Allocate a tmp that doesn't collide with any participant.
+                    // The allocator returns slots from "holes" in the occupation
+                    // map, which doesn't track parallel-copy destinations, so we
+                    // may need to allocate (and discard) a few before finding a
+                    // safe one. Bounded by |participants|.
+                    let new_tmp = loop {
+                        let cand = ctx.allocate_tmp_type::<S>(ValType::I32);
+                        assert_eq!(cand.len(), 1);
+                        let cand = cand.start;
+                        if !participants.contains(&cand) {
+                            break cand;
+                        }
+                    };
                     tmp_register = Some(new_tmp);
                     new_tmp
                 }
@@ -636,6 +678,7 @@ fn parallel_copy<'a, S: Settings<'a>>(
     };
 
     copy_sequence
+        .into_iter()
         .map(|(src, dest)| {
             let src = materialize(ctx, src);
             let dest = materialize(ctx, dest);

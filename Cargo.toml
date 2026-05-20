@@ -2,6 +2,10 @@
 name = "crush"
 description = "Compiles WebAssembly into a ZK friendly IR with infinite registers."
 edition = "2024"
+build = "build.rs"
+
+[build-dependencies]
+cc = "1"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

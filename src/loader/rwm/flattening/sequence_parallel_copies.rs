@@ -17,11 +17,18 @@
 //! dedicated temporary register, or, if possible, any register that has is not an original source,
 //! handled in the first phase of the algorithm.
 //!
-//! The final sequence of copy instructions contains first the results of the second phase
-//! (cycle-breaking copies), then the results of the first phase (non-cycle copies). This swapped
-//! order is to ensure that the temporary register used to break cycles is not overwritten.
+//! The body of the algorithm lives in Lean 4 (see `lean/ParallelCopies.lean`); this module is a
+//! thin FFI shim. We still validate the pre-condition in Rust because (a) Lean's `panic!` is
+//! recoverable in pure code and would not propagate as a Rust panic, and (b) `#[should_panic]`
+//! tests document the contract at the Rust boundary.
 
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Register {
+    Temp,
+    Given(u32),
+}
 
 /// Given a set of parallel copies, determine a sequence of individual copy instructions
 /// that can be executed in order without overwriting any source values before they are copied.
@@ -33,165 +40,107 @@ use std::collections::{BTreeMap, btree_map::Entry};
 /// Returns a sequence of (source, destination) register pairs that can be executed in order to achieve
 /// the same effect as the original parallel copies.
 ///
-/// Pre-conditions:
-///  * every destination register must be only written to once.
+/// Pre-condition: each non-self destination may be written by at most one *distinct* source.
+/// Self-copies (`src == dst`) and exact-duplicate edges (`(s, d)` appearing more than once with the
+/// same `s`) are allowed — they are silently filtered out. Only conflicting writes — two pairs
+/// `(s₁, d)` and `(s₂, d)` with `s₁ ≠ s₂` and neither being a self-copy — panic.
 pub fn sequence_parallel_copies(
     parallel_copies: impl IntoIterator<Item = (u32, u32)>,
 ) -> impl Iterator<Item = (Register, Register)> {
-    // This could be a HashMap if we didn't care about the determinism of the output...
-    let mut graph: BTreeMap<u32, RegConnections> = BTreeMap::new();
+    let pairs: Vec<(u32, u32)> = parallel_copies.into_iter().collect();
 
-    for (src, dst) in parallel_copies {
+    // Pre-condition check. Matches the original Rust implementation: self-copies and exact
+    // duplicates are dropped silently; a destination written by *different* sources panics.
+    let mut seen: BTreeMap<u32, u32> = BTreeMap::new();
+    for &(src, dst) in &pairs {
         if src == dst {
-            // No need to copy a register to itself, we can skip this copy.
             continue;
         }
-
-        // Update the destination entry in the graph.
-        let dst_entry = graph.entry(dst).or_default();
-        if dst_entry.src == Some(src) {
-            // This copy is already represented is repeated, we can skip it.
-            continue;
-        }
-        if dst_entry.src.is_some() {
-            panic!(
+        match seen.get(&dst) {
+            Some(&prev) if prev == src => continue,
+            Some(_) => panic!(
                 "Pre-condition violated: destination register {} is written to more than once",
                 dst
-            );
-        }
-        dst_entry.src = Some(src);
-
-        // Update the source entry in the graph.
-        graph.entry(src).or_default().dest.push(dst);
-    }
-
-    sequence_parallel_copies_impl(graph)
-}
-
-#[derive(Default)]
-struct RegConnections {
-    src: Option<u32>,
-    dest: Vec<u32>,
-}
-
-fn sequence_parallel_copies_impl(
-    mut graph: BTreeMap<u32, RegConnections>,
-) -> impl Iterator<Item = (Register, Register)> {
-    // Find the set of destinations that are not sources to any other copy.
-    let mut tree_ends: Vec<u32> = graph
-        .iter()
-        .filter_map(|(&reg, conn)| conn.dest.is_empty().then_some(reg))
-        .collect();
-
-    let mut non_cycle_copies: Vec<(u32, u32)> = Vec::new();
-
-    // This part of the algorithm prunes the subtrees of the graph, leaving only the cycles.
-    // Due to the source-swapping operation, a cycle connected to a subtree will be automatically
-    // broken and handled in this phase.
-    while let Some(target) = tree_ends.pop() {
-        // Unfortunately we cant keep the mutable borrow of this entry, because
-        // we will have to mutate the source entry as well.
-        let source = graph[&target].src.unwrap();
-        non_cycle_copies.push((source, target));
-
-        let Entry::Occupied(mut source_entry) = graph.entry(source) else {
-            panic!("Invariant violated: source register not found in graph");
-        };
-        let source_node = source_entry.get_mut();
-
-        // Remove the edge from source to target.
-        source_node.dest.retain(|&dst| dst != target);
-
-        // We perform the source-swapping trick that breaks a potential cycle connected to
-        // this subtree: the newly written register will now be the source of the remaining
-        // copies, instead of the original source, if any.
-        let remaining_dests = std::mem::take(&mut source_node.dest);
-
-        if source_node.src.is_none() {
-            // The source entry can be removed from the graph, as it has no source itself.
-            source_entry.remove_entry();
-        } else {
-            // The original source now no more outgoing edges, add it to the tree_ends list.
-            tree_ends.push(source);
-        }
-
-        // Update the target entry in the graph with the remaining destinations, if any.
-        if remaining_dests.is_empty() {
-            // If there are no remaining destinations, the target entry can be removed from the graph,
-            // since it has no more sources or destinations.
-            graph.remove(&target);
-        } else {
-            // Update the src of remaining destinations to point to target (source-swapping).
-            // This is the key step: since target now holds the same value as the original source,
-            // we can use target as the source for the remaining copies.
-            for &d in &remaining_dests {
-                graph.get_mut(&d).unwrap().src = Some(target);
+            ),
+            None => {
+                seen.insert(dst, src);
             }
-
-            let target_entry = graph.get_mut(&target).unwrap();
-            // The target is no longer a destination.
-            target_entry.src = None;
-            // The target is now the source for the remaining destinations.
-            target_entry.dest = remaining_dests;
         }
     }
 
-    // At this point, the graph only contains cycles. We can break them by using a temporary register.
-    // The thing is, we don't really need an extra temporary register if there were any copies already issued.
-    // We can use any written register that isn't an original source, as long as we place the cycle-breaking
-    // copies before the original copies in the sequence.
-    let tmp_register = non_cycle_copies
-        .first()
-        .map(|&(_, dst)| Register::Given(dst))
-        .unwrap_or(Register::Temp);
-
-    let mut cycle_copies: Vec<(Register, Register)> = Vec::new();
-    while let Some(initial) = graph.keys().next().cloned() {
-        // Break the cycle by copying the value of `initial` to the temporary register.
-        cycle_copies.push((Register::Given(initial), tmp_register));
-
-        let mut curr = initial;
-        loop {
-            let Entry::Occupied(curr_entry) = graph.entry(curr) else {
-                panic!("Invariant violated: current register not found in graph");
-            };
-            let curr_node = curr_entry.get();
-            assert_eq!(
-                curr_node.dest.len(),
-                1,
-                "Invariant violated: cycle node has more than one destination"
-            );
-
-            let src = curr_node.src.unwrap();
-            curr_entry.remove_entry();
-
-            if src == initial {
-                // We have completed the cycle, we can break out of the loop.
-                break;
-            }
-
-            // Copy the value from src to curr.
-            cycle_copies.push((Register::Given(src), Register::Given(curr)));
-            curr = src;
-        }
-
-        // Close the cycle by copying the value from the temporary register to the last destination.
-        cycle_copies.push((tmp_register, Register::Given(curr)));
+    // Encode pairs as little-endian u32s and hand them to Lean. Use checked
+    // arithmetic at the FFI boundary so a pathologically large input is
+    // rejected before we wrap and under-allocate.
+    let input_len = pairs
+        .len()
+        .checked_mul(2)
+        .expect("sequence_parallel_copies: input too large (overflow in length)");
+    let mut input: Vec<u32> = Vec::with_capacity(input_len);
+    for &(src, dst) in &pairs {
+        input.push(src);
+        input.push(dst);
     }
 
-    // We have to place the cycle-breaking copies before the non-cycle copies, because the latter may
-    // write to the register that we need to use as temporary for breaking the cycles.
-    cycle_copies.into_iter().chain(
-        non_cycle_copies
-            .into_iter()
-            .map(|(src, dst)| (Register::Given(src), Register::Given(dst))),
-    )
+    // NOTE: a debug-mode runtime check that this schedule (and especially its
+    // *materialised* form, after `parallel_copy` resolves `Register::Temp` to a
+    // concrete u32) realises parallel-copy semantics would be a useful belt-
+    // and-braces guard against future regressions in `parallel_copy`. The
+    // present module's 47 unit tests already cover the Lean schedule; the
+    // missing piece is a check at the materialisation layer. Left as a follow-up.
+    unsafe { call_lean(&input) }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Register {
-    Temp,
-    Given(u32),
+unsafe fn call_lean(input: &[u32]) -> std::vec::IntoIter<(Register, Register)> {
+    // The C side decodes the flat u32 stream into (src, dst) pairs, runs the Lean algorithm,
+    // and returns a flat u32 stream of (tag_s, val_s, tag_d, val_d) quadruples.
+    let buf = unsafe { ffi::crush_seq_parallel_copies(input.as_ptr(), input.len() / 2) };
+    let copies = decode_output(&buf);
+    unsafe { ffi::crush_seq_parallel_copies_free(buf) };
+    copies.into_iter()
+}
+
+fn decode_output(buf: &ffi::CrushBuf) -> Vec<(Register, Register)> {
+    if buf.ptr.is_null() || buf.len_u32 == 0 {
+        return Vec::new();
+    }
+    assert!(
+        buf.len_u32 % 4 == 0,
+        "Lean returned a malformed buffer: len_u32 = {}",
+        buf.len_u32
+    );
+    let slice = unsafe { std::slice::from_raw_parts(buf.ptr, buf.len_u32) };
+    let mut out = Vec::with_capacity(buf.len_u32 / 4);
+    for q in slice.chunks_exact(4) {
+        out.push((decode_register(q[0], q[1]), decode_register(q[2], q[3])));
+    }
+    out
+}
+
+fn decode_register(tag: u32, val: u32) -> Register {
+    match tag {
+        0 => Register::Temp,
+        1 => Register::Given(val),
+        _ => panic!("Lean returned an unknown Register tag: {tag}"),
+    }
+}
+
+mod ffi {
+    use std::os::raw::c_void;
+
+    #[repr(C)]
+    pub struct CrushBuf {
+        pub ptr: *mut u32,
+        pub len_u32: usize,
+    }
+
+    unsafe extern "C" {
+        pub fn crush_seq_parallel_copies(pairs: *const u32, num_pairs: usize) -> CrushBuf;
+        pub fn crush_seq_parallel_copies_free(buf: CrushBuf);
+    }
+
+    // Silence unused-import warnings for c_void when not used directly.
+    #[allow(dead_code)]
+    fn _unused(_: *mut c_void) {}
 }
 
 #[cfg(test)]
