@@ -76,22 +76,26 @@ impl BasicBlockTracker {
         stats.times_executed += 1;
 
         for flags in self.regs.values() {
-            if flags.contains(AccessFlags::READ) {
+            let was_read = flags.contains(AccessFlags::READ);
+            let was_written_ever = flags.contains(AccessFlags::WRITTEN_EVER);
+            let is_written_live = flags.contains(AccessFlags::WRITTEN_LIVE);
+
+            if was_read {
                 stats.reads += 1;
             }
-            if flags.contains(AccessFlags::WRITTEN_EVER) {
+            if was_written_ever {
                 stats.written_ever += 1;
             }
-            if flags.contains(AccessFlags::WRITTEN_LIVE) {
+            if is_written_live {
                 stats.written_live += 1;
+            }
+            if was_read || was_written_ever {
+                stats.accesses += 1;
             }
             // A "temporary" access: first touch is a write (no external read)
             // and the value is dropped before the block ends — the register
             // access can be elided entirely.
-            if flags.contains(AccessFlags::WRITTEN_EVER)
-                && !flags.contains(AccessFlags::WRITTEN_LIVE)
-                && !flags.contains(AccessFlags::READ)
-            {
+            if was_written_ever && !is_written_live && !was_read {
                 stats.tmp_accesses += 1;
             }
         }
@@ -120,6 +124,7 @@ pub struct BasicBlockExecStats {
     pub reads: usize,
     pub written_ever: usize,
     pub written_live: usize,
+    pub accesses: usize,
     pub tmp_accesses: usize,
 }
 
@@ -132,75 +137,71 @@ impl BasicBlockTracker {
 
         writeln!(
             w,
-            "{:<20}  {:>10}  {:>10}  {:>12}  {:>12}  {:>10}  {:>8}  {:>12}",
+            "{:<20}  {:>10}  {:>10}  {:>12}  {:>12}  {:>10}  {:>12}  {:>8}",
             "block (start..=end)",
             "execs",
             "reads",
             "writes_live",
             "writes_ever",
-            "saved",
-            "saved%",
+            "accesses",
             "tmp_accesses",
+            "saved%",
         )?;
-        writeln!(w, "{}", "-".repeat(101))?;
+        writeln!(w, "{}", "-".repeat(103))?;
 
         let mut total_execs = 0usize;
         let mut total_reads = 0usize;
         let mut total_written_live = 0usize;
         let mut total_written_ever = 0usize;
+        let mut total_accesses = 0usize;
         let mut total_tmp_accesses = 0usize;
 
         for ((start, end), s) in &blocks {
-            let saved_pct = if s.written_ever == 0 {
-                if s.written_live == 0 {
-                    f64::NAN
-                } else {
-                    f64::INFINITY
-                }
+            let saved_pct = if s.accesses == 0 {
+                f64::NAN
             } else {
-                (1.0 - s.written_live as f64 / s.written_ever as f64) * 100.0
+                s.tmp_accesses as f64 / s.accesses as f64 * 100.0
             };
 
-            let saved = s.written_ever - s.written_live;
             writeln!(
                 w,
-                "{:<20}  {:>10}  {:>10}  {:>12}  {:>12}  {:>10}  {:>7.1}%  {:>12}",
+                "{:<20}  {:>10}  {:>10}  {:>12}  {:>12}  {:>10}  {:>12}  {:>7.1}%",
                 format!("{}..={}", start, end),
                 s.times_executed,
                 s.reads,
                 s.written_live,
                 s.written_ever,
-                saved,
-                saved_pct,
+                s.accesses,
                 s.tmp_accesses,
+                saved_pct,
             )?;
 
             total_execs += s.times_executed;
             total_reads += s.reads;
             total_written_live += s.written_live;
             total_written_ever += s.written_ever;
+            total_accesses += s.accesses;
             total_tmp_accesses += s.tmp_accesses;
         }
 
-        let total_saved_pct = if total_written_ever == 0 {
-            100.0f64
+        let total_saved_pct = if total_accesses == 0 {
+            f64::NAN
         } else {
-            (1.0 - total_written_live as f64 / total_written_ever as f64) * 100.0
+            total_tmp_accesses as f64 / total_accesses as f64 * 100.0
         };
 
-        let total_saved = total_written_ever - total_written_live;
-        writeln!(w, "{}", "-".repeat(101))?;
+        writeln!(w, "{}", "-".repeat(103))?;
         writeln!(
             w,
-            "{:<20}  {:>10}  {:>10}  {:>12}  {:>12}  {:>10}  {:>7.1}%  {:>12}",
+            "{:<20}  {:>10}  {:>10}  {:>12}  {:>12}  {:>10}  {:>12}  {:>7.1}%",
             "TOTAL",
             total_execs,
             total_reads,
             total_written_live,
             total_written_ever,
-            total_saved,
-            total_saved_pct,
+            total_accesses,
             total_tmp_accesses,
+            total_saved_pct,
         )?;
 
         Ok(())
