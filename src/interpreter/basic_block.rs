@@ -96,7 +96,8 @@ impl BasicBlockTracker {
 
 impl super::BlockBoundaryTracker for Rc<RefCell<BasicBlockTracker>> {
     fn reset(&mut self, prev_block_end_pc: u32, next_block_start_pc: u32) {
-        self.borrow_mut().reset(prev_block_end_pc, next_block_start_pc);
+        self.borrow_mut()
+            .reset(prev_block_end_pc, next_block_start_pc);
     }
 
     fn print_stats(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
@@ -122,7 +123,13 @@ impl BasicBlockTracker {
         writeln!(
             w,
             "{:<20}  {:>6}  {:>6}  {:>12}  {:>12}  {:>10}  {:>8}",
-            "block (start..end)", "execs", "reads", "writes_live", "writes_ever", "saved", "saved%"
+            "block (start..=end)",
+            "execs",
+            "reads",
+            "writes_live",
+            "writes_ever",
+            "saved",
+            "saved%"
         )?;
         writeln!(w, "{}", "-".repeat(83))?;
 
@@ -132,7 +139,11 @@ impl BasicBlockTracker {
 
         for ((start, end), s) in &blocks {
             let saved_pct = if s.written_ever == 0 {
-                100.0f64
+                if s.written_live == 0 {
+                    f64::NAN
+                } else {
+                    f64::INFINITY
+                }
             } else {
                 (1.0 - s.written_live as f64 / s.written_ever as f64) * 100.0
             };
@@ -141,7 +152,7 @@ impl BasicBlockTracker {
             writeln!(
                 w,
                 "{:<20}  {:>6}  {:>6}  {:>12}  {:>12}  {:>10}  {:>7.1}%",
-                format!("{}..{}", start, end),
+                format!("{}..={}", start, end),
                 s.times_executed,
                 s.reads,
                 s.written_live,
