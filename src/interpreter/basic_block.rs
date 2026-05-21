@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, HashMap, hash_map::Entry};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, btree_map::Entry};
+use std::rc::Rc;
 
 use bitflags::bitflags;
 
@@ -17,11 +19,10 @@ bitflags! {
 /// in case the register was written and then dropped before the end of the block.
 #[derive(Debug, Default)]
 pub struct BasicBlockTracker {
-    regs: HashMap<u32, AccessFlags>,
+    regs: BTreeMap<u32, AccessFlags>,
     current_block_start: u32,
     per_block_stats: BTreeMap<(u32, u32), BasicBlockExecStats>,
 }
-
 impl BasicBlockTracker {
     pub fn new() -> Self {
         Self::default()
@@ -62,6 +63,12 @@ impl BasicBlockTracker {
         }
     }
 
+    pub fn notify_drop_from(&mut self, reg: u32) {
+        for (_, flags) in self.regs.range_mut(reg..) {
+            flags.remove(AccessFlags::WRITTEN_LIVE);
+        }
+    }
+
     pub fn reset(&mut self, prev_block_end_pc: u32, next_block_start_pc: u32) {
         // stat block for the just executed block
         let key = (self.current_block_start, prev_block_end_pc);
@@ -87,6 +94,16 @@ impl BasicBlockTracker {
     }
 }
 
+impl super::BlockBoundaryTracker for Rc<RefCell<BasicBlockTracker>> {
+    fn reset(&mut self, prev_block_end_pc: u32, next_block_start_pc: u32) {
+        self.borrow_mut().reset(prev_block_end_pc, next_block_start_pc);
+    }
+
+    fn print_stats(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        self.borrow().print_stats(w)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct BasicBlockExecStats {
     pub times_executed: usize,
@@ -96,7 +113,7 @@ pub struct BasicBlockExecStats {
 }
 
 impl BasicBlockTracker {
-    pub fn print_stats(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+    pub fn print_stats<W: std::io::Write + ?Sized>(&self, w: &mut W) -> std::io::Result<()> {
         // Sort blocks by descending total write cost.
         let mut blocks: Vec<(&(u32, u32), &BasicBlockExecStats)> =
             self.per_block_stats.iter().collect();

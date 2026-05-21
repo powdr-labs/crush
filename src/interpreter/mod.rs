@@ -14,9 +14,11 @@ use crate::{
 };
 use core::panic;
 use itertools::Itertools;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::ops::Range;
+use std::rc::Rc;
 use wasmparser::Operator as Op;
 
 // How a null reference is represented in the VROM
@@ -26,8 +28,19 @@ pub const NULL_REF: [u32; 3] = [
     0,        // Address: 0 is an invalid function address because START_ROM_ADDR > 0
 ];
 
-trait BasicBlockTracker {
+trait BlockBoundaryTracker {
     fn reset(&mut self, prev_block_end_pc: u32, next_block_start_pc: u32);
+
+    fn print_stats(&self, _w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct NoopBasicBlockTracker;
+
+impl BlockBoundaryTracker for NoopBasicBlockTracker {
+    fn reset(&mut self, _prev_block_end_pc: u32, _next_block_start_pc: u32) {}
 }
 
 /// We need 2 kinds of register banks, chosen by the execution model:
@@ -228,16 +241,21 @@ impl RegisterBank for WriteOnceRegisterBank {
 struct ReadWriteRegisterBank {
     /// Each register is `Some(value)` if alive, or `None` if dropped.
     regs: Vec<Option<u32>>,
+    basic_block_tracker: Rc<RefCell<basic_block::BasicBlockTracker>>,
 }
 
 impl ReadWriteRegisterBank {
-    fn new() -> Self {
-        Self { regs: Vec::new() }
+    fn new(basic_block_tracker: Rc<RefCell<basic_block::BasicBlockTracker>>) -> Self {
+        Self {
+            regs: Vec::new(),
+            basic_block_tracker,
+        }
     }
 }
 
 impl RegisterBank for ReadWriteRegisterBank {
     fn get(&mut self, addr: u32) -> RegisterValue {
+        self.basic_block_tracker.borrow_mut().notify_read(addr);
         match self.regs.get(addr as usize) {
             Some(Some(value)) => RegisterValue::Concrete(*value),
             Some(None) | None => RegisterValue::Dropped,
@@ -245,6 +263,7 @@ impl RegisterBank for ReadWriteRegisterBank {
     }
 
     fn set(&mut self, addr: u32, value: u32) {
+        self.basic_block_tracker.borrow_mut().notify_write(addr);
         let addr = addr as usize;
         if addr >= self.regs.len() {
             self.regs.resize(addr + 1, None);
@@ -274,6 +293,7 @@ impl RegisterBank for ReadWriteRegisterBank {
     }
 
     fn drop_reg(&mut self, addr: u32) {
+        self.basic_block_tracker.borrow_mut().notify_drop(addr);
         let addr = addr as usize;
         if addr < self.regs.len() {
             self.regs[addr] = None;
@@ -281,6 +301,9 @@ impl RegisterBank for ReadWriteRegisterBank {
     }
 
     fn drop_from(&mut self, first: u32) {
+        self.basic_block_tracker
+            .borrow_mut()
+            .notify_drop_from(first);
         self.regs.truncate(first as usize);
     }
 }
@@ -290,7 +313,7 @@ pub struct Interpreter<'a, E: ExternalFunctions> {
     pc: u32,
     fp: u32,
     regs: Box<dyn RegisterBank>,
-    basic_block_tracker: Box<dyn BasicBlockTracker>,
+    basic_block_tracker: Box<dyn BlockBoundaryTracker>,
     ram: Ram,
     call_stack: Vec<u32>,
     trace_enabled: bool,
@@ -346,12 +369,22 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
         const START_ROM_ADDR: u32 = 0x1;
 
         let mut func_stack_sizes = Vec::new();
-        let regs = if exec_model == ExecutionModel::WriteOnceRegisters {
-            func_stack_sizes.extend(program.functions.iter().map(|f| f.frame_size.unwrap()));
-            Box::new(WriteOnceRegisterBank::new()) as Box<dyn RegisterBank>
-        } else {
-            Box::new(ReadWriteRegisterBank::new()) as Box<dyn RegisterBank>
-        };
+        let (regs, basic_block_tracker): (Box<dyn RegisterBank>, Box<dyn BlockBoundaryTracker>) =
+            if exec_model == ExecutionModel::WriteOnceRegisters {
+                func_stack_sizes.extend(program.functions.iter().map(|f| f.frame_size.unwrap()));
+                (
+                    Box::new(WriteOnceRegisterBank::new()) as Box<dyn RegisterBank>,
+                    Box::new(NoopBasicBlockTracker) as Box<dyn BlockBoundaryTracker>,
+                )
+            } else {
+                let basic_block_tracker: Rc<RefCell<basic_block::BasicBlockTracker>> =
+                    Rc::new(RefCell::new(basic_block::BasicBlockTracker::new()));
+                (
+                    Box::new(ReadWriteRegisterBank::new(basic_block_tracker.clone()))
+                        as Box<dyn RegisterBank>,
+                    Box::new(basic_block_tracker) as Box<dyn BlockBoundaryTracker>,
+                )
+            };
 
         let (flat_program, labels) = linker::link(program.functions, START_ROM_ADDR);
 
@@ -395,6 +428,7 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
             pc: 0,
             fp: 0,
             regs,
+            basic_block_tracker,
             ram: Ram(ram),
             exec_model,
             call_stack: Vec::new(),
@@ -463,6 +497,9 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
         // Push the initial function address onto the stack for instrumentation
         self.call_stack.push(self.addr_to_func_id[&self.pc]);
         self.run_loop();
+        self.basic_block_tracker
+            .print_stats(&mut std::io::stdout())
+            .expect("failed to print basic block stats");
         // Pop the initial function address
         self.call_stack.pop();
 
