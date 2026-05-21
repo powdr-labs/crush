@@ -35,19 +35,18 @@ impl BasicBlockTracker {
             }
             Entry::Occupied(mut entry) => {
                 let flags = entry.get_mut();
-                if flags.contains(AccessFlags::WRITTEN_LIVE) {
-                    // there is a live write, so this read is internal
-                    // to the block and should not be counted
-                    return;
+
+                // if there is a live write, this read is internal
+                // to the block and should not be counted
+                if !flags.contains(AccessFlags::WRITTEN_LIVE) {
+                    // the only way for we to have !WRITTEN_LIVE && WRITTEN_EVER is for
+                    // the register to have been written and then dropped, but in that case
+                    // there should not be any reads in a well formed program
+                    assert!(!flags.contains(AccessFlags::WRITTEN_EVER));
+
+                    // was never written, so this is an external read, which we do want to track
+                    flags.insert(AccessFlags::READ);
                 }
-                if flags.contains(AccessFlags::WRITTEN_EVER) {
-                    // was once written, but is no longer live (i.e. has been dropped),
-                    // now the program is trying to read it.
-                    // should not be possible in a well formed program
-                    panic!();
-                }
-                // was never written, so this is an external read, which we do want to track
-                flags.insert(AccessFlags::READ);
             }
         }
     }
