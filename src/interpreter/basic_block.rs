@@ -85,6 +85,15 @@ impl BasicBlockTracker {
             if flags.contains(AccessFlags::WRITTEN_LIVE) {
                 stats.written_live += 1;
             }
+            // A "temporary" access: first touch is a write (no external read)
+            // and the value is dropped before the block ends — the register
+            // access can be elided entirely.
+            if flags.contains(AccessFlags::WRITTEN_EVER)
+                && !flags.contains(AccessFlags::WRITTEN_LIVE)
+                && !flags.contains(AccessFlags::READ)
+            {
+                stats.tmp_accesses += 1;
+            }
         }
 
         self.current_block_start = next_block_start_pc;
@@ -111,6 +120,7 @@ pub struct BasicBlockExecStats {
     pub reads: usize,
     pub written_ever: usize,
     pub written_live: usize,
+    pub tmp_accesses: usize,
 }
 
 impl BasicBlockTracker {
@@ -122,20 +132,23 @@ impl BasicBlockTracker {
 
         writeln!(
             w,
-            "{:<20}  {:>6}  {:>6}  {:>12}  {:>12}  {:>10}  {:>8}",
+            "{:<20}  {:>10}  {:>10}  {:>12}  {:>12}  {:>10}  {:>8}  {:>12}",
             "block (start..=end)",
             "execs",
             "reads",
             "writes_live",
             "writes_ever",
             "saved",
-            "saved%"
+            "saved%",
+            "tmp_accesses",
         )?;
-        writeln!(w, "{}", "-".repeat(83))?;
+        writeln!(w, "{}", "-".repeat(101))?;
 
+        let mut total_execs = 0usize;
         let mut total_reads = 0usize;
         let mut total_written_live = 0usize;
         let mut total_written_ever = 0usize;
+        let mut total_tmp_accesses = 0usize;
 
         for ((start, end), s) in &blocks {
             let saved_pct = if s.written_ever == 0 {
@@ -151,7 +164,7 @@ impl BasicBlockTracker {
             let saved = s.written_ever - s.written_live;
             writeln!(
                 w,
-                "{:<20}  {:>6}  {:>6}  {:>12}  {:>12}  {:>10}  {:>7.1}%",
+                "{:<20}  {:>10}  {:>10}  {:>12}  {:>12}  {:>10}  {:>7.1}%  {:>12}",
                 format!("{}..={}", start, end),
                 s.times_executed,
                 s.reads,
@@ -159,11 +172,14 @@ impl BasicBlockTracker {
                 s.written_ever,
                 saved,
                 saved_pct,
+                s.tmp_accesses,
             )?;
 
+            total_execs += s.times_executed;
             total_reads += s.reads;
             total_written_live += s.written_live;
             total_written_ever += s.written_ever;
+            total_tmp_accesses += s.tmp_accesses;
         }
 
         let total_saved_pct = if total_written_ever == 0 {
@@ -173,17 +189,18 @@ impl BasicBlockTracker {
         };
 
         let total_saved = total_written_ever - total_written_live;
-        writeln!(w, "{}", "-".repeat(83))?;
+        writeln!(w, "{}", "-".repeat(101))?;
         writeln!(
             w,
-            "{:<20}  {:>6}  {:>6}  {:>12}  {:>12}  {:>10}  {:>7.1}%",
+            "{:<20}  {:>10}  {:>10}  {:>12}  {:>12}  {:>10}  {:>7.1}%  {:>12}",
             "TOTAL",
-            "-",
+            total_execs,
             total_reads,
             total_written_live,
             total_written_ever,
             total_saved,
             total_saved_pct,
+            total_tmp_accesses,
         )?;
 
         Ok(())
