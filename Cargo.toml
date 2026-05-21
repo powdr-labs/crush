@@ -4,6 +4,7 @@ description = "Compiles WebAssembly into a ZK friendly IR with infinite register
 edition = "2024"
 
 [dependencies]
+bitflags = "2"
 clap = { version = "4", features = ["derive"] }
 derive-where = "1.4.0"
 env_logger = "0.10.0"

@@ -1,3 +1,4 @@
+mod basic_block;
 pub mod generic_ir;
 pub mod linker;
 
@@ -24,6 +25,10 @@ pub const NULL_REF: [u32; 3] = [
     0,        // Frame size: any value here would do, so we choose 0
     0,        // Address: 0 is an invalid function address because START_ROM_ADDR > 0
 ];
+
+trait BasicBlockTracker {
+    fn reset(&mut self, prev_block_end_pc: u32, next_block_start_pc: u32);
+}
 
 /// We need 2 kinds of register banks, chosen by the execution model:
 /// - Write-once registers
@@ -285,6 +290,7 @@ pub struct Interpreter<'a, E: ExternalFunctions> {
     pc: u32,
     fp: u32,
     regs: Box<dyn RegisterBank>,
+    basic_block_tracker: Box<dyn BasicBlockTracker>,
     ram: Ram,
     call_stack: Vec<u32>,
     trace_enabled: bool,
@@ -475,14 +481,15 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
 
             let instr = t.i.flat_program[t.i.pc as usize].clone();
 
-            let mut should_inc_pc = true;
+            // Instructions that change the control flow (calls and returns) will set this to a different value.
+            let mut new_pc = t.i.pc + 1;
+            let mut basic_block_end = false;
+
             // If the directive is not an instruction (drop hint or label), this is set to false.
             let mut instruction_processed = true;
             match instr {
                 Directive::Label { .. } => {
-                    should_inc_pc = false;
-                    instruction_processed = false;
-                    // do nothing
+                    unreachable!("Labels should have been removed by the linker");
                 }
                 Directive::Drop { register } => {
                     t.i.regs.drop_reg(t.i.fp + register);
@@ -505,10 +512,9 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     }
 
                     t.i.call_stack.pop();
-                    t.i.pc = pc;
+                    new_pc = pc;
                     t.i.fp = fp;
-
-                    should_inc_pc = false;
+                    basic_block_end = true;
                 }
                 Directive::WASMOp {
                     op,
@@ -1821,11 +1827,11 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     saved_caller_fp,
                 } => {
                     let prev_pc = t.i.pc;
-                    t.i.pc = t.i.labels[&target].pc;
-                    should_inc_pc = false;
+                    new_pc = t.i.labels[&target].pc;
+                    basic_block_end = true;
 
                     // Push the new function id for instrumentation
-                    t.i.call_stack.push(t.i.addr_to_func_id[&t.i.pc]);
+                    t.i.call_stack.push(t.i.addr_to_func_id[&new_pc]);
 
                     let prev_fp = t.i.fp;
                     t.i.fp += new_frame_offset;
@@ -1840,10 +1846,10 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     saved_caller_fp,
                 } => {
                     let prev_pc = t.i.pc;
-                    t.i.pc = t.get_reg_relative_u32(target_pc..target_pc + 1);
-                    should_inc_pc = false;
+                    new_pc = t.get_reg_relative_u32(target_pc..target_pc + 1);
+                    basic_block_end = true;
 
-                    t.i.call_stack.push(t.i.addr_to_func_id[&t.i.pc]);
+                    t.i.call_stack.push(t.i.addr_to_func_id[&new_pc]);
 
                     let prev_fp = t.i.fp;
                     t.i.fp += new_frame_offset;
@@ -1858,10 +1864,10 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     saved_caller_fp,
                 } => {
                     let prev_pc = t.i.pc;
-                    t.i.pc = t.i.labels[&target].pc;
-                    should_inc_pc = false;
+                    new_pc = t.i.labels[&target].pc;
+                    basic_block_end = true;
 
-                    t.i.call_stack.push(t.i.addr_to_func_id[&t.i.pc]);
+                    t.i.call_stack.push(t.i.addr_to_func_id[&new_pc]);
 
                     let prev_fp = t.i.fp;
                     t.i.fp = t.get_reg_relative_u32(new_frame_ptr..new_frame_ptr + 1);
@@ -1876,10 +1882,10 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     saved_caller_fp,
                 } => {
                     let prev_pc = t.i.pc;
-                    t.i.pc = t.get_reg_relative_u32(target_pc..target_pc + 1);
-                    should_inc_pc = false;
+                    new_pc = t.get_reg_relative_u32(target_pc..target_pc + 1);
+                    basic_block_end = true;
 
-                    t.i.call_stack.push(t.i.addr_to_func_id[&t.i.pc]);
+                    t.i.call_stack.push(t.i.addr_to_func_id[&new_pc]);
 
                     let prev_fp = t.i.fp;
                     t.i.fp = t.get_reg_relative_u32(new_frame_ptr..new_frame_ptr + 1);
@@ -1893,6 +1899,10 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     inputs,
                     outputs,
                 } => {
+                    // This is a special instruction, so it goes inside its own basic block.
+                    t.i.basic_block_tracker.reset(t.i.pc - 1, t.i.pc);
+                    basic_block_end = true;
+
                     let args = inputs
                         .into_iter()
                         .flatten()
@@ -1916,8 +1926,8 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     new_frame_ptr,
                     saved_caller_fp,
                 } => {
-                    t.i.pc = t.i.labels[&target].pc;
-                    should_inc_pc = false;
+                    new_pc = t.i.labels[&target].pc;
+                    basic_block_end = true;
 
                     let prev_fp = t.i.fp;
                     t.i.fp = t.get_reg_relative_u32(new_frame_ptr..new_frame_ptr + 1);
@@ -1930,26 +1940,26 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     let target = t.i.labels[&target].pc;
                     let cond = t.get_reg_relative_u32(condition..condition + 1);
                     if cond != 0 {
-                        t.i.pc = target;
-                        should_inc_pc = false;
+                        new_pc = target;
                     }
+                    basic_block_end = true;
                 }
                 Directive::JumpIfZero { target, condition } => {
                     let target = t.i.labels[&target].pc;
                     let cond = t.get_reg_relative_u32(condition..condition + 1);
                     if cond == 0 {
-                        t.i.pc = target;
-                        should_inc_pc = false;
+                        new_pc = target;
                     }
+                    basic_block_end = true;
                 }
                 Directive::Jump { target } => {
-                    t.i.pc = t.i.labels[&target].pc;
-                    should_inc_pc = false;
+                    new_pc = t.i.labels[&target].pc;
+                    basic_block_end = true;
                 }
                 Directive::JumpOffset { offset } => {
                     let offset = t.get_reg_relative_u32(offset..offset + 1);
-                    // Offset starts with 0, so we don't prevent the natural increment of the PC.
-                    t.i.pc += offset;
+                    new_pc = t.i.pc + 1 + offset;
+                    basic_block_end = true;
                 }
                 Directive::Trap { reason } => {
                     panic!("Trap encountered: {reason:?}");
@@ -1963,11 +1973,13 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                 to_be_dropped_on_next_instr.clear();
             }
 
+            if basic_block_end {
+                t.i.basic_block_tracker.reset(t.i.pc, new_pc);
+            }
+
             t.print_trace();
 
-            if should_inc_pc {
-                t.i.pc += 1;
-            }
+            t.i.pc = new_pc;
 
             cycles += 1;
         };
