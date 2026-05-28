@@ -20,6 +20,25 @@ use crate::{
     utils::rev_vec_filler::RevVecFiller,
 };
 
+/// Why a live range ended at its `range.end` boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeEndReason {
+    /// The value is consumed (used as input for the last time) by the node
+    /// at `range.end`.
+    Consumed,
+    /// The value's range ends either because of an execution path divergence,
+    /// that arises at the fall-through right after a BrIf/BrIfZero, or because
+    /// it was produced by the previous node, but it it unused and can be
+    /// dropped right away.
+    Discarded,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveRange {
+    pub range: Range<usize>,
+    pub end_reason: RangeEndReason,
+}
+
 #[derive(Debug)]
 pub struct Liveness {
     /// For each value origin, holds the ranges where the value is live.
@@ -34,7 +53,7 @@ pub struct Liveness {
     /// origin node, and others at a label where the value carried from some break.
     /// Each range ends either at the node right before its last usage, ot at a break
     /// that might need to carry the value over to the jump target.
-    live_ranges: HashMap<ValueOrigin, Arc<[Range<usize>]>>,
+    live_ranges: HashMap<ValueOrigin, Arc<[LiveRange]>>,
 
     /// The set of outputs indexed from the Input node that are redirected
     /// as-is to the next iteration of the loop.
@@ -58,14 +77,14 @@ impl Liveness {
     /// The first range always starts at the origin.
     ///
     /// If the value is ephemeral (produced but never used), returns a single
-    /// empty range `[origin.node, origin.node)`. Storing it as dimensionless
-    /// distinguishes "unused" unambiguously from "last used exactly at
-    /// `origin.node + 1`", whose range is `[origin.node, origin.node + 1)`.
-    pub fn query_liveness(&self, origin: &ValueOrigin) -> Arc<[Range<usize>]> {
-        self.live_ranges
-            .get(origin)
-            .cloned()
-            .unwrap_or_else(|| single_range(origin.node..origin.node))
+    /// one element range with RangeEndReason::Discarded.
+    pub fn query_liveness(&self, origin: &ValueOrigin) -> Arc<[LiveRange]> {
+        self.live_ranges.get(origin).cloned().unwrap_or_else(|| {
+            Arc::new([LiveRange {
+                range: origin.node..(origin.node + 1),
+                end_reason: RangeEndReason::Discarded,
+            }])
+        })
     }
 
     pub fn query_if_input_is_redirected(&self, input_idx: u32) -> bool {
@@ -237,25 +256,40 @@ impl<'a> LivenessDag<'a> {
         last_usage_map.push((0, last_usage));
 
         // Use last usage map to build the live ranges for each value origin.
-        let mut live_ranges = HashMap::new();
+        let mut live_ranges: HashMap<ValueOrigin, Vec<LiveRange>> = HashMap::new();
         while let Some((interval_start, usage_map)) = last_usage_map.pop() {
             for (origin, last_usage) in usage_map {
                 let start = interval_start.max(origin.node);
-                let end = if let Some((next_interval_start, _)) = last_usage_map.last() {
-                    last_usage.min(*next_interval_start)
-                } else {
-                    last_usage
-                };
-                let ranges: &mut Vec<Range<usize>> = live_ranges.entry(origin).or_default();
+                let (end, end_reason) =
+                    if let Some((next_interval_start, _)) = last_usage_map.last() {
+                        if last_usage <= *next_interval_start {
+                            // Capped by the consumer at last_usage.
+                            (last_usage, RangeEndReason::Consumed)
+                        } else {
+                            // Capped by the next interval boundary; the value
+                            // continues into the next interval (where it gets
+                            // consumed), but on this execution path it's no
+                            // longer relevant past the boundary.
+                            (*next_interval_start, RangeEndReason::Discarded)
+                        }
+                    } else {
+                        (last_usage, RangeEndReason::Consumed)
+                    };
+                let ranges = live_ranges.entry(origin).or_default();
 
                 if let Some(prev_range) = ranges.last_mut()
-                    && prev_range.end == start
+                    && prev_range.range.end == start
                 {
                     // Merge with the previous range if they are contiguous.
-                    prev_range.end = end;
+                    // The merged range conceptually ends where the new one
+                    // ends, so adopt the new range's end reason.
+                    prev_range.range.end = end;
+                    prev_range.end_reason = end_reason;
                 } else {
-                    // Add a new range otherwise.
-                    ranges.push(Range { start, end });
+                    ranges.push(LiveRange {
+                        range: Range { start, end },
+                        end_reason,
+                    });
                 }
             }
         }
@@ -332,10 +366,11 @@ fn merge_usages(
     }
 }
 
-/// Creates an `Arc<[Range<usize>]>` containing a single range.
-///
-/// This function is needed to isolate the false positive on clippy.
+/// Creates an `Arc<[LiveRange]>` containing a single range with the `RangeEndReason::Discarded` end reason.
 #[allow(clippy::single_range_in_vec_init)]
-pub(crate) fn single_range(range: Range<usize>) -> Arc<[Range<usize>]> {
-    Arc::new([range])
+pub(crate) fn single_range(range: Range<usize>) -> Arc<[LiveRange]> {
+    Arc::new([LiveRange {
+        range,
+        end_reason: RangeEndReason::Discarded,
+    }])
 }

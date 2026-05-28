@@ -1,7 +1,8 @@
 mod occupation_tracker;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque},
+    collections::{BTreeMap, BinaryHeap, HashMap, VecDeque},
+    iter,
     num::NonZeroU32,
     ops::Range,
 };
@@ -15,7 +16,7 @@ use crate::{
         dag::ValueOrigin,
         passes::blockless_dag::GenericNode,
         rwm::{
-            liveness_dag::{self, LivenessDag, single_range},
+            liveness_dag::{self, LiveRange, LivenessDag, RangeEndReason},
             register_allocation::occupation_tracker::{Occupation, OccupationTracker},
         },
         settings::Settings,
@@ -84,7 +85,7 @@ impl Allocation {
     /// last node consuming it.
     pub fn occupation_for_node(&self, node_index: usize) -> Vec<Range<u32>> {
         self.occupation
-            .reg_occupation(&single_range(node_index..(node_index + 1)))
+            .reg_occupation(iter::once(node_index..(node_index + 1)))
     }
 
     /// Precomputes a map from node index to registers that should be dropped after that node.
@@ -112,14 +113,15 @@ pub type Node<'a> = GenericNode<'a, Allocation>;
 ///
 /// It compares by reverse live range end so it can be inserted in a BinaryHeap
 /// to efficiently track the currently alive chunks by their end point.
-#[derive(Eq)]
 pub struct RangeReg {
-    pub live: Range<usize>,
+    pub live: LiveRange,
     pub regs: Range<u32>,
 }
+
+impl Eq for RangeReg {}
 impl PartialEq for RangeReg {
     fn eq(&self, other: &Self) -> bool {
-        self.live.end == other.live.end
+        self.live.range.end == other.live.range.end
     }
 }
 impl PartialOrd for RangeReg {
@@ -130,7 +132,7 @@ impl PartialOrd for RangeReg {
 impl Ord for RangeReg {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Reverse order: think of higer as "first to die".
-        other.live.end.cmp(&self.live.end)
+        other.live.range.end.cmp(&self.live.range.end)
     }
 }
 
@@ -148,55 +150,48 @@ pub struct PerNodeOccupation {
 #[derive(Debug)]
 pub struct NodeRegChanges {
     pub node_index: usize,
-    pub dying: BTreeSet<u32>,
-    pub ephemeral: Vec<u32>,
+    /// Registers that will no longer be accessible after this node.
+    /// The map value tells why it is being dropped.
+    pub dying: BTreeMap<u32, RangeEndReason>,
     pub newly_live: Vec<u32>,
 }
 
 impl PerNodeOccupation {
-    /// Advances the tracker to the next node, returning the set of registers that
-    /// are just dying at this node. To get what actually must be dropped, make
-    /// the difference with the registers that are alive at this node (which doesn't
-    /// include the dying, but includes the ones just becoming live).
+    /// Advances the tracker to the next node, returning the registers that
+    /// transition states at this node. `consumed` are last-used-as-input;
+    /// `obsoleted` are values still alive at this node but no longer needed
+    /// on the fall-through (only at BrIf/BrIfZero). To get what actually must
+    /// be dropped, take the union of both and subtract `newly_live`.
     pub fn advance(&mut self) -> NodeRegChanges {
         let node_index = self.next_node;
         self.next_node += 1;
 
         // Remove the dying allocations and collect their registers.
-        let mut dying = BTreeSet::new();
+        let mut dying = BTreeMap::new();
         while let Some(next_to_die) = self.active_allocs.peek()
-            && next_to_die.live.end <= node_index
+            && next_to_die.live.range.end <= node_index
         {
-            for reg in next_to_die.regs.clone() {
-                dying.insert(reg);
+            let next_to_die = self.active_allocs.pop().unwrap();
+            for reg in next_to_die.regs {
+                dying.insert(reg, next_to_die.live.end_reason);
             }
-            self.active_allocs.pop();
         }
 
         // Add the new allocations.
-        let mut ephemeral = Vec::new();
         let mut newly_live = Vec::new();
         while let Some(next_to_live) = self.rev_sorted_next_allocs.last()
-            && next_to_live.live.start <= node_index
+            && next_to_live.live.range.start <= node_index
         {
             let next_to_live = self.rev_sorted_next_allocs.pop().unwrap();
-            if next_to_live.live.end == node_index {
-                // This is an ephemeral value that must be discarded right away
-                for reg in next_to_live.regs {
-                    ephemeral.push(reg);
-                }
-            } else {
-                for reg in next_to_live.regs.clone() {
-                    newly_live.push(reg);
-                }
-                self.active_allocs.push(next_to_live);
+            for reg in next_to_live.regs.clone() {
+                newly_live.push(reg);
             }
+            self.active_allocs.push(next_to_live);
         }
 
         NodeRegChanges {
             node_index,
             dying,
-            ephemeral,
             newly_live,
         }
     }
@@ -447,11 +442,11 @@ fn recursive_block_allocation<'a, S: Settings>(
                     // Find the range that either contains the loop node or ends at it.
                     let value_liveness = oa[0].occupation_tracker.liveness().query_liveness(origin);
                     let err_msg = "liveness bug: value used outside of its live ranges";
-                    let pos = value_liveness.partition_point(|r| r.start <= index);
+                    let pos = value_liveness.partition_point(|r| r.range.start <= index);
                     assert!(pos > 0, "{}", err_msg);
                     let relevant_range = &value_liveness[pos - 1];
-                    assert!(relevant_range.end >= index, "{}", err_msg);
-                    let alloc_fixed = if relevant_range.end == index {
+                    assert!(relevant_range.range.end >= index, "{}", err_msg);
+                    let alloc_fixed = if relevant_range.range.end == index {
                         // The range covering the loop node ends exactly here, so
                         // on this execution path the loop consumes the value.
                         // Try to reuse the same register for the loop input.
