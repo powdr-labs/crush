@@ -73,8 +73,8 @@ trait RegisterBank {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegisterValue {
-    Unassigned,
     Dropped,
+    Unassigned,
     Future(u32),
     Concrete(u32),
 }
@@ -240,7 +240,7 @@ impl RegisterBank for WriteOnceRegisterBank {
 
 struct ReadWriteRegisterBank {
     /// Each register is `Some(value)` if alive, or `None` if dropped.
-    regs: Vec<Option<u32>>,
+    regs: Vec<RegisterValue>,
     basic_block_tracker: Rc<RefCell<basic_block::BasicBlockTracker>>,
 }
 
@@ -256,19 +256,19 @@ impl ReadWriteRegisterBank {
 impl RegisterBank for ReadWriteRegisterBank {
     fn get(&mut self, addr: u32) -> RegisterValue {
         self.basic_block_tracker.borrow_mut().notify_read(addr);
-        match self.regs.get(addr as usize) {
-            Some(Some(value)) => RegisterValue::Concrete(*value),
-            Some(None) | None => RegisterValue::Dropped,
-        }
+        self.regs
+            .get(addr as usize)
+            .cloned()
+            .unwrap_or(RegisterValue::Dropped)
     }
 
     fn set(&mut self, addr: u32, value: u32) {
         self.basic_block_tracker.borrow_mut().notify_write(addr);
         let addr = addr as usize;
         if addr >= self.regs.len() {
-            self.regs.resize(addr + 1, None);
+            self.regs.resize(addr + 1, RegisterValue::Dropped);
         }
-        self.regs[addr] = Some(value);
+        self.regs[addr] = RegisterValue::Concrete(value);
     }
 
     fn copy_range(&mut self, src: Range<u32>, dest: Range<u32>) {
@@ -296,7 +296,7 @@ impl RegisterBank for ReadWriteRegisterBank {
         self.basic_block_tracker.borrow_mut().notify_drop(addr);
         let addr = addr as usize;
         if addr < self.regs.len() {
-            self.regs[addr] = None;
+            self.regs[addr] = RegisterValue::Dropped;
         }
     }
 
