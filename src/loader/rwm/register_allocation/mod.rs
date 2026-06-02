@@ -1,7 +1,7 @@
 mod occupation_tracker;
 
 use std::{
-    collections::{BTreeMap, BinaryHeap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque},
     iter,
     num::NonZeroU32,
     ops::Range,
@@ -150,9 +150,11 @@ pub struct PerNodeOccupation {
 #[derive(Debug)]
 pub struct NodeRegChanges {
     pub node_index: usize,
-    /// Registers that will no longer be accessible after this node.
-    /// The map value tells why it is being dropped.
-    pub dying: BTreeMap<u32, RangeEndReason>,
+    /// Registers that are being used for the last time at this node.
+    pub consumed: BTreeSet<u32>,
+    /// Registers that are no longer needed starting from this node,
+    /// and can be dropped right away.
+    pub discarded: Vec<u32>,
     pub newly_live: Vec<u32>,
 }
 
@@ -167,13 +169,21 @@ impl PerNodeOccupation {
         self.next_node += 1;
 
         // Remove the dying allocations and collect their registers.
-        let mut dying = BTreeMap::new();
+        let mut consumed = BTreeSet::new();
+        let mut discarded = Vec::new();
         while let Some(next_to_die) = self.active_allocs.peek()
             && next_to_die.live.range.end <= node_index
         {
             let next_to_die = self.active_allocs.pop().unwrap();
             for reg in next_to_die.regs {
-                dying.insert(reg, next_to_die.live.end_reason);
+                match next_to_die.live.end_reason {
+                    RangeEndReason::Consumed => {
+                        consumed.insert(reg);
+                    }
+                    RangeEndReason::Discarded => {
+                        discarded.push(reg);
+                    }
+                };
             }
         }
 
@@ -191,7 +201,8 @@ impl PerNodeOccupation {
 
         NodeRegChanges {
             node_index,
-            dying,
+            consumed,
+            discarded,
             newly_live,
         }
     }
