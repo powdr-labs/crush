@@ -18,9 +18,7 @@ use crate::{
         rwm::{
             flattening::sequence_parallel_copies::Register,
             liveness_dag::RangeEndReason,
-            register_allocation::{
-                self, AllocatedDag, Allocation, NodeRegChanges, PerNodeOccupation,
-            },
+            register_allocation::{self, AllocatedDag, Allocation, PerNodeOccupation},
             settings::Settings,
         },
         settings::{
@@ -112,7 +110,7 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
         assert_eq!(reg_changes.node_index, node_idx);
 
         // Split the set of registers that are consumed from the set that is discarded.
-        let (consumed_regs, discarded_regs): (BTreeSet<_>, BTreeSet<_>) = reg_changes
+        let (mut consumed_regs, mut discarded_regs): (BTreeSet<_>, BTreeSet<_>) = reg_changes
             .dying
             .into_iter()
             .partition_map(|(reg, reason)| match reason {
@@ -406,13 +404,13 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                     .collect_vec();
 
                 // The last target is special, because it is the default target.
-                let (mut default_target, mut consumed) = jump_instructions.pop().unwrap();
+                let (mut default_target, consumed) = jump_instructions.pop().unwrap();
                 self.save_live_at_jump(&mut ctx, &mut default_target, &live_regs, consumed);
 
                 // Get the set of registers that were consumed by the node, but not by any of
                 // the remaining branch targets. I.e. can be the BrTable selector itself, or
                 // inputs consumed by the default branch but not by any of the other branches.
-                let consumed_intersection =
+                let mut consumed_intersection =
                     full_intersection(jump_instructions.iter().map(|(_, consumed)| consumed));
 
                 // Decide whether or not to drop the selector at the relative jump instruction.
@@ -565,8 +563,6 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                 directives.into()
             }
             Operation::WASMOp(Op::Call { function_index }) => {
-                // TODO: to be continued...
-
                 let curr_entry = self.ctrl_stack.front().unwrap();
 
                 if let Some((module, function)) = ctx.common.prog.get_imported_func(function_index)
@@ -601,10 +597,15 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                         node_idx,
                         &inputs,
                         func_type,
-                        reg_changes,
+                        std::mem::take(&mut reg_changes.newly_live),
+                        &mut consumed_regs,
                     );
 
-                    return vec![
+                    // All the inputs goes directly to the called function,
+                    // so there shouldn't be any consumed register left.
+                    assert!(consumed_regs.is_empty());
+
+                    vec![
                         call.prefix_directives.into(),
                         self.s
                             .emit_function_call(
@@ -617,7 +618,7 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                             .into(),
                         call.suffix_directives.into(),
                     ]
-                    .into();
+                    .into()
                 }
             }
             Operation::WASMOp(Op::CallIndirect {
@@ -630,8 +631,6 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                 let (entry_idx, inputs) = inputs.split_last().unwrap();
                 let entry_idx = entry_idx.as_register().unwrap().clone();
 
-                let fn_entry_is_dying = reg_changes.dying.remove(&entry_idx.start);
-
                 let fn_type = ctx.common.prog.get_type(type_index);
                 let call = prepare_function_call(
                     self.s,
@@ -640,8 +639,14 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                     node_idx,
                     inputs,
                     &fn_type.ty,
-                    reg_changes,
+                    reg_changes.newly_live,
+                    &mut consumed_regs,
                 );
+
+                let fn_entry_is_dying = consumed_regs.remove(&entry_idx.start);
+
+                // There shouldn't remain any register in the consumed set by this point.
+                assert!(consumed_regs.is_empty());
 
                 // We need to load the function reference from the table, so we allocate
                 // the space for it and emit the table.get directive.
@@ -936,10 +941,10 @@ fn emit_drops_after_label<'a, S: Settings<'a>>(
 ///
 /// This function emits the copy instructions for the inputs that are not
 /// already at the expected locations, and the drops for the inputs are
-/// no longer used after the copy. It also cleans the dying regs of registers
+/// no longer used after the copy. It also cleans the consumed_regs of registers
 /// that can't be dropped because they are expected in that place as input.
 ///
-/// Dying registers that are not related to the copy are left in `dying_regs`.
+/// Registers that are not related to the copy are left in `consumed_regs`.
 fn copy_inputs_if_needed<'a, S: Settings<'a>>(
     s: &S,
     ctx: &mut Context<'a, '_>,
@@ -1216,7 +1221,8 @@ fn prepare_function_call<'a, S: Settings<'a>>(
     node_idx: usize,
     inputs: &[WasmOpInput],
     func_type: &FuncType,
-    mut reg_changes: NodeRegChanges,
+    mut newly_live: Vec<u32>,
+    consumed_regs: &mut BTreeSet<u32>,
 ) -> FunctionCall<S::Directive> {
     // Normal function calls requires inputs to be copied to where they are needed in the
     // function frame, and also may require outputs to be copied to where the users expect
@@ -1244,8 +1250,7 @@ fn prepare_function_call<'a, S: Settings<'a>>(
         })
         .collect_vec();
 
-    // Calculate where return address and caller frame pointer are stored.
-    // Also calculate the space needed by the function inputs, to calculate where
+    // Calculate the space needed by the function inputs/outputs, to calculate where
     // the return address and caller frame pointer are stored.
     let input_size = inputs_offset - frame_start;
     let outputs_size = outputs_offset - frame_start;
@@ -1255,34 +1260,32 @@ fn prepare_function_call<'a, S: Settings<'a>>(
     ctx.function_call_prelude_size = Some(ret_fp.end);
 
     // Generate the actual directives for input and output copy.
-    let prefix_directives =
-        drop_regs_and_copy_inputs(s, ctx, inputs, input_ranges, reg_changes.dying);
+    let prefix_directives = copy_inputs_if_needed(s, ctx, inputs, input_ranges, consumed_regs);
 
     let (tmp_reg, mut suffix_directives) = parallel_copy(s, ctx, output_copy_set);
 
     // After the function is called, we need another set of drops to clear the function frame.
-    let mut individual_drops = BTreeSet::new();
+    let mut individual_drops = Vec::new();
     if let Some(tmp_reg) = tmp_reg
         && tmp_reg < frame_start
     {
-        individual_drops.insert(tmp_reg);
+        individual_drops.push(tmp_reg);
     }
 
     // Everything from frame_start onward that is not a newly live value must be dropped.
-    // I.e. we must keep usedfunction outputs that were allocated inside the callee frame,
+    // I.e. we must keep used function outputs that were allocated inside the callee frame,
     // and drop the rest of the frame. This should already include every ephemeral output.
-    assert!(reg_changes.ephemeral.iter().all(|reg| *reg >= frame_start));
-    reg_changes.newly_live.retain(|reg| *reg >= frame_start);
-    reg_changes.newly_live.sort_unstable();
+    newly_live.retain(|reg| *reg >= frame_start);
+    newly_live.sort_unstable();
     let mut drop_from = frame_start;
-    for reg in reg_changes.newly_live {
+    for reg in newly_live {
         individual_drops.extend(drop_from..reg);
         drop_from = reg + 1;
     }
 
     // Emit the after-call drops
-    for reg in individual_drops.range(..drop_from) {
-        suffix_directives.push(s.emit_drop(ctx, *reg).into());
+    for reg in individual_drops {
+        suffix_directives.push(s.emit_drop(ctx, reg).into());
     }
     suffix_directives.push(s.emit_drop_from(ctx, drop_from).into());
 
