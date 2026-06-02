@@ -236,7 +236,7 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
 
                 // Generate the drops right after loop label
                 let live_regs_at_loop_start = sub_entry.allocation.occupation_for_node(0);
-                let mut ctx = Context {
+                ctx = Context {
                     common: self.common_ctx,
                     node_index: node_idx,
                     node_inputs: &inputs,
@@ -302,9 +302,11 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
 
                 // We must save all the currently live registers so that the target label can emit the relevant drops.
                 let live_regs = ctx.allocation.occupation_for_node(node_idx);
-                self.save_live_at_jump(
+                save_live_at_jump(
+                    self.s,
                     &mut ctx,
                     &mut jump_directives,
+                    &mut self.live_regs_at_jump,
                     &live_regs,
                     BTreeSet::new(), // branch_taken_consumed is empty
                 );
@@ -405,7 +407,14 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
 
                 // The last target is special, because it is the default target.
                 let (mut default_target, consumed) = jump_instructions.pop().unwrap();
-                self.save_live_at_jump(&mut ctx, &mut default_target, &live_regs, consumed);
+                save_live_at_jump(
+                    self.s,
+                    &mut ctx,
+                    &mut default_target,
+                    &mut self.live_regs_at_jump,
+                    &live_regs,
+                    consumed,
+                );
 
                 // Get the set of registers that were consumed by the node, but not by any of
                 // the remaining branch targets. I.e. can be the BrTable selector itself, or
@@ -426,7 +435,14 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                             consumed.remove(&selector.start);
                         }
 
-                        self.save_live_at_jump(&mut ctx, &mut jump_result, &live_regs, consumed);
+                        save_live_at_jump(
+                            self.s,
+                            &mut ctx,
+                            &mut jump_result,
+                            &mut self.live_regs_at_jump,
+                            &live_regs,
+                            consumed,
+                        );
                         jump_result
                     })
                     .collect_vec();
@@ -639,7 +655,7 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                     node_idx,
                     inputs,
                     &fn_type.ty,
-                    reg_changes.newly_live,
+                    std::mem::take(&mut reg_changes.newly_live),
                     &mut consumed_regs,
                 );
 
@@ -719,14 +735,12 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                     call.suffix_directives.into(),
                 ]);
 
-                return directives.into();
+                directives.into()
             }
-            Operation::WASMOp(Op::Unreachable) => {
-                return self
-                    .s
-                    .emit_trap(&mut ctx, TrapReason::UnreachableInstruction)
-                    .into();
-            }
+            Operation::WASMOp(Op::Unreachable) => self
+                .s
+                .emit_trap(&mut ctx, TrapReason::UnreachableInstruction)
+                .into(),
             Operation::WASMOp(op) => {
                 // Normal WASM operations are handled by the ISA emmiter directly.
                 let curr_entry = self.ctrl_stack.front().unwrap();
@@ -770,44 +784,6 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                 directives.push(self.s.emit_drop(&mut ctx, reg).into());
             }
             directives.into()
-        }
-    }
-
-    fn save_live_at_jump(
-        &mut self,
-        ctx: &mut Context<'a, '_>,
-        jump_result: &mut JumpResult<S::Directive>,
-        currently_live: &[Range<u32>],
-        mut consumed_regs: BTreeSet<u32>,
-    ) {
-        if currently_live.is_empty() && consumed_regs.is_empty() {
-            return;
-        }
-
-        // We do one last attempt to perform the drops of the remaining
-        // consumed registers before the actual jump, if possible.
-        if let Some(branched_directives) = jump_result.mut_directives() {
-            for reg in std::mem::take(&mut consumed_regs) {
-                branched_directives.push(self.s.emit_drop(ctx, reg).into());
-            }
-        }
-
-        if let Some(target) = jump_result.target() {
-            // Whenever this jump is a conditional jump (br_table jumps included), we can have extra "sudden"
-            // register deaths: registers that must be kept alive if this branch is not taken, but are no longer
-            // needed if this branch is taken. We must save what are the registers that are currently live at the
-            // jump, so that the target can know what drops to emit.
-            let live_set = self.live_regs_at_jump.entry(target.clone()).or_default();
-            for range in currently_live {
-                for reg in range.clone() {
-                    live_set.insert(reg);
-                }
-            }
-
-            // Whatever remains in consumed_regs must also be dropped at the target label.
-            for reg in consumed_regs {
-                live_set.insert(reg);
-            }
         }
     }
 
@@ -878,6 +854,45 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
         } else {
             directives.push(self.s.emit_jump(target.clone()).into());
             JumpResult::CopyJump(target, directives)
+        }
+    }
+}
+
+fn save_live_at_jump<'a, S: Settings<'a>>(
+    s: &S,
+    ctx: &mut Context<'a, '_>,
+    jump_result: &mut JumpResult<S::Directive>,
+    live_regs_at_jump: &mut HashMap<String, BTreeSet<u32>>,
+    currently_live: &[Range<u32>],
+    mut consumed_regs: BTreeSet<u32>,
+) {
+    if currently_live.is_empty() && consumed_regs.is_empty() {
+        return;
+    }
+
+    // We do one last attempt to perform the drops of the remaining
+    // consumed registers before the actual jump, if possible.
+    if let Some(branched_directives) = jump_result.mut_directives() {
+        for reg in std::mem::take(&mut consumed_regs) {
+            branched_directives.push(s.emit_drop(ctx, reg).into());
+        }
+    }
+
+    if let Some(target) = jump_result.target() {
+        // Whenever this jump is a conditional jump (br_table jumps included), we can have extra "sudden"
+        // register deaths: registers that must be kept alive if this branch is not taken, but are no longer
+        // needed if this branch is taken. We must save what are the registers that are currently live at the
+        // jump, so that the target can know what drops to emit.
+        let live_set = live_regs_at_jump.entry(target.clone()).or_default();
+        for range in currently_live {
+            for reg in range.clone() {
+                live_set.insert(reg);
+            }
+        }
+
+        // Whatever remains in consumed_regs must also be dropped at the target label.
+        for reg in consumed_regs {
+            live_set.insert(reg);
         }
     }
 }
