@@ -44,15 +44,6 @@ struct AllocationEntry {
     /// that renders the value dead or at the last node that uses it in that execution path.
     ///
     /// The ranges are half-open, sorted and disjoint.
-    ///
-    /// A single empty range `[X, X)` is a valid value, meaning the allocation is
-    /// produced at node `X` but never used (dimensionless lifetime). It is stored
-    /// that way so that "produced but immediately discarded" can be distinguished
-    /// from "last used at X + 1" (whose range is `[X, X + 1)`). The IntervalMap
-    /// cannot store empty intervals, so entries for dimensionless allocations are
-    /// still inserted into the IntervalMap as `[X, X + 1)` to block allocations at
-    /// that register for the node `X` (the value is written there at origin, so
-    /// no other live value can share the slot at that moment).
     live_ranges: Arc<[LiveRange]>,
 }
 
@@ -87,15 +78,13 @@ impl Occupation {
         self.reg_occupation(live_range.iter().map(|lr| lr.range.clone()))
     }
 
-    /// Returns `true` if the Value allocation with the given origin has any
-    /// non-empty live range — i.e. it is read by at least one node.
+    /*
+    /// Returns `true` if the Value allocation with the given origin is read by
+    /// at least one node.
     ///
-    /// In the dimensionless-ranges convention an unused value has a single
-    /// empty range `[X, X)`, whereas a used-but-consumed-immediately value has
-    /// range `[X, X + 1)`. These are stored identically in the IntervalMap
-    /// (both as `[X, X + 1)`), so the distinction lives only in the
-    /// `live_ranges` field of the `AllocationEntry`. Callers that need to know
-    /// whether a value will ever be read should use this method.
+    /// An unused value has the synthetic fallback liveness from
+    /// `Liveness::query_liveness` — a single `Discarded` range — while a used
+    /// value always has at least one range ending in `Consumed`.
     pub fn is_value_used(&self, origin: ValueOrigin) -> bool {
         // TODO: this is stupid. We can query from the map and then check the AllocationEntry directly.
         self.allocations.iter().any(|entry| {
@@ -103,9 +92,9 @@ impl Occupation {
                 && entry
                     .live_ranges
                     .iter()
-                    .any(|r| r.range.start < r.range.end)
+                    .any(|r| r.end_reason == RangeEndReason::Consumed)
         })
-    }
+    }*/
 
     pub fn per_node_tracker(&self) -> PerNodeOccupation {
         // Sort all the allocated chunks by their live range start.
@@ -364,8 +353,10 @@ impl OccupationTracker {
                 // Output was not allocated yet, allocate it at its natural position
                 let live_range = self.liveness.query_liveness(&origin);
                 assert!(
-                    live_range.len() == 1 && live_range[0].range == (origin.node..origin.node),
-                    "unused function output should have dimensionless liveness"
+                    live_range.len() == 1
+                        && live_range[0].range == (origin.node..(origin.node + 1))
+                        && live_range[0].end_reason == RangeEndReason::Discarded,
+                    "unused function output should have one node Discarded liveness"
                 );
 
                 self.insert(
