@@ -432,15 +432,21 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                             consumed.remove(&selector.start);
                         }
 
+                        // Only aggregate `currently_live` at the target label here.
+                        // The per-path `consumed` registers are dropped inline below,
+                        // between this path's marker label and its plain jump. Since
+                        // drop hints don't take up PC address space, the table entry
+                        // still occupies a single instruction slot, and the drops only
+                        // execute when the JumpOffset selects this entry.
                         save_live_at_jump(
                             self.s,
                             &mut ctx,
                             &mut jump_result,
                             &mut self.live_regs_at_jump,
                             &live_regs,
-                            consumed,
+                            BTreeSet::new(),
                         );
-                        jump_result
+                        (jump_result, consumed)
                     })
                     .collect_vec();
 
@@ -538,12 +544,19 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
 
                 let jump_instructions = jump_instructions
                     .into_iter()
-                    .filter_map(|jump_directives| {
+                    .filter_map(|(jump_directives, consumed)| {
                         // This label is not actually refereced statically, but it marks
                         // one possible target of the relative jump. It is useful on backends
                         // that rely on labels to find all the possible jump targets.
                         let marker_label = ctx.new_label(LabelType::Marker);
                         directives.push(self.s.emit_label(&mut ctx, marker_label).into());
+                        // Drop the path-specific consumed registers between the marker
+                        // label and the Jump. The hints bind to the Jump's PC, so the
+                        // drops only happen when the JumpOffset above selects this slot
+                        // and the Jump executes.
+                        for reg in consumed {
+                            directives.push(emit_drop(self.s, &mut ctx, reg));
+                        }
                         match jump_directives {
                             JumpResult::PlainJump(target) => {
                                 // This is a plain jump, just emit it directly.

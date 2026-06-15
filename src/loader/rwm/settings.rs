@@ -137,6 +137,16 @@ pub trait Settings<'a>: loader::Settings {
     ///
     /// Drop hints are pure liveness information and carry no semantic meaning:
     /// backends that don't track register liveness can safely ignore them.
+    ///
+    /// Drops are expected to be free: they must not take up PC address space
+    /// among the executable instructions. Concretely, a hint binds to a
+    /// neighboring instruction and is delivered to the backend as metadata
+    /// attached to that instruction's PC, rather than as a directive of its
+    /// own. As an example, the linker in `src/interpreter/linker.rs` strips
+    /// drop hints from the linked program and surfaces them in a side
+    /// channel indexed by PC. The flattener relies on this property: it may
+    /// insert drop hints inside sequences (such as jump tables) where every
+    /// non-hint directive must map to exactly one final ISA instruction.
     fn emit_drop_hint(
         &self,
         c: &mut Context<'a, '_>,
