@@ -39,10 +39,20 @@ pub struct LabelValue {
     pub namespace: Option<String>,
 }
 
+/// The result of linking a program.
+pub struct LinkedProgram<D> {
+    /// The flattened program, indexed by PC.
+    pub program: Vec<D>,
+    /// Resolved labels, keyed by label id.
+    pub labels: HashMap<String, LabelValue>,
+    /// Drop hints, indexed by PC and parallel to `program`.
+    pub drop_hints: Vec<Vec<ExecDropHint>>,
+}
+
 pub fn link<D: Directive>(
     program: Vec<FunctionAsm<D>>,
     init_pc: u32,
-) -> (Vec<D>, HashMap<String, LabelValue>, Vec<Vec<ExecDropHint>>) {
+) -> LinkedProgram<D> {
     let mut flat_program = vec![D::nop(); init_pc as usize];
     // Side channel of drop hints, indexed by PC and kept parallel to `flat_program`.
     let mut drop_hints: Vec<Vec<ExecDropHint>> = vec![Vec::new(); init_pc as usize];
@@ -108,5 +118,9 @@ pub fn link<D: Directive>(
     }
 
     debug_assert_eq!(flat_program.len(), drop_hints.len());
-    (flat_program, labels, drop_hints)
+    LinkedProgram {
+        program: flat_program,
+        labels,
+        drop_hints,
+    }
 }

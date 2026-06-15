@@ -349,8 +349,11 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
             Box::new(ReadWriteRegisterBank::new()) as Box<dyn RegisterBank>
         };
 
-        let (flat_program, labels, drop_hints) =
-            linker::link(program.functions, START_ROM_ADDR);
+        let linker::LinkedProgram {
+            program: flat_program,
+            labels,
+            drop_hints,
+        } = linker::link(program.functions, START_ROM_ADDR);
 
         let ram = program
             .m
