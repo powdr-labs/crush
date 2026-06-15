@@ -673,6 +673,14 @@ impl linker::Directive for Directive<'_> {
             None
         }
     }
+
+    fn as_drop_hint(&self) -> Option<DropHint> {
+        if let Directive::DropHint(hint) = self {
+            Some(*hint)
+        } else {
+            None
+        }
+    }
 }
 
 impl Display for Directive<'_> {

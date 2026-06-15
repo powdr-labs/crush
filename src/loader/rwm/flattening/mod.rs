@@ -5,7 +5,7 @@
 
 mod sequence_parallel_copies;
 
-use itertools::Itertools;
+use itertools::{Itertools, Position};
 use wasmparser::{FuncType, Operator as Op, ValType};
 
 use crate::{
@@ -376,7 +376,8 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                 let mut choice_inputs = Vec::with_capacity(table_inputs.len());
                 let mut jump_instructions = targets
                     .into_iter()
-                    .map(|target| {
+                    .with_position()
+                    .map(|(position, target)| {
                         // The inputs for one particular target are a permutation of the inputs
                         // of the BrTable operation.
                         choice_inputs.clear();
@@ -384,8 +385,16 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                             choice_inputs.push(table_inputs[idx as usize].clone());
                         }
 
-                        // Emit the jump to the target label.
-                        let mut consumed = reg_changes.consumed.clone();
+                        // Emit the jump to the target label. The last target is the last user
+                        // of the node's consumed set, so we can move it instead of cloning.
+                        // This also leaves `reg_changes.consumed` empty, so the generic drop
+                        // wrapping won't append unreachable drops after the table's terminator.
+                        let mut consumed = match position {
+                            Position::Last | Position::Only => {
+                                std::mem::take(&mut reg_changes.consumed)
+                            }
+                            Position::First | Position::Middle => reg_changes.consumed.clone(),
+                        };
                         let jump_result =
                             self.emit_jump(&mut ctx, target.target, &choice_inputs, &mut consumed);
 
@@ -475,7 +484,7 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
 
                         directives.extend([
                             // Otherwise fall through to the default target.
-                            jump_directives.into(),
+                            jump_directives,
                             // Emit the label for the jump table that will follow.
                             self.s.emit_label(&mut ctx, table_label).into(),
                         ])
@@ -558,7 +567,7 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                 // Finally emit the jump directives for each target.
                 for (jump_label, jump_directives) in jump_instructions {
                     directives.push(self.s.emit_label(&mut ctx, jump_label).into());
-                    directives.push(jump_directives.into());
+                    directives.push(jump_directives);
                 }
                 directives.into()
             }
@@ -824,7 +833,7 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
 
                 directives.push(self.s.emit_return(ctx, ra, caller_fp).into());
 
-                return JumpResult::Return(directives);
+                return JumpResult::Return(directives.into());
             }
             TargetType::Label(id) => {
                 // This is a jump to a label in the current function.
@@ -843,7 +852,7 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
             JumpResult::PlainJump(target)
         } else {
             directives.push(self.s.emit_jump(target.clone()).into());
-            JumpResult::CopyJump(target, directives)
+            JumpResult::CopyJump(target, directives.into())
         }
     }
 }
@@ -862,10 +871,18 @@ fn save_live_at_jump<'a, S: Settings<'a>>(
 
     // We do one last attempt to perform the drops of the remaining
     // consumed registers before the actual jump, if possible.
-    if let Some(branched_directives) = jump_result.mut_directives() {
-        for reg in std::mem::take(&mut consumed_regs) {
-            branched_directives.push(emit_drop(s, ctx, reg));
+    if let Some(branched_directives) = jump_result.mut_directives()
+        && !consumed_regs.is_empty()
+    {
+        // Create the set of drop directives
+        let mut rem_drops = Vec::with_capacity(consumed_regs.len() + 1);
+        for drop_hint in std::mem::take(&mut consumed_regs) {
+            rem_drops.push(emit_drop(s, ctx, drop_hint));
         }
+
+        // Prepend it to the branched directives, so that it will be executed if the branch is taken.
+        rem_drops.push(std::mem::take(branched_directives));
+        *branched_directives = rem_drops.into();
     }
 
     if let Some(target) = jump_result.target() {
@@ -888,8 +905,8 @@ fn save_live_at_jump<'a, S: Settings<'a>>(
 }
 
 enum JumpResult<D> {
-    Return(Vec<Tree<D>>),
-    CopyJump(String, Vec<Tree<D>>),
+    Return(Tree<D>),
+    CopyJump(String, Tree<D>),
     PlainJump(String),
 }
 
@@ -899,14 +916,12 @@ impl<D> JumpResult<D> {
         Tree<D>: From<S::Directive>,
     {
         match self {
-            JumpResult::CopyJump(_, directives) | JumpResult::Return(directives) => {
-                directives.into()
-            }
+            JumpResult::CopyJump(_, directives) | JumpResult::Return(directives) => directives,
             JumpResult::PlainJump(target) => s.emit_jump(target).into(),
         }
     }
 
-    fn mut_directives(&mut self) -> Option<&mut Vec<Tree<D>>> {
+    fn mut_directives(&mut self) -> Option<&mut Tree<D>> {
         match self {
             JumpResult::CopyJump(_, directives) | JumpResult::Return(directives) => {
                 Some(directives)

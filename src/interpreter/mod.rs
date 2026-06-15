@@ -9,7 +9,7 @@ use crate::loader::{
 };
 use crate::{
     interpreter::generic_ir::{Directive, GenericIrSetting as S},
-    loader::{FunctionAsm, rwm::settings::DropHint},
+    loader::FunctionAsm,
 };
 use core::panic;
 use itertools::Itertools;
@@ -294,6 +294,8 @@ pub struct Interpreter<'a, E: ExternalFunctions> {
     module: Module<'a>,
     external_functions: E,
     flat_program: Vec<Directive<'a>>,
+    /// Drop hints indexed by PC, parallel to `flat_program`.
+    drop_hints: Vec<Vec<linker::ExecDropHint>>,
     labels: HashMap<String, linker::LabelValue>,
     addr_to_func_id: HashMap<u32, u32>,
 }
@@ -347,7 +349,8 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
             Box::new(ReadWriteRegisterBank::new()) as Box<dyn RegisterBank>
         };
 
-        let (flat_program, labels) = linker::link(program.functions, START_ROM_ADDR);
+        let (flat_program, labels, drop_hints) =
+            linker::link(program.functions, START_ROM_ADDR);
 
         let ram = program
             .m
@@ -397,6 +400,7 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
             module: program.m,
             external_functions,
             flat_program,
+            drop_hints,
             labels,
             addr_to_func_id,
         };
@@ -465,38 +469,58 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
             .collect::<Vec<u32>>()
     }
 
+    /// Applies the drop hints that fire before executing the instruction at `pc`.
+    ///
+    /// Runs before the instruction, so `self.fp` is still the frame the hints
+    /// are relative to.
+    fn apply_drop_hints_before(&mut self, pc: usize) {
+        for i in 0..self.drop_hints[pc].len() {
+            match self.drop_hints[pc][i] {
+                linker::ExecDropHint::DropBefore(reg) => self.regs.drop_reg(self.fp + reg),
+                linker::ExecDropHint::DropBeforeFrom(reg) => self.regs.drop_from(self.fp + reg),
+                linker::ExecDropHint::DropAfter(_) => {}
+            }
+        }
+    }
+
+    /// Applies the drop hints that fire after executing the instruction at `pc`.
+    ///
+    /// `fp` is the frame pointer in effect when the instruction *began*, not the
+    /// current one: a call/return may have changed `self.fp`, but the hint's
+    /// registers are relative to the frame the instruction was emitted in.
+    fn apply_drop_hints_after(&mut self, pc: usize, fp: u32) {
+        for i in 0..self.drop_hints[pc].len() {
+            if let linker::ExecDropHint::DropAfter(reg) = self.drop_hints[pc][i] {
+                self.regs.drop_reg(fp + reg);
+            }
+        }
+    }
+
     fn run_loop(&mut self) {
         let mut cycles = 0usize;
 
-        let mut to_be_dropped_on_next_instr = Vec::new();
         let mut t = Tracer::new(self);
         let final_fp = loop {
             t.reset();
 
-            let instr = t.i.flat_program[t.i.pc as usize].clone();
+            let pc = t.i.pc as usize;
+            // Frame pointer in effect for this instruction. Captured before the
+            // instruction runs, because a call/return may change `fp`, but the
+            // drop hints are relative to this frame.
+            let fp = t.i.fp;
+            let instr = t.i.flat_program[pc].clone();
+
+            // Apply the drop hints that fire before this instruction.
+            t.i.apply_drop_hints_before(pc);
 
             let mut should_inc_pc = true;
-            // If the directive is not an instruction (drop hint or label), this is set to false.
-            let mut instruction_processed = true;
             match instr {
                 Directive::Label { .. } => {
                     should_inc_pc = false;
-                    instruction_processed = false;
                     // do nothing
                 }
-                Directive::DropHint(hint) => {
-                    match hint {
-                        DropHint::DropNow(register) => {
-                            t.i.regs.drop_reg(t.i.fp + register);
-                        }
-                        DropHint::DropAfterNextInstruction(register) => {
-                            to_be_dropped_on_next_instr.push(t.i.fp + register);
-                        }
-                        DropHint::DropNowFrom(first) => {
-                            t.i.regs.drop_from(t.i.fp + first);
-                        }
-                    }
-                    instruction_processed = false;
+                Directive::DropHint(_) => {
+                    unreachable!("drop hints are stripped from the program during linking")
                 }
                 Directive::Return { ret_pc, ret_fp } => {
                     let pc = t.get_reg_relative_u32(ret_pc..ret_pc + 1);
@@ -1958,12 +1982,10 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                 }
             }
 
-            if instruction_processed {
-                for reg in &to_be_dropped_on_next_instr {
-                    t.i.regs.drop_reg(*reg);
-                }
-                to_be_dropped_on_next_instr.clear();
-            }
+            // Apply the drop hints that fire after this instruction. Keyed on the
+            // fetched PC and the pre-instruction `fp`, so it is unaffected by a
+            // call/return that changed `t.i.pc` / `t.i.fp`.
+            t.i.apply_drop_hints_after(pc, fp);
 
             t.print_trace();
 
