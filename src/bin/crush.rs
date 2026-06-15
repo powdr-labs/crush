@@ -592,7 +592,7 @@ mod tests {
         ];
 
         for processed in processed_programs {
-            let (_, labels) = crush::interpreter::linker::link(processed.functions, 1);
+            let labels = crush::interpreter::linker::link(processed.functions, 1).labels;
             let all_labels = labels.keys().cloned().collect::<Vec<_>>();
 
             // Function 0 is internal (not exported): namespace should come from name section.
