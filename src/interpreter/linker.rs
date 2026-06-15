@@ -13,7 +13,7 @@ pub struct Label<'a> {
 /// These live in the side channel produced by the linker, indexed by the PC of
 /// the instruction they apply to. Backends that don't track register liveness
 /// can ignore the side channel entirely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ExecDropHint {
     /// Drop the register before executing the instruction at this PC.
     DropBefore(u32),
@@ -104,6 +104,10 @@ pub fn link<D: Directive>(
                 }
                 None => {
                     flat_program.push(d);
+                    // Sort and dedup before flushing so the per-PC side
+                    // channel has a canonical, duplicate-free order.
+                    pending.sort_unstable();
+                    pending.dedup();
                     drop_hints.push(std::mem::take(&mut pending));
                     after_hint_open = false;
                 }
