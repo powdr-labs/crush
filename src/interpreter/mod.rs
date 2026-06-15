@@ -9,7 +9,7 @@ use crate::loader::{
 };
 use crate::{
     interpreter::generic_ir::{Directive, GenericIrSetting as S},
-    loader::FunctionAsm,
+    loader::{FunctionAsm, rwm::settings::DropHint},
 };
 use core::panic;
 use itertools::Itertools;
@@ -484,16 +484,18 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     instruction_processed = false;
                     // do nothing
                 }
-                Directive::Drop { register } => {
-                    t.i.regs.drop_reg(t.i.fp + register);
-                    instruction_processed = false;
-                }
-                Directive::DropOnNextInstr { register } => {
-                    to_be_dropped_on_next_instr.push(t.i.fp + register);
-                    instruction_processed = false;
-                }
-                Directive::DropFrom { first } => {
-                    t.i.regs.drop_from(t.i.fp + first);
+                Directive::DropHint(hint) => {
+                    match hint {
+                        DropHint::DropNow(register) => {
+                            t.i.regs.drop_reg(t.i.fp + register);
+                        }
+                        DropHint::DropAfterNextInstruction(register) => {
+                            to_be_dropped_on_next_instr.push(t.i.fp + register);
+                        }
+                        DropHint::DropNowFrom(first) => {
+                            t.i.regs.drop_from(t.i.fp + first);
+                        }
+                    }
                     instruction_processed = false;
                 }
                 Directive::Return { ret_pc, ret_fp } => {

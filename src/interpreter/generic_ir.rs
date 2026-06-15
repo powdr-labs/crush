@@ -139,9 +139,9 @@ impl<'a> RwmSettings<'a> for GenericIrSetting<'a> {
         });
 
         if last_reg_usage {
-            directives.push(Directive::DropOnNextInstr {
-                register: value_ptr.start,
-            });
+            directives.push(Directive::DropHint(DropHint::DropAfterNextInstruction(
+                value_ptr.start,
+            )));
         }
 
         directives.extend([
@@ -150,9 +150,7 @@ impl<'a> RwmSettings<'a> for GenericIrSetting<'a> {
                 inputs: vec![value_ptr.clone(), tmp.clone()],
                 output: Some(tmp.clone()),
             },
-            Directive::DropOnNextInstr {
-                register: tmp.start,
-            },
+            Directive::DropHint(DropHint::DropAfterNextInstruction(tmp.start)),
             Directive::JumpIf {
                 target: label,
                 condition: tmp.start,
@@ -243,11 +241,7 @@ impl<'a> RwmSettings<'a> for GenericIrSetting<'a> {
     }
 
     fn emit_drop_hint(&self, _c: &mut RwmCtx, hint: DropHint) -> Directive<'a> {
-        match hint {
-            DropHint::DropNow(register) => Directive::Drop { register },
-            DropHint::DropAfterNextInstruction(register) => Directive::DropOnNextInstr { register },
-            DropHint::DropNowFrom(first) => Directive::DropFrom { first },
-        }
+        Directive::DropHint(hint)
     }
 }
 
@@ -642,19 +636,8 @@ pub enum Directive<'a> {
         inputs: Vec<Range<u32>>,
         outputs: Vec<Range<u32>>,
     },
-    /// Signals that a register is no longer needed and can be reclaimed.
-    Drop {
-        register: Register, // size: 1 word
-    },
-    /// Signals that a register will no longer be needed after the next instruction.
-    DropOnNextInstr {
-        register: Register, // size: 1 word
-    },
-    /// Signals that all registers from `first` onward are no longer needed.
-    /// Emitted after function calls to mark the callee's frame space (past return values) as free.
-    DropFrom {
-        first: Register, // size: 1 word
-    },
+    /// Signals when registers are no longer needed and can be reclaimed.
+    DropHint(DropHint),
     /// General trap, which includes an unreachable instruction.
     Trap { reason: TrapReason },
     /// A forwarded operation from WebAssembly, only with the inputs and output registers specified.
@@ -830,15 +813,13 @@ impl Display for Directive<'_> {
                     }
                 }
             }
-            Directive::Drop { register } => {
-                write!(f, "    Drop ${register}")?;
-            }
-            Directive::DropOnNextInstr { register } => {
-                write!(f, "    DropOnNextInstr ${register}")?;
-            }
-            Directive::DropFrom { first } => {
-                write!(f, "    DropFrom ${first}")?;
-            }
+            Directive::DropHint(hint) => match hint {
+                DropHint::DropNow(register) => write!(f, "    Drop ${register}")?,
+                DropHint::DropAfterNextInstruction(register) => {
+                    write!(f, "    DropOnNextInstr ${register}")?
+                }
+                DropHint::DropNowFrom(first) => write!(f, "    DropFrom ${first}")?,
+            },
             Directive::Trap { reason } => {
                 write!(f, "    Trap")?;
                 match reason {
