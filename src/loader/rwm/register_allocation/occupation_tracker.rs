@@ -1,11 +1,13 @@
-use crate::loader::rwm::liveness_dag::single_range;
-use crate::loader::rwm::register_allocation::Allocation;
+use crate::loader::rwm::liveness_dag::{LiveRange, RangeEndReason, single_range};
+use crate::loader::rwm::register_allocation::{Allocation, PerNodeOccupation, RangeReg};
 use crate::loader::{dag::ValueOrigin, rwm::liveness_dag::Liveness};
 use crate::utils::range_consolidation::RangeConsolidationIterator;
 use iset::IntervalMap;
 use itertools::Itertools;
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::io::Write;
+use std::iter;
 use std::sync::{Arc, LazyLock};
 use std::{
     collections::BTreeMap, fs::File, io::BufWriter, num::NonZeroU32, ops::Range, path::Path,
@@ -25,7 +27,12 @@ enum AllocationType {
     },
 }
 
-static WHOLE_RANGE: LazyLock<Arc<[Range<usize>]>> = LazyLock::new(|| single_range(0..usize::MAX));
+static WHOLE_RANGE: LazyLock<Arc<[LiveRange]>> = LazyLock::new(|| {
+    Arc::new([LiveRange {
+        range: 0..usize::MAX,
+        end_reason: RangeEndReason::Discarded,
+    }])
+});
 
 #[derive(Debug)]
 struct AllocationEntry {
@@ -37,28 +44,7 @@ struct AllocationEntry {
     /// that renders the value dead or at the last node that uses it in that execution path.
     ///
     /// The ranges are half-open, sorted and disjoint.
-    ///
-    /// A single empty range `[X, X)` is a valid value, meaning the allocation is
-    /// produced at node `X` but never used (dimensionless lifetime). It is stored
-    /// that way so that "produced but immediately discarded" can be distinguished
-    /// from "last used at X + 1" (whose range is `[X, X + 1)`). The IntervalMap
-    /// cannot store empty intervals, so entries for dimensionless allocations are
-    /// still inserted into the IntervalMap as `[X, X + 1)` to block allocations at
-    /// that register for the node `X` (the value is written there at origin, so
-    /// no other live value can share the slot at that moment).
-    live_ranges: Arc<[Range<usize>]>,
-}
-
-/// Produces the IntervalMap interval corresponding to a live range stored in
-/// an `AllocationEntry`. Dimensionless ranges `[X, X)` are widened to `[X, X + 1)`
-/// because `iset::IntervalMap` does not accept empty intervals. All other ranges
-/// pass through unchanged.
-fn interval_map_range_fix(r: &Range<usize>) -> Range<usize> {
-    if r.start < r.end {
-        r.clone()
-    } else {
-        r.start..(r.start + 1)
-    }
+    live_ranges: Arc<[LiveRange]>,
 }
 
 /// Maps occupied registers over nodes.
@@ -73,23 +59,12 @@ pub struct Occupation {
 impl Occupation {
     /// Returns the register ranges of allocations whose live range overlaps any
     /// of the given `live_ranges`.
-    ///
-    /// A dimensionless query range `[X, X)` is interpreted as a point query at
-    /// `X`, returning all intervals containing `X`. This is required for
-    /// correctness when allocating values with empty liveness (e.g. an unused
-    /// output of a non-call node): the point query surfaces the allocations
-    /// that are alive at the origin, so the allocator places the doomed write
-    /// past them instead of clobbering a still-needed register.
-    ///
-    /// Implemented by widening `[X, X)` to `[X, X + 1)` before calling
-    /// `iset::IntervalMap::values`, which rejects empty intervals. This yields
-    /// the same set of stored intervals as the point query (both match
-    /// intervals `[a, b)` with `a ≤ X < b`), so the widening is
-    /// semantics-preserving.
-    pub fn reg_occupation(&self, live_ranges: &[Range<usize>]) -> Vec<Range<u32>> {
+    pub fn reg_occupation(
+        &self,
+        live_ranges: impl IntoIterator<Item = Range<usize>>,
+    ) -> Vec<Range<u32>> {
         live_ranges
-            .iter()
-            .map(interval_map_range_fix)
+            .into_iter()
             .flat_map(|live_range| {
                 self.alive_interval_map
                     .values(live_range)
@@ -98,12 +73,49 @@ impl Occupation {
             .collect()
     }
 
-    fn consolidated_reg_occupation(
-        &self,
-        live_ranges: &[Range<usize>],
-    ) -> impl Iterator<Item = Range<u32>> {
-        let occupied_ranges = self.reg_occupation(live_ranges);
-        RangeConsolidationIterator::new(occupied_ranges)
+    /// Like [`reg_occupation`], but takes the live ranges directly from the slice of `LiveRange`s.
+    fn reg_overlap(&self, live_range: &[LiveRange]) -> Vec<Range<u32>> {
+        self.reg_occupation(live_range.iter().map(|lr| lr.range.clone()))
+    }
+
+    /*
+    /// Returns `true` if the Value allocation with the given origin is read by
+    /// at least one node.
+    ///
+    /// An unused value has the synthetic fallback liveness from
+    /// `Liveness::query_liveness` — a single `Discarded` range — while a used
+    /// value always has at least one range ending in `Consumed`.
+    pub fn is_value_used(&self, origin: ValueOrigin) -> bool {
+        // TODO: this is stupid. We can query from the map and then check the AllocationEntry directly.
+        self.allocations.iter().any(|entry| {
+            matches!(entry.kind, AllocationType::Value { origin: o, .. } if o == origin)
+                && entry
+                    .live_ranges
+                    .iter()
+                    .any(|r| r.end_reason == RangeEndReason::Consumed)
+        })
+    }*/
+
+    pub fn per_node_tracker(&self) -> PerNodeOccupation {
+        // Sort all the allocated chunks by their live range start.
+        let mut rev_sorted_next_allocs = self
+            .allocations
+            .iter()
+            .filter(|alloc| matches!(alloc.kind, AllocationType::Value { .. }))
+            .flat_map(|alloc| {
+                alloc.live_ranges.iter().map(|live| RangeReg {
+                    live: live.clone(),
+                    regs: alloc.reg_range.clone(),
+                })
+            })
+            .collect_vec();
+        rev_sorted_next_allocs.sort_unstable_by_key(|r| Reverse(r.live.range.start));
+
+        PerNodeOccupation {
+            next_node: 0,
+            rev_sorted_next_allocs,
+            active_allocs: BinaryHeap::new(),
+        }
     }
 }
 
@@ -154,6 +166,31 @@ impl OccupationTracker {
         );
     }
 
+    /// Like [`set_allocation`], but marks the value as alive for the entire
+    /// block (live range `0..usize::MAX`). The register will not be dropped
+    /// anywhere inside this block.
+    ///
+    /// Intended for redirected loop inputs whose outer value is still alive
+    /// after the loop: the inner alias must share the outer register without
+    /// ever being released inside the loop body.
+    ///
+    /// Warning: this function doesn't check for overlaps with other existing allocations!
+    pub fn set_allocation_alive_throughout(&mut self, origin: ValueOrigin, reg_range: Range<u32>) {
+        if let Some(alloc_idx) = self.origin_map.get(&origin) {
+            let existing_alloc = &self.occupation.allocations[*alloc_idx];
+            assert_eq!(existing_alloc.reg_range, reg_range);
+        }
+
+        self.insert(
+            AllocationType::Value {
+                origin,
+                do_not_relocate: true,
+            },
+            reg_range,
+            WHOLE_RANGE.clone(),
+        );
+    }
+
     /// Reserve a given register range, blocking it from being used.
     pub fn reserve_range(&mut self, reg_range: Range<u32>) {
         self.insert(
@@ -196,7 +233,7 @@ impl OccupationTracker {
         }
 
         let live_ranges = self.liveness.query_liveness(&origin);
-        let existing_entries = self.occupation.reg_occupation(&live_ranges);
+        let existing_entries = self.occupation.reg_overlap(&live_ranges);
         if overlaps_any(existing_entries.iter(), &hint) {
             TryAllocResult::NotAllocated {
                 live_ranges,
@@ -224,7 +261,7 @@ impl OccupationTracker {
             return;
         }
 
-        let existing_entries = self.occupation.reg_occupation(&live_ranges);
+        let existing_entries = self.occupation.reg_overlap(&live_ranges);
         self.allocate_where_possible(origin, size, live_ranges, existing_entries)
             .expect("overflow in allocation");
     }
@@ -315,10 +352,11 @@ impl OccupationTracker {
             } else {
                 // Output was not allocated yet, allocate it at its natural position
                 let live_range = self.liveness.query_liveness(&origin);
-                assert_eq!(
-                    live_range.as_ref(),
-                    single_range(origin.node..origin.node).as_ref(),
-                    "unused function output should have dimensionless liveness"
+                assert!(
+                    live_range.len() == 1
+                        && live_range[0].range == (origin.node..(origin.node + 1))
+                        && live_range[0].end_reason == RangeEndReason::Discarded,
+                    "unused function output should have one node Discarded liveness"
                 );
 
                 self.insert(
@@ -420,7 +458,7 @@ impl OccupationTracker {
                 };
 
                 let live_ranges = self.liveness.query_liveness(&origin);
-                let existing_entries = self.occupation.reg_occupation(&live_ranges);
+                let existing_entries = self.occupation.reg_overlap(&live_ranges);
                 if let Ok(()) = self.allocate_where_possible(
                     origin,
                     (entry.original_range.len() as u32).try_into().unwrap(),
@@ -461,8 +499,9 @@ impl OccupationTracker {
     pub fn make_sub_tracker(&self, sub_block_index: usize, sub_liveness: Liveness) -> Self {
         let mut sub_tracker = OccupationTracker::new(sub_liveness);
 
-        let sub_range = single_range(sub_block_index..(sub_block_index + 1));
-        let sub_occupation = self.occupation.consolidated_reg_occupation(&sub_range);
+        let sub_range = iter::once(sub_block_index..(sub_block_index + 1));
+        let sub_occupation = self.occupation.reg_occupation(sub_range);
+        let sub_occupation = RangeConsolidationIterator::new(sub_occupation);
 
         let whole_range = WHOLE_RANGE.clone();
         for reg_range in sub_occupation {
@@ -546,7 +585,7 @@ impl OccupationTracker {
         &mut self,
         origin: ValueOrigin,
         size: NonZeroU32,
-        live_ranges: Arc<[Range<usize>]>,
+        live_ranges: Arc<[LiveRange]>,
         existing_entries: Vec<Range<u32>>,
     ) -> Result<(), ()> {
         // Track the end of the current occupied space
@@ -578,7 +617,7 @@ impl OccupationTracker {
         &mut self,
         kind: AllocationType,
         reg_range: Range<u32>,
-        live_ranges: Arc<[Range<usize>]>,
+        live_ranges: Arc<[LiveRange]>,
     ) {
         let entry_idx = self.occupation.allocations.len();
         if let AllocationType::Value { origin, .. } = kind {
@@ -586,10 +625,10 @@ impl OccupationTracker {
         }
 
         // Force insert because live ranges are not unique.
-        for range in live_ranges.iter() {
+        for lr in live_ranges.iter() {
             self.occupation
                 .alive_interval_map
-                .force_insert(interval_map_range_fix(range), entry_idx);
+                .force_insert(lr.range.clone(), entry_idx);
         }
 
         self.occupation.allocations.push(AllocationEntry {
@@ -610,10 +649,10 @@ impl OccupationTracker {
         let alloc = self.occupation.allocations.swap_remove(entry_idx);
 
         // Remove the entry from the interval map.
-        for live_range in alloc.live_ranges.iter() {
+        for lr in alloc.live_ranges.iter() {
             self.occupation
                 .alive_interval_map
-                .remove_where(interval_map_range_fix(live_range), |idx| *idx == entry_idx);
+                .remove_where(lr.range.clone(), |idx| *idx == entry_idx);
         }
 
         // Now we need to fix the references to the entry moved by swap_remove.
@@ -628,8 +667,8 @@ impl OccupationTracker {
             *self.origin_map.get_mut(&origin).unwrap() = entry_idx;
         }
 
-        for live_range in moved_entry.live_ranges.iter() {
-            let im_range = interval_map_range_fix(live_range);
+        for lr in moved_entry.live_ranges.iter() {
+            let im_range = lr.range.clone();
             self.occupation
                 .alive_interval_map
                 .remove_where(im_range.clone(), |idx| *idx == old_idx);
@@ -644,7 +683,7 @@ enum TryAllocResult {
     AlreadyAllocated,
     AllocatedAtHint,
     NotAllocated {
-        live_ranges: Arc<[Range<usize>]>,
+        live_ranges: Arc<[LiveRange]>,
         existing_entries: Vec<Range<u32>>,
     },
 }

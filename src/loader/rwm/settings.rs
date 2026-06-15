@@ -10,6 +10,20 @@ use crate::{
     utils::tree::Tree,
 };
 
+/// A drop hint, signaling that one or more registers are no longer needed at
+/// some point. These are pure hints: backends that don't track register
+/// liveness can safely ignore them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropHint {
+    /// The given register is no longer needed at this point.
+    DropNow(u32),
+    /// The given register will no longer be needed after the next instruction.
+    DropAfterNextInstruction(u32),
+    /// All registers from the given one onward (in the current frame) are no
+    /// longer needed.
+    DropNowFrom(u32),
+}
+
 /// Trait controlling the behavior of the flattening process.
 pub trait Settings<'a>: loader::Settings {
     /// Emits a directive to mark a code position.
@@ -46,6 +60,9 @@ pub trait Settings<'a>: loader::Settings {
     ) -> impl Into<Tree<Self::Directive>>;
 
     /// Emits a jump to a label conditioned on cmp(value, immediate).
+    ///
+    /// last_reg_usage will be set to true if this is the last usage of the value
+    /// in value_ptr, and false otherwise. This can be used to optimize register usage.
     fn emit_conditional_jump_cmp_immediate(
         &self,
         c: &mut Context<'a, '_>,
@@ -53,6 +70,7 @@ pub trait Settings<'a>: loader::Settings {
         value_ptr: Range<u32>,
         immediate: u32,
         label: String,
+        last_reg_usage: bool,
     ) -> impl Into<Tree<Self::Directive>>;
 
     /// Emits a jump relative to the next instruction (i.e. to PC+1+offset, where offset is unsigned).
@@ -113,5 +131,15 @@ pub trait Settings<'a>: loader::Settings {
         op: Operator<'a>,
         inputs: &[WasmOpInput],
         output: Option<Range<u32>>,
+    ) -> impl Into<Tree<Self::Directive>>;
+
+    /// Emits a drop hint, signaling that one or more registers are no longer needed.
+    ///
+    /// Drop hints are pure liveness information and carry no semantic meaning:
+    /// backends that don't track register liveness can safely ignore them.
+    fn emit_drop_hint(
+        &self,
+        c: &mut Context<'a, '_>,
+        hint: DropHint,
     ) -> impl Into<Tree<Self::Directive>>;
 }

@@ -1,7 +1,8 @@
 mod occupation_tracker;
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque},
+    iter,
     num::NonZeroU32,
     ops::Range,
 };
@@ -15,7 +16,7 @@ use crate::{
         dag::ValueOrigin,
         passes::blockless_dag::GenericNode,
         rwm::{
-            liveness_dag::{self, LivenessDag, single_range},
+            liveness_dag::{self, LiveRange, LivenessDag, RangeEndReason},
             register_allocation::occupation_tracker::{Occupation, OccupationTracker},
         },
         settings::Settings,
@@ -77,14 +78,139 @@ impl Allocation {
         self.nodes_outputs.iter()
     }
 
+    /// Returns all the occupied register ranges crossing a single node index.
+    ///
+    /// Does not include the inputs of the node, but includes its outputs, because the
+    /// live range of an output is [A, B) where A is the node prducing it and B is the
+    /// last node consuming it.
     pub fn occupation_for_node(&self, node_index: usize) -> Vec<Range<u32>> {
         self.occupation
-            .reg_occupation(&single_range(node_index..(node_index + 1)))
+            .reg_occupation(iter::once(node_index..(node_index + 1)))
     }
+
+    /// Precomputes a map from node index to registers that should be dropped after that node.
+    pub fn per_node_occupation(&self) -> PerNodeOccupation {
+        self.occupation.per_node_tracker()
+    }
+
+    /*
+    /// Returns `true` if the value at `origin` is read by at least one node.
+    ///
+    /// Decidable from the stored live ranges alone: used values have at least
+    /// one range ending in `Consumed`, whereas unused values carry only the
+    /// synthetic `Discarded` fallback. This works even when the unique consumer
+    /// is the immediately following node, which the `occupation_for_node`
+    /// queries cannot see (its live range ends before that query point).
+    pub fn is_value_used(&self, origin: &ValueOrigin) -> bool {
+        self.occupation.is_value_used(*origin)
+    }*/
 }
 
 pub type AllocatedDag<'a> = GenericBlocklessDag<'a, Allocation>;
 pub type Node<'a> = GenericNode<'a, Allocation>;
+
+/// Struct to track every live chunk independently.
+///
+/// It compares by reverse live range end so it can be inserted in a BinaryHeap
+/// to efficiently track the currently alive chunks by their end point.
+pub struct RangeReg {
+    pub live: LiveRange,
+    pub regs: Range<u32>,
+}
+
+impl Eq for RangeReg {}
+impl PartialEq for RangeReg {
+    fn eq(&self, other: &Self) -> bool {
+        self.live.range.end == other.live.range.end
+    }
+}
+impl PartialOrd for RangeReg {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for RangeReg {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse order: think of higer as "first to die".
+        other.live.range.end.cmp(&self.live.range.end)
+    }
+}
+
+/// This is a tracker that reply the allocation state per node, and
+/// can be used to detect when a value is no longer alive and its
+/// register can be dropped.
+pub struct PerNodeOccupation {
+    next_node: usize,
+    /// The allocations that have not yet become alive, sorted by their live
+    /// range start in reverse order (so we can pop to get the next allocation).
+    rev_sorted_next_allocs: Vec<RangeReg>,
+    active_allocs: BinaryHeap<RangeReg>,
+}
+
+#[derive(Debug)]
+pub struct NodeRegChanges {
+    pub node_index: usize,
+    /// Registers that are being used for the last time at this node.
+    pub consumed: BTreeSet<u32>,
+    /// Registers that are no longer needed starting from this node,
+    /// and can be dropped right away.
+    pub discarded: Vec<u32>,
+    pub newly_live: Vec<u32>,
+}
+
+impl PerNodeOccupation {
+    /// Advances the tracker to the next node, returning the registers that
+    /// transition states at this node. `consumed` are last-used-as-input;
+    /// `obsoleted` are values still alive at this node but no longer needed
+    /// on the fall-through (only at BrIf/BrIfZero). To get what actually must
+    /// be dropped, take the union of both and subtract `newly_live`.
+    pub fn advance(&mut self) -> NodeRegChanges {
+        let node_index = self.next_node;
+        self.next_node += 1;
+
+        // Remove the dying allocations and collect their registers.
+        let mut consumed = BTreeSet::new();
+        let mut discarded = Vec::new();
+        while let Some(next_to_die) = self.active_allocs.peek()
+            && next_to_die.live.range.end <= node_index
+        {
+            let next_to_die = self.active_allocs.pop().unwrap();
+            for reg in next_to_die.regs {
+                match next_to_die.live.end_reason {
+                    RangeEndReason::Consumed => {
+                        consumed.insert(reg);
+                    }
+                    RangeEndReason::Discarded => {
+                        discarded.push(reg);
+                    }
+                };
+            }
+        }
+
+        // Add the new allocations.
+        let mut newly_live = Vec::new();
+        while let Some(next_to_live) = self.rev_sorted_next_allocs.last()
+            && next_to_live.live.range.start <= node_index
+        {
+            let next_to_live = self.rev_sorted_next_allocs.pop().unwrap();
+            for reg in next_to_live.regs.clone() {
+                newly_live.push(reg);
+            }
+            self.active_allocs.push(next_to_live);
+        }
+
+        NodeRegChanges {
+            node_index,
+            consumed,
+            discarded,
+            newly_live,
+        }
+    }
+
+    pub fn active(&self) -> impl Iterator<Item = &RangeReg> {
+        self.active_allocs.iter()
+    }
+}
 
 struct OptimisticAllocator {
     occupation_tracker: OccupationTracker,
@@ -327,11 +453,11 @@ fn recursive_block_allocation<'a, S: Settings>(
                     // Find the range that either contains the loop node or ends at it.
                     let value_liveness = oa[0].occupation_tracker.liveness().query_liveness(origin);
                     let err_msg = "liveness bug: value used outside of its live ranges";
-                    let pos = value_liveness.partition_point(|r| r.start <= index);
+                    let pos = value_liveness.partition_point(|r| r.range.start <= index);
                     assert!(pos > 0, "{}", err_msg);
                     let relevant_range = &value_liveness[pos - 1];
-                    assert!(relevant_range.end >= index, "{}", err_msg);
-                    let alloc_fixed = if relevant_range.end == index {
+                    assert!(relevant_range.range.end >= index, "{}", err_msg);
+                    let alloc_fixed = if relevant_range.range.end == index {
                         // The range covering the loop node ends exactly here, so
                         // on this execution path the loop consumes the value.
                         // Try to reuse the same register for the loop input.
@@ -358,10 +484,16 @@ fn recursive_block_allocation<'a, S: Settings>(
                         // This input outlives the loop body, but inside the loop
                         // it is just forwarded unchanged to the next iteration.
                         // We can always reuse the allocation from the outer level.
+                        //
+                        // The register must stay alive for the whole loop body:
+                        // dropping it inside would also drop the outer value, since
+                        // they share the same register. Mark the inner alias as
+                        // alive throughout the block so no drop is ever emitted for
+                        // it inside the loop.
                         let allocation = oa[0].occupation_tracker.get_allocation(*origin).unwrap();
                         number_of_saved_copies += allocation.len();
 
-                        occupation_tracker.set_allocation(
+                        occupation_tracker.set_allocation_alive_throughout(
                             ValueOrigin {
                                 node: 0,
                                 output_idx: input_idx as u32,

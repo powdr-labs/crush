@@ -1,5 +1,7 @@
 /// This is a plain tree whose only purpose is to be converted into a flat vector by depth-first traversal.
+#[derive(Default)]
 pub enum Tree<T> {
+    #[default]
     Empty,
     Leaf(T),
     VecLeaf(Vec<T>),

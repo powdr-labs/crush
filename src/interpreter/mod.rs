@@ -1,3 +1,4 @@
+mod basic_block;
 pub mod generic_ir;
 pub mod linker;
 
@@ -13,9 +14,11 @@ use crate::{
 };
 use core::panic;
 use itertools::Itertools;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::ops::Range;
+use std::rc::Rc;
 use wasmparser::Operator as Op;
 
 // How a null reference is represented in the VROM
@@ -24,6 +27,21 @@ pub const NULL_REF: [u32; 3] = [
     0,        // Frame size: any value here would do, so we choose 0
     0,        // Address: 0 is an invalid function address because START_ROM_ADDR > 0
 ];
+
+trait BlockBoundaryTracker {
+    fn reset(&mut self, prev_block_end_pc: u32, next_block_start_pc: u32);
+
+    fn print_stats(&self, _w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct NoopBasicBlockTracker;
+
+impl BlockBoundaryTracker for NoopBasicBlockTracker {
+    fn reset(&mut self, _prev_block_end_pc: u32, _next_block_start_pc: u32) {}
+}
 
 /// We need 2 kinds of register banks, chosen by the execution model:
 /// - Write-once registers
@@ -45,10 +63,17 @@ trait RegisterBank {
     /// Set a future value at the given absolute address.
     /// Only valid for write-once execution model.
     fn set_future(&mut self, addr: u32);
+
+    /// Mark a single register as dropped. Reading it afterwards will panic.
+    fn drop_reg(&mut self, _addr: u32) {}
+
+    /// Mark all registers from `first` onward as dropped.
+    fn drop_from(&mut self, _first: u32) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegisterValue {
+    Dropped,
     Unassigned,
     Future(u32),
     Concrete(u32),
@@ -66,6 +91,9 @@ impl RegisterValue {
             RegisterValue::Unassigned => {
                 panic!("Can not convert unassigned to u32");
             }
+            RegisterValue::Dropped => {
+                panic!("Can not read from a dropped register");
+            }
         }
     }
 }
@@ -74,6 +102,7 @@ impl Display for RegisterValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RegisterValue::Unassigned => write!(f, "U"),
+            RegisterValue::Dropped => write!(f, "D"),
             RegisterValue::Future(fut) => write!(f, "F{}", fut),
             RegisterValue::Concrete(value) => write!(f, "{}", value),
         }
@@ -159,6 +188,7 @@ impl RegisterBank for WriteOnceRegisterBank {
                 self.regs[addr as usize] = value;
                 value
             }
+            RegisterValue::Dropped => unreachable!("Dropped state in write-once bank"),
         }
     }
 
@@ -168,6 +198,7 @@ impl RegisterBank for WriteOnceRegisterBank {
             RegisterValue::Unassigned => {
                 *slot = RegisterValue::Concrete(value);
             }
+            RegisterValue::Dropped => unreachable!("Dropped state in write-once bank"),
             RegisterValue::Future(future) => {
                 // Assigning Concrete values to Futures materializes it.
                 if let Some(old_value) = self.future_assignments.insert(future, value) {
@@ -208,37 +239,44 @@ impl RegisterBank for WriteOnceRegisterBank {
 }
 
 struct ReadWriteRegisterBank {
-    regs: Vec<u32>,
+    /// Each register is `Some(value)` if alive, or `None` if dropped.
+    regs: Vec<RegisterValue>,
+    basic_block_tracker: Rc<RefCell<basic_block::BasicBlockTracker>>,
 }
 
 impl ReadWriteRegisterBank {
-    fn new() -> Self {
-        Self { regs: Vec::new() }
+    fn new(basic_block_tracker: Rc<RefCell<basic_block::BasicBlockTracker>>) -> Self {
+        Self {
+            regs: Vec::new(),
+            basic_block_tracker,
+        }
     }
 }
 
 impl RegisterBank for ReadWriteRegisterBank {
     fn get(&mut self, addr: u32) -> RegisterValue {
-        let value = self.regs.get(addr as usize).copied().unwrap_or(0);
-        RegisterValue::Concrete(value)
+        self.basic_block_tracker.borrow_mut().notify_read(addr);
+        self.regs
+            .get(addr as usize)
+            .cloned()
+            .unwrap_or(RegisterValue::Dropped)
     }
 
     fn set(&mut self, addr: u32, value: u32) {
+        self.basic_block_tracker.borrow_mut().notify_write(addr);
         let addr = addr as usize;
         if addr >= self.regs.len() {
-            self.regs.resize(addr + 1, 0);
+            self.regs.resize(addr + 1, RegisterValue::Dropped);
         }
-        self.regs[addr] = value;
+        self.regs[addr] = RegisterValue::Concrete(value);
     }
 
     fn copy_range(&mut self, src: Range<u32>, dest: Range<u32>) {
         assert_eq!(src.len(), dest.len());
         if src.len() == 1 {
-            // Optimize the common case of copying a single word to avoid the overhead of collect_vec()
             let value = self.get(src.start).as_concrete();
             self.set(dest.start, value);
         } else {
-            // Read all the values first to allow for overlapping src and dest
             let value = src.map(|addr| self.get(addr).as_concrete()).collect_vec();
             for (dest, value) in dest.zip_eq(value) {
                 self.set(dest, value);
@@ -253,6 +291,21 @@ impl RegisterBank for ReadWriteRegisterBank {
     fn set_future(&mut self, _addr: u32) {
         unreachable!("Futures are not supported in read-write execution model");
     }
+
+    fn drop_reg(&mut self, addr: u32) {
+        self.basic_block_tracker.borrow_mut().notify_drop(addr);
+        let addr = addr as usize;
+        if addr < self.regs.len() {
+            self.regs[addr] = RegisterValue::Dropped;
+        }
+    }
+
+    fn drop_from(&mut self, first: u32) {
+        self.basic_block_tracker
+            .borrow_mut()
+            .notify_drop_from(first);
+        self.regs.truncate(first as usize);
+    }
 }
 
 pub struct Interpreter<'a, E: ExternalFunctions> {
@@ -260,6 +313,7 @@ pub struct Interpreter<'a, E: ExternalFunctions> {
     pc: u32,
     fp: u32,
     regs: Box<dyn RegisterBank>,
+    basic_block_tracker: Box<dyn BlockBoundaryTracker>,
     ram: Ram,
     call_stack: Vec<u32>,
     trace_enabled: bool,
@@ -269,6 +323,8 @@ pub struct Interpreter<'a, E: ExternalFunctions> {
     module: Module<'a>,
     external_functions: E,
     flat_program: Vec<Directive<'a>>,
+    /// Drop hints indexed by PC, parallel to `flat_program`.
+    drop_hints: Vec<Vec<linker::ExecDropHint>>,
     labels: HashMap<String, linker::LabelValue>,
     addr_to_func_id: HashMap<u32, u32>,
 }
@@ -315,14 +371,28 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
         const START_ROM_ADDR: u32 = 0x1;
 
         let mut func_stack_sizes = Vec::new();
-        let regs = if exec_model == ExecutionModel::WriteOnceRegisters {
-            func_stack_sizes.extend(program.functions.iter().map(|f| f.frame_size.unwrap()));
-            Box::new(WriteOnceRegisterBank::new()) as Box<dyn RegisterBank>
-        } else {
-            Box::new(ReadWriteRegisterBank::new()) as Box<dyn RegisterBank>
-        };
+        let (regs, basic_block_tracker): (Box<dyn RegisterBank>, Box<dyn BlockBoundaryTracker>) =
+            if exec_model == ExecutionModel::WriteOnceRegisters {
+                func_stack_sizes.extend(program.functions.iter().map(|f| f.frame_size.unwrap()));
+                (
+                    Box::new(WriteOnceRegisterBank::new()) as Box<dyn RegisterBank>,
+                    Box::new(NoopBasicBlockTracker) as Box<dyn BlockBoundaryTracker>,
+                )
+            } else {
+                let basic_block_tracker: Rc<RefCell<basic_block::BasicBlockTracker>> =
+                    Rc::new(RefCell::new(basic_block::BasicBlockTracker::new()));
+                (
+                    Box::new(ReadWriteRegisterBank::new(basic_block_tracker.clone()))
+                        as Box<dyn RegisterBank>,
+                    Box::new(basic_block_tracker) as Box<dyn BlockBoundaryTracker>,
+                )
+            };
 
-        let (flat_program, labels) = linker::link(program.functions, START_ROM_ADDR);
+        let linker::LinkedProgram {
+            program: flat_program,
+            labels,
+            drop_hints,
+        } = linker::link(program.functions, START_ROM_ADDR);
 
         let ram = program
             .m
@@ -364,6 +434,7 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
             pc: 0,
             fp: 0,
             regs,
+            basic_block_tracker,
             ram: Ram(ram),
             exec_model,
             call_stack: Vec::new(),
@@ -372,6 +443,7 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
             module: program.m,
             external_functions,
             flat_program,
+            drop_hints,
             labels,
             addr_to_func_id,
         };
@@ -432,12 +504,42 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
         // Push the initial function address onto the stack for instrumentation
         self.call_stack.push(self.addr_to_func_id[&self.pc]);
         self.run_loop();
+        self.basic_block_tracker
+            .print_stats(&mut std::io::stdout())
+            .expect("failed to print basic block stats");
         // Pop the initial function address
         self.call_stack.pop();
 
         outputs_range
             .map(|i| self.regs.get(first_fp + i).as_concrete())
             .collect::<Vec<u32>>()
+    }
+
+    /// Applies the drop hints that fire before executing the instruction at `pc`.
+    ///
+    /// Runs before the instruction, so `self.fp` is still the frame the hints
+    /// are relative to.
+    fn apply_drop_hints_before(&mut self, pc: usize) {
+        for i in 0..self.drop_hints[pc].len() {
+            match self.drop_hints[pc][i] {
+                linker::ExecDropHint::DropBefore(reg) => self.regs.drop_reg(self.fp + reg),
+                linker::ExecDropHint::DropBeforeFrom(reg) => self.regs.drop_from(self.fp + reg),
+                linker::ExecDropHint::DropAfter(_) => {}
+            }
+        }
+    }
+
+    /// Applies the drop hints that fire after executing the instruction at `pc`.
+    ///
+    /// `fp` is the frame pointer in effect when the instruction *began*, not the
+    /// current one: a call/return may have changed `self.fp`, but the hint's
+    /// registers are relative to the frame the instruction was emitted in.
+    fn apply_drop_hints_after(&mut self, pc: usize, fp: u32) {
+        for i in 0..self.drop_hints[pc].len() {
+            if let linker::ExecDropHint::DropAfter(reg) = self.drop_hints[pc][i] {
+                self.regs.drop_reg(fp + reg);
+            }
+        }
     }
 
     fn run_loop(&mut self) {
@@ -447,27 +549,39 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
         let final_fp = loop {
             t.reset();
 
-            let instr = t.i.flat_program[t.i.pc as usize].clone();
+            let pc = t.i.pc as usize;
+            // Frame pointer in effect for this instruction. Captured before the
+            // instruction runs, because a call/return may change `fp`, but the
+            // drop hints are relative to this frame.
+            let fp = t.i.fp;
+            let instr = t.i.flat_program[pc].clone();
 
-            let mut should_inc_pc = true;
+            // Apply the drop hints that fire before this instruction.
+            t.i.apply_drop_hints_before(pc);
+
+            // Instructions that change the control flow (calls and returns) will set this to a different value.
+            let mut new_pc = t.i.pc + 1;
+            let mut basic_block_end = false;
 
             match instr {
                 Directive::Label { .. } => {
-                    should_inc_pc = false;
-                    // do nothing
+                    unreachable!("Labels should have been removed by the linker");
+                }
+                Directive::DropHint(_) => {
+                    unreachable!("drop hints are stripped from the program during linking")
                 }
                 Directive::Return { ret_pc, ret_fp } => {
                     let pc = t.get_reg_relative_u32(ret_pc..ret_pc + 1);
                     let fp = t.get_reg_relative_u32(ret_fp..ret_fp + 1);
                     if pc == 0 {
+                        // Special PC for when the program is terminating.
                         break fp;
-                    } else {
-                        // Pop the current function from the stack
-                        t.i.call_stack.pop();
-                        t.i.pc = pc;
-                        t.i.fp = fp;
                     }
-                    should_inc_pc = false;
+
+                    t.i.call_stack.pop();
+                    new_pc = pc;
+                    t.i.fp = fp;
+                    basic_block_end = true;
                 }
                 Directive::WASMOp {
                     op,
@@ -1780,11 +1894,11 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     saved_caller_fp,
                 } => {
                     let prev_pc = t.i.pc;
-                    t.i.pc = t.i.labels[&target].pc;
-                    should_inc_pc = false;
+                    new_pc = t.i.labels[&target].pc;
+                    basic_block_end = true;
 
                     // Push the new function id for instrumentation
-                    t.i.call_stack.push(t.i.addr_to_func_id[&t.i.pc]);
+                    t.i.call_stack.push(t.i.addr_to_func_id[&new_pc]);
 
                     let prev_fp = t.i.fp;
                     t.i.fp += new_frame_offset;
@@ -1799,10 +1913,10 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     saved_caller_fp,
                 } => {
                     let prev_pc = t.i.pc;
-                    t.i.pc = t.get_reg_relative_u32(target_pc..target_pc + 1);
-                    should_inc_pc = false;
+                    new_pc = t.get_reg_relative_u32(target_pc..target_pc + 1);
+                    basic_block_end = true;
 
-                    t.i.call_stack.push(t.i.addr_to_func_id[&t.i.pc]);
+                    t.i.call_stack.push(t.i.addr_to_func_id[&new_pc]);
 
                     let prev_fp = t.i.fp;
                     t.i.fp += new_frame_offset;
@@ -1817,10 +1931,10 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     saved_caller_fp,
                 } => {
                     let prev_pc = t.i.pc;
-                    t.i.pc = t.i.labels[&target].pc;
-                    should_inc_pc = false;
+                    new_pc = t.i.labels[&target].pc;
+                    basic_block_end = true;
 
-                    t.i.call_stack.push(t.i.addr_to_func_id[&t.i.pc]);
+                    t.i.call_stack.push(t.i.addr_to_func_id[&new_pc]);
 
                     let prev_fp = t.i.fp;
                     t.i.fp = t.get_reg_relative_u32(new_frame_ptr..new_frame_ptr + 1);
@@ -1835,10 +1949,10 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     saved_caller_fp,
                 } => {
                     let prev_pc = t.i.pc;
-                    t.i.pc = t.get_reg_relative_u32(target_pc..target_pc + 1);
-                    should_inc_pc = false;
+                    new_pc = t.get_reg_relative_u32(target_pc..target_pc + 1);
+                    basic_block_end = true;
 
-                    t.i.call_stack.push(t.i.addr_to_func_id[&t.i.pc]);
+                    t.i.call_stack.push(t.i.addr_to_func_id[&new_pc]);
 
                     let prev_fp = t.i.fp;
                     t.i.fp = t.get_reg_relative_u32(new_frame_ptr..new_frame_ptr + 1);
@@ -1852,6 +1966,10 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     inputs,
                     outputs,
                 } => {
+                    // This is a special instruction, so it goes inside its own basic block.
+                    t.i.basic_block_tracker.reset(t.i.pc - 1, t.i.pc);
+                    basic_block_end = true;
+
                     let args = inputs
                         .into_iter()
                         .flatten()
@@ -1875,8 +1993,8 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     new_frame_ptr,
                     saved_caller_fp,
                 } => {
-                    t.i.pc = t.i.labels[&target].pc;
-                    should_inc_pc = false;
+                    new_pc = t.i.labels[&target].pc;
+                    basic_block_end = true;
 
                     let prev_fp = t.i.fp;
                     t.i.fp = t.get_reg_relative_u32(new_frame_ptr..new_frame_ptr + 1);
@@ -1889,37 +2007,44 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                     let target = t.i.labels[&target].pc;
                     let cond = t.get_reg_relative_u32(condition..condition + 1);
                     if cond != 0 {
-                        t.i.pc = target;
-                        should_inc_pc = false;
+                        new_pc = target;
                     }
+                    basic_block_end = true;
                 }
                 Directive::JumpIfZero { target, condition } => {
                     let target = t.i.labels[&target].pc;
                     let cond = t.get_reg_relative_u32(condition..condition + 1);
                     if cond == 0 {
-                        t.i.pc = target;
-                        should_inc_pc = false;
+                        new_pc = target;
                     }
+                    basic_block_end = true;
                 }
                 Directive::Jump { target } => {
-                    t.i.pc = t.i.labels[&target].pc;
-                    should_inc_pc = false;
+                    new_pc = t.i.labels[&target].pc;
+                    basic_block_end = true;
                 }
                 Directive::JumpOffset { offset } => {
                     let offset = t.get_reg_relative_u32(offset..offset + 1);
-                    // Offset starts with 0, so we don't prevent the natural increment of the PC.
-                    t.i.pc += offset;
+                    new_pc = t.i.pc + 1 + offset;
+                    basic_block_end = true;
                 }
                 Directive::Trap { reason } => {
                     panic!("Trap encountered: {reason:?}");
                 }
             }
 
+            // Apply the drop hints that fire after this instruction. Keyed on the
+            // fetched PC and the pre-instruction `fp`, so it is unaffected by a
+            // call/return that changed `t.i.pc` / `t.i.fp`.
+            t.i.apply_drop_hints_after(pc, fp);
+
+            if basic_block_end {
+                t.i.basic_block_tracker.reset(t.i.pc, new_pc);
+            }
+
             t.print_trace();
 
-            if should_inc_pc {
-                t.i.pc += 1;
-            }
+            t.i.pc = new_pc;
 
             cycles += 1;
         };
@@ -2059,7 +2184,14 @@ mod trace {
 
         fn get_reg(&mut self, offset: u32) -> u32 {
             let addr = self.i.fp + offset;
-            let value = self.i.regs.get(addr).as_concrete();
+            let reg_value = self.i.regs.get(addr);
+            if let RegisterValue::Dropped = reg_value {
+                panic!(
+                    "Read from dropped register ${offset} (absolute address {addr}) at pc={}, fp={}\nInstruction: {}",
+                    self.i.pc, self.i.fp, self.i.flat_program[self.i.pc as usize]
+                );
+            }
+            let value = reg_value.as_concrete();
             self.reads.push(ReadOp {
                 addr: offset,
                 value: RegisterValue::Concrete(value),
