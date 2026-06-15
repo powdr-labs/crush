@@ -10,6 +10,20 @@ use crate::{
     utils::tree::Tree,
 };
 
+/// A drop hint, signaling that one or more registers are no longer needed at
+/// some point. These are pure hints: backends that don't track register
+/// liveness can safely ignore them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropHint {
+    /// The given register is no longer needed at this point.
+    DropNow(u32),
+    /// The given register will no longer be needed after the next instruction.
+    DropAfterNextInstruction(u32),
+    /// All registers from the given one onward (in the current frame) are no
+    /// longer needed.
+    DropNowFrom(u32),
+}
+
 /// Trait controlling the behavior of the flattening process.
 pub trait Settings<'a>: loader::Settings {
     /// Emits a directive to mark a code position.
@@ -119,20 +133,13 @@ pub trait Settings<'a>: loader::Settings {
         output: Option<Range<u32>>,
     ) -> impl Into<Tree<Self::Directive>>;
 
-    /// Emits a drop hint, signaling that the given register is no longer needed at this point.
-    fn emit_drop(&self, c: &mut Context<'a, '_>, reg: u32) -> impl Into<Tree<Self::Directive>>;
-
-    /// Emits a drop hint, signaling that the given register will no longer be needed after
-    /// the next instruction.
-    fn emit_drop_on_next_instr(
+    /// Emits a drop hint, signaling that one or more registers are no longer needed.
+    ///
+    /// Drop hints are pure liveness information and carry no semantic meaning:
+    /// backends that don't track register liveness can safely ignore them.
+    fn emit_drop_hint(
         &self,
         c: &mut Context<'a, '_>,
-        reg: u32,
+        hint: DropHint,
     ) -> impl Into<Tree<Self::Directive>>;
-
-    /// Emits a drop-from hint after a function call, signaling that all registers
-    /// from `reg` onward (in the current frame) are no longer needed. This covers the
-    /// callee's frame space past the return values (saved RA/FP, locals, temporaries).
-    fn emit_drop_from(&self, c: &mut Context<'a, '_>, reg: u32)
-    -> impl Into<Tree<Self::Directive>>;
 }

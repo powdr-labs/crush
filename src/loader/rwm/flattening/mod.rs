@@ -20,7 +20,7 @@ use crate::{
             register_allocation::{
                 self, AllocatedDag, Allocation, NodeRegChanges, PerNodeOccupation,
             },
-            settings::Settings,
+            settings::{DropHint, Settings},
         },
         settings::{
             ComparisonFunction, JumpCondition, LabelType, TrapReason, WasmOpInput, format_label,
@@ -305,11 +305,7 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
 
                 let mut directives = Vec::new();
                 if drop_selector {
-                    directives.push(
-                        self.s
-                            .emit_drop_on_next_instr(&mut ctx, cond_reg.start)
-                            .into(),
-                    );
+                    directives.push(emit_drop_after_next_instr(self.s, &mut ctx, cond_reg.start));
                 }
 
                 if S::is_jump_condition_available(cond)
@@ -488,7 +484,7 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
 
                 // Now we drop all consumed inputs that are no longer needed for the remaining targets.
                 for reg in consumed_intersection {
-                    directives.push(self.s.emit_drop(&mut ctx, reg).into());
+                    directives.push(emit_drop(self.s, &mut ctx, reg));
                 }
 
                 if !S::is_relative_jump_available() {
@@ -527,11 +523,7 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                 // can be implemented with a single indirection, but that would also require
                 // 1-to-1 mapping in all the instructions belonging to the jump table.
                 if drop_selector {
-                    directives.push(
-                        self.s
-                            .emit_drop_on_next_instr(&mut ctx, selector.start)
-                            .into(),
-                    );
+                    directives.push(emit_drop_after_next_instr(self.s, &mut ctx, selector.start));
                 }
                 directives.push(self.s.emit_relative_jump(&mut ctx, selector).into());
 
@@ -680,14 +672,16 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                 );
 
                 if fn_entry_is_dying {
-                    directives.push(self.s.emit_drop(&mut ctx, entry_idx.start).into());
+                    directives.push(emit_drop(self.s, &mut ctx, entry_idx.start));
                 }
 
                 directives.extend([
                     // Func frame size is not used in RW mode.
-                    self.s
-                        .emit_drop(&mut ctx, split_ref[FunctionRef::<S>::FUNC_FRAME_SIZE].start)
-                        .into(),
+                    emit_drop(
+                        self.s,
+                        &mut ctx,
+                        split_ref[FunctionRef::<S>::FUNC_FRAME_SIZE].start,
+                    ),
                     self.s
                         .emit_conditional_jump_cmp_immediate(
                             &mut ctx,
@@ -699,20 +693,21 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
                             true,
                         )
                         .into(),
-                    self.s
-                        .emit_drop(&mut ctx, split_ref[FunctionRef::<S>::FUNC_ADDR].start)
-                        .into(),
+                    emit_drop(
+                        self.s,
+                        &mut ctx,
+                        split_ref[FunctionRef::<S>::FUNC_ADDR].start,
+                    ),
                     self.s
                         .emit_trap(&mut ctx, TrapReason::WrongIndirectCallFunctionType)
                         .into(),
                     self.s.emit_label(&mut ctx, ok_label).into(),
                     call.prefix_directives.into(),
-                    self.s
-                        .emit_drop_on_next_instr(
-                            &mut ctx,
-                            split_ref[FunctionRef::<S>::FUNC_ADDR].start,
-                        )
-                        .into(),
+                    emit_drop_after_next_instr(
+                        self.s,
+                        &mut ctx,
+                        split_ref[FunctionRef::<S>::FUNC_ADDR].start,
+                    ),
                     self.s
                         .emit_indirect_call(
                             &mut ctx,
@@ -772,11 +767,11 @@ impl<'a, 'b, S: Settings<'a>> Flattener<'a, 'b, S> {
             let mut directives =
                 Vec::with_capacity(reg_changes.discarded.len() + reg_changes.consumed.len() + 1);
             for reg in reg_changes.discarded {
-                directives.push(self.s.emit_drop(&mut ctx, reg).into());
+                directives.push(emit_drop(self.s, &mut ctx, reg));
             }
             directives.push(node_directives);
             for reg in reg_changes.consumed {
-                directives.push(self.s.emit_drop(&mut ctx, reg).into());
+                directives.push(emit_drop(self.s, &mut ctx, reg));
             }
             directives.into()
         }
@@ -869,7 +864,7 @@ fn save_live_at_jump<'a, S: Settings<'a>>(
     // consumed registers before the actual jump, if possible.
     if let Some(branched_directives) = jump_result.mut_directives() {
         for reg in std::mem::take(&mut consumed_regs) {
-            branched_directives.push(s.emit_drop(ctx, reg).into());
+            branched_directives.push(emit_drop(s, ctx, reg));
         }
     }
 
@@ -928,6 +923,21 @@ impl<D> JumpResult<D> {
     }
 }
 
+/// Convenience wrapper for the common `DropNow` hint.
+fn emit_drop<'a, S: Settings<'a>>(s: &S, c: &mut Context<'a, '_>, reg: u32) -> Tree<S::Directive> {
+    s.emit_drop_hint(c, DropHint::DropNow(reg)).into()
+}
+
+/// Convenience wrapper for the `DropAfterNextInstruction` hint.
+fn emit_drop_after_next_instr<'a, S: Settings<'a>>(
+    s: &S,
+    c: &mut Context<'a, '_>,
+    reg: u32,
+) -> Tree<S::Directive> {
+    s.emit_drop_hint(c, DropHint::DropAfterNextInstruction(reg))
+        .into()
+}
+
 fn emit_drops_after_label<'a, S: Settings<'a>>(
     s: &S,
     ctx: &mut Context<'a, '_>,
@@ -943,7 +953,7 @@ fn emit_drops_after_label<'a, S: Settings<'a>>(
 
     to_drop
         .into_iter()
-        .map(|reg| s.emit_drop(ctx, reg).into())
+        .map(|reg| emit_drop(s, ctx, reg))
         .collect_vec()
 }
 
@@ -1005,7 +1015,7 @@ fn copy_inputs_if_needed<'a, S: Settings<'a>>(
 
     // Emit the drops for the registers that are dying after the copy.
     for reg in drops {
-        directives.push(s.emit_drop(ctx, reg).into());
+        directives.push(emit_drop(s, ctx, reg));
     }
 
     directives
@@ -1296,9 +1306,12 @@ fn prepare_function_call<'a, S: Settings<'a>>(
 
     // Emit the after-call drops
     for reg in individual_drops {
-        suffix_directives.push(s.emit_drop(ctx, reg).into());
+        suffix_directives.push(emit_drop(s, ctx, reg));
     }
-    suffix_directives.push(s.emit_drop_from(ctx, drop_from).into());
+    suffix_directives.push(
+        s.emit_drop_hint(ctx, DropHint::DropNowFrom(drop_from))
+            .into(),
+    );
 
     FunctionCall {
         frame_start,

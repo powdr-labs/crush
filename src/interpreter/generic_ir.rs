@@ -1,7 +1,10 @@
 use crate::{
     interpreter::linker,
     loader::{
-        rwm::{flattening::Context as RwmCtx, settings::Settings as RwmSettings},
+        rwm::{
+            flattening::Context as RwmCtx,
+            settings::{DropHint, Settings as RwmSettings},
+        },
         settings::{ComparisonFunction, JumpCondition, Settings, TrapReason, WasmOpInput},
         wom::settings::{ReturnInfosToCopy, Settings as WomSettings},
     },
@@ -239,16 +242,12 @@ impl<'a> RwmSettings<'a> for GenericIrSetting<'a> {
         }
     }
 
-    fn emit_drop(&self, _c: &mut RwmCtx, reg: u32) -> Directive<'a> {
-        Directive::Drop { register: reg }
-    }
-
-    fn emit_drop_on_next_instr(&self, _c: &mut RwmCtx<'a, '_>, reg: u32) -> Directive<'a> {
-        Directive::DropOnNextInstr { register: reg }
-    }
-
-    fn emit_drop_from(&self, _c: &mut RwmCtx, reg: u32) -> Directive<'a> {
-        Directive::DropFrom { first: reg }
+    fn emit_drop_hint(&self, _c: &mut RwmCtx, hint: DropHint) -> Directive<'a> {
+        match hint {
+            DropHint::DropNow(register) => Directive::Drop { register },
+            DropHint::DropAfterNextInstruction(register) => Directive::DropOnNextInstr { register },
+            DropHint::DropNowFrom(first) => Directive::DropFrom { first },
+        }
     }
 }
 
