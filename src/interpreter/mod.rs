@@ -472,49 +472,31 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
             .collect::<Vec<u32>>()
     }
 
-    /// Applies the drop hints that fire before executing the instruction at `pc`.
-    ///
-    /// Runs before the instruction, so `self.fp` is still the frame the hints
-    /// are relative to.
-    fn apply_drop_hints_before(&mut self, pc: usize) {
-        for i in 0..self.drop_hints[pc].len() {
-            match self.drop_hints[pc][i] {
-                linker::ExecDropHint::DropBefore(reg) => self.regs.drop_reg(self.fp + reg),
-                linker::ExecDropHint::DropBeforeFrom(reg) => self.regs.drop_from(self.fp + reg),
-                linker::ExecDropHint::DropAfter(_) => {}
-            }
-        }
-    }
-
-    /// Applies the drop hints that fire after executing the instruction at `pc`.
-    ///
-    /// `fp` is the frame pointer in effect when the instruction *began*, not the
-    /// current one: a call/return may have changed `self.fp`, but the hint's
-    /// registers are relative to the frame the instruction was emitted in.
-    fn apply_drop_hints_after(&mut self, pc: usize, fp: u32) {
-        for i in 0..self.drop_hints[pc].len() {
-            if let linker::ExecDropHint::DropAfter(reg) = self.drop_hints[pc][i] {
-                self.regs.drop_reg(fp + reg);
-            }
-        }
-    }
-
     fn run_loop(&mut self) {
         let mut cycles = 0usize;
 
         let mut t = Tracer::new(self);
+        let mut post_drops = Vec::new();
+
         let final_fp = loop {
             t.reset();
 
             let pc = t.i.pc as usize;
-            // Frame pointer in effect for this instruction. Captured before the
-            // instruction runs, because a call/return may change `fp`, but the
-            // drop hints are relative to this frame.
-            let fp = t.i.fp;
             let instr = t.i.flat_program[pc].clone();
 
             // Apply the drop hints that fire before this instruction.
-            t.i.apply_drop_hints_before(pc);
+            //
+            // It is important to use the original FP from before the instruction executes to calculate post_drops.
+            let fp = t.i.fp;
+            post_drops.clear();
+            for hint in &t.i.drop_hints[pc] {
+                use linker::ExecDropHint::*;
+                match hint {
+                    DropBefore(reg) => t.i.regs.drop_reg(fp + *reg),
+                    DropBeforeFrom(reg) => t.i.regs.drop_from(fp + *reg),
+                    DropAfter(reg) => post_drops.push(fp + *reg),
+                }
+            }
 
             let mut should_inc_pc = true;
             match instr {
@@ -1985,10 +1967,10 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                 }
             }
 
-            // Apply the drop hints that fire after this instruction. Keyed on the
-            // fetched PC and the pre-instruction `fp`, so it is unaffected by a
-            // call/return that changed `t.i.pc` / `t.i.fp`.
-            t.i.apply_drop_hints_after(pc, fp);
+            // Apply the drop hints that fire after this instruction.
+            for reg in &post_drops {
+                t.i.regs.drop_reg(*reg);
+            }
 
             t.print_trace();
 
