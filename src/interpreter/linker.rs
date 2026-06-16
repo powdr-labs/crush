@@ -49,10 +49,7 @@ pub struct LinkedProgram<D> {
     pub drop_hints: Vec<Vec<ExecDropHint>>,
 }
 
-pub fn link<D: Directive>(
-    program: Vec<FunctionAsm<D>>,
-    init_pc: u32,
-) -> LinkedProgram<D> {
+pub fn link<D: Directive>(program: Vec<FunctionAsm<D>>, init_pc: u32) -> LinkedProgram<D> {
     let mut flat_program = vec![D::nop(); init_pc as usize];
     // Side channel of drop hints, indexed by PC and kept parallel to `flat_program`.
     let mut drop_hints: Vec<Vec<ExecDropHint>> = vec![Vec::new(); init_pc as usize];
