@@ -1,7 +1,10 @@
 use crate::{
     interpreter::linker,
     loader::{
-        rwm::{flattening::Context as RwmCtx, settings::Settings as RwmSettings},
+        rwm::{
+            flattening::Context as RwmCtx,
+            settings::{DropHint, Settings as RwmSettings},
+        },
         settings::{ComparisonFunction, JumpCondition, Settings, TrapReason, WasmOpInput},
         wom::settings::{ReturnInfosToCopy, Settings as WomSettings},
     },
@@ -116,6 +119,7 @@ impl<'a> RwmSettings<'a> for GenericIrSetting<'a> {
         value_ptr: Range<u32>,
         immediate: u32,
         label: String,
+        last_reg_usage: bool,
     ) -> Vec<Directive<'a>> {
         let cmp_op = match cmp {
             ComparisonFunction::Equal => Op::I32Eq,
@@ -123,26 +127,37 @@ impl<'a> RwmSettings<'a> for GenericIrSetting<'a> {
             ComparisonFunction::LessThanUnsigned => Op::I32LtU,
         };
 
-        let const_value = c.allocate_tmp_type::<Self>(ValType::I32);
-        let comparison = c.allocate_tmp_type::<Self>(ValType::I32);
-        vec![
-            Directive::WASMOp {
-                op: Op::I32Const {
-                    value: immediate as i32,
-                },
-                inputs: Vec::new(),
-                output: Some(const_value.clone()),
+        let tmp = c.allocate_tmp_type::<Self>(ValType::I32);
+
+        let mut directives = Vec::with_capacity(5);
+        directives.push(Directive::WASMOp {
+            op: Op::I32Const {
+                value: immediate as i32,
             },
+            inputs: Vec::new(),
+            output: Some(tmp.clone()),
+        });
+
+        if last_reg_usage {
+            directives.push(Directive::DropHint(DropHint::DropAfterNextInstruction(
+                value_ptr.start,
+            )));
+        }
+
+        directives.extend([
             Directive::WASMOp {
                 op: cmp_op,
-                inputs: vec![value_ptr.clone(), const_value],
-                output: Some(comparison.clone()),
+                inputs: vec![value_ptr.clone(), tmp.clone()],
+                output: Some(tmp.clone()),
             },
+            Directive::DropHint(DropHint::DropAfterNextInstruction(tmp.start)),
             Directive::JumpIf {
                 target: label,
-                condition: comparison.start,
+                condition: tmp.start,
             },
-        ]
+        ]);
+
+        directives
     }
 
     fn emit_relative_jump(&self, _c: &mut RwmCtx, offset_ptr: Range<u32>) -> Directive<'a> {
@@ -223,6 +238,10 @@ impl<'a> RwmSettings<'a> for GenericIrSetting<'a> {
             inputs: inputs.iter().cloned().map(unwrap_register).collect(),
             output,
         }
+    }
+
+    fn emit_drop_hint(&self, _c: &mut RwmCtx, hint: DropHint) -> Directive<'a> {
+        Directive::DropHint(hint)
     }
 }
 
@@ -617,6 +636,8 @@ pub enum Directive<'a> {
         inputs: Vec<Range<u32>>,
         outputs: Vec<Range<u32>>,
     },
+    /// Signals when registers are no longer needed and can be reclaimed.
+    DropHint(DropHint),
     /// General trap, which includes an unreachable instruction.
     Trap { reason: TrapReason },
     /// A forwarded operation from WebAssembly, only with the inputs and output registers specified.
@@ -648,6 +669,14 @@ impl linker::Directive for Directive<'_> {
                 namespace: namespace.as_deref(),
                 frame_size: *frame_size,
             })
+        } else {
+            None
+        }
+    }
+
+    fn as_drop_hint(&self) -> Option<DropHint> {
+        if let Directive::DropHint(hint) = self {
+            Some(*hint)
         } else {
             None
         }
@@ -792,6 +821,13 @@ impl Display for Directive<'_> {
                     }
                 }
             }
+            Directive::DropHint(hint) => match hint {
+                DropHint::DropNow(register) => write!(f, "    Drop ${register}")?,
+                DropHint::DropAfterNextInstruction(register) => {
+                    write!(f, "    DropOnNextInstr ${register}")?
+                }
+                DropHint::DropNowFrom(first) => write!(f, "    DropFrom ${first}")?,
+            },
             Directive::Trap { reason } => {
                 write!(f, "    Trap")?;
                 match reason {

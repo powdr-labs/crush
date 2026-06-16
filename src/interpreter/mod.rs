@@ -45,10 +45,17 @@ trait RegisterBank {
     /// Set a future value at the given absolute address.
     /// Only valid for write-once execution model.
     fn set_future(&mut self, addr: u32);
+
+    /// Mark a single register as dropped. Reading it afterwards will panic.
+    fn drop_reg(&mut self, _addr: u32) {}
+
+    /// Mark all registers from `first` onward as dropped.
+    fn drop_from(&mut self, _first: u32) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegisterValue {
+    Dropped,
     Unassigned,
     Future(u32),
     Concrete(u32),
@@ -66,6 +73,9 @@ impl RegisterValue {
             RegisterValue::Unassigned => {
                 panic!("Can not convert unassigned to u32");
             }
+            RegisterValue::Dropped => {
+                panic!("Can not read from a dropped register");
+            }
         }
     }
 }
@@ -74,6 +84,7 @@ impl Display for RegisterValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RegisterValue::Unassigned => write!(f, "U"),
+            RegisterValue::Dropped => write!(f, "D"),
             RegisterValue::Future(fut) => write!(f, "F{}", fut),
             RegisterValue::Concrete(value) => write!(f, "{}", value),
         }
@@ -159,6 +170,7 @@ impl RegisterBank for WriteOnceRegisterBank {
                 self.regs[addr as usize] = value;
                 value
             }
+            RegisterValue::Dropped => unreachable!("Dropped state in write-once bank"),
         }
     }
 
@@ -168,6 +180,7 @@ impl RegisterBank for WriteOnceRegisterBank {
             RegisterValue::Unassigned => {
                 *slot = RegisterValue::Concrete(value);
             }
+            RegisterValue::Dropped => unreachable!("Dropped state in write-once bank"),
             RegisterValue::Future(future) => {
                 // Assigning Concrete values to Futures materializes it.
                 if let Some(old_value) = self.future_assignments.insert(future, value) {
@@ -208,7 +221,8 @@ impl RegisterBank for WriteOnceRegisterBank {
 }
 
 struct ReadWriteRegisterBank {
-    regs: Vec<u32>,
+    /// Each register is `Some(value)` if alive, or `None` if dropped.
+    regs: Vec<RegisterValue>,
 }
 
 impl ReadWriteRegisterBank {
@@ -219,26 +233,26 @@ impl ReadWriteRegisterBank {
 
 impl RegisterBank for ReadWriteRegisterBank {
     fn get(&mut self, addr: u32) -> RegisterValue {
-        let value = self.regs.get(addr as usize).copied().unwrap_or(0);
-        RegisterValue::Concrete(value)
+        self.regs
+            .get(addr as usize)
+            .cloned()
+            .unwrap_or(RegisterValue::Dropped)
     }
 
     fn set(&mut self, addr: u32, value: u32) {
         let addr = addr as usize;
         if addr >= self.regs.len() {
-            self.regs.resize(addr + 1, 0);
+            self.regs.resize(addr + 1, RegisterValue::Dropped);
         }
-        self.regs[addr] = value;
+        self.regs[addr] = RegisterValue::Concrete(value);
     }
 
     fn copy_range(&mut self, src: Range<u32>, dest: Range<u32>) {
         assert_eq!(src.len(), dest.len());
         if src.len() == 1 {
-            // Optimize the common case of copying a single word to avoid the overhead of collect_vec()
             let value = self.get(src.start).as_concrete();
             self.set(dest.start, value);
         } else {
-            // Read all the values first to allow for overlapping src and dest
             let value = src.map(|addr| self.get(addr).as_concrete()).collect_vec();
             for (dest, value) in dest.zip_eq(value) {
                 self.set(dest, value);
@@ -252,6 +266,17 @@ impl RegisterBank for ReadWriteRegisterBank {
 
     fn set_future(&mut self, _addr: u32) {
         unreachable!("Futures are not supported in read-write execution model");
+    }
+
+    fn drop_reg(&mut self, addr: u32) {
+        let addr = addr as usize;
+        if addr < self.regs.len() {
+            self.regs[addr] = RegisterValue::Dropped;
+        }
+    }
+
+    fn drop_from(&mut self, first: u32) {
+        self.regs.truncate(first as usize);
     }
 }
 
@@ -269,6 +294,8 @@ pub struct Interpreter<'a, E: ExternalFunctions> {
     module: Module<'a>,
     external_functions: E,
     flat_program: Vec<Directive<'a>>,
+    /// Drop hints indexed by PC, parallel to `flat_program`.
+    drop_hints: Vec<Vec<linker::ExecDropHint>>,
     labels: HashMap<String, linker::LabelValue>,
     addr_to_func_id: HashMap<u32, u32>,
 }
@@ -322,7 +349,11 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
             Box::new(ReadWriteRegisterBank::new()) as Box<dyn RegisterBank>
         };
 
-        let (flat_program, labels) = linker::link(program.functions, START_ROM_ADDR);
+        let linker::LinkedProgram {
+            program: flat_program,
+            labels,
+            drop_hints,
+        } = linker::link(program.functions, START_ROM_ADDR);
 
         let ram = program
             .m
@@ -372,6 +403,7 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
             module: program.m,
             external_functions,
             flat_program,
+            drop_hints,
             labels,
             addr_to_func_id,
         };
@@ -444,29 +476,49 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
         let mut cycles = 0usize;
 
         let mut t = Tracer::new(self);
+        let mut post_drops = Vec::new();
+
         let final_fp = loop {
             t.reset();
 
-            let instr = t.i.flat_program[t.i.pc as usize].clone();
+            let pc = t.i.pc as usize;
+            let instr = t.i.flat_program[pc].clone();
+
+            // Apply the drop hints that fire before this instruction.
+            //
+            // It is important to use the original FP from before the instruction executes to calculate post_drops.
+            let fp = t.i.fp;
+            post_drops.clear();
+            for hint in &t.i.drop_hints[pc] {
+                use linker::ExecDropHint::*;
+                match hint {
+                    DropBefore(reg) => t.i.regs.drop_reg(fp + *reg),
+                    DropBeforeFrom(reg) => t.i.regs.drop_from(fp + *reg),
+                    DropAfter(reg) => post_drops.push(fp + *reg),
+                }
+            }
 
             let mut should_inc_pc = true;
-
             match instr {
                 Directive::Label { .. } => {
                     should_inc_pc = false;
                     // do nothing
                 }
+                Directive::DropHint(_) => {
+                    unreachable!("drop hints are stripped from the program during linking")
+                }
                 Directive::Return { ret_pc, ret_fp } => {
                     let pc = t.get_reg_relative_u32(ret_pc..ret_pc + 1);
                     let fp = t.get_reg_relative_u32(ret_fp..ret_fp + 1);
                     if pc == 0 {
+                        // Special PC for when the program is terminating.
                         break fp;
-                    } else {
-                        // Pop the current function from the stack
-                        t.i.call_stack.pop();
-                        t.i.pc = pc;
-                        t.i.fp = fp;
                     }
+
+                    t.i.call_stack.pop();
+                    t.i.pc = pc;
+                    t.i.fp = fp;
+
                     should_inc_pc = false;
                 }
                 Directive::WASMOp {
@@ -1915,6 +1967,11 @@ impl<'a, E: ExternalFunctions> Interpreter<'a, E> {
                 }
             }
 
+            // Apply the drop hints that fire after this instruction.
+            for reg in &post_drops {
+                t.i.regs.drop_reg(*reg);
+            }
+
             t.print_trace();
 
             if should_inc_pc {
@@ -2059,7 +2116,14 @@ mod trace {
 
         fn get_reg(&mut self, offset: u32) -> u32 {
             let addr = self.i.fp + offset;
-            let value = self.i.regs.get(addr).as_concrete();
+            let reg_value = self.i.regs.get(addr);
+            if let RegisterValue::Dropped = reg_value {
+                panic!(
+                    "Read from dropped register ${offset} (absolute address {addr}) at pc={}, fp={}\nInstruction: {}",
+                    self.i.pc, self.i.fp, self.i.flat_program[self.i.pc as usize]
+                );
+            }
+            let value = reg_value.as_concrete();
             self.reads.push(ReadOp {
                 addr: offset,
                 value: RegisterValue::Concrete(value),
